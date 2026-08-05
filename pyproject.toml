@@ -1,0 +1,13 @@
+[project]
+name = "streamlx"
+version = "0.1.0"
+description = "SSD expert streaming for MoE models on mlx-lm: run models larger than unified memory on Apple Silicon"
+requires-python = ">=3.10"
+dependencies = ["mlx-lm>=0.31", "numpy"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["streamlx"]
