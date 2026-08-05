@@ -130,12 +130,28 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
 
 def preload_popular(pools: dict, trace_npz: str) -> int:
     """Warm-start each pool with its layer's most-popular experts (measured
-    skew, notes/phase2a.md); sorted id order => semi-sequential reads."""
+    skew); sorted id order => semi-sequential reads.
+
+    Trace axis -> model layer comes from the sidecar's layer_ids (models with
+    dense layers, e.g. kimi_linear layer 0, are NOT axis-identity)."""
+    import json
+    from pathlib import Path
+
     d = np.load(trace_npz)
     e = d["experts"]
+    p = Path(trace_npz)
+    side = p.parent / (p.stem + ".meta.json")
+    if side.exists():
+        layer_ids = json.loads(side.read_text())["layer_ids"]
+    else:
+        layer_ids = list(range(e.shape[1]))
+    axis_of = {int(lid): i for i, lid in enumerate(layer_ids)}
     total = 0
-    for i, pool in pools.items():
-        hist = np.bincount(e[:, i, :].ravel(), minlength=pool.n_experts)
+    for lid, pool in pools.items():
+        ax = axis_of.get(lid)
+        if ax is None:
+            continue
+        hist = np.bincount(e[:, ax, :].ravel(), minlength=pool.n_experts)
         top = np.argsort(hist)[::-1][: pool.n_slots]
         pool.ensure(sorted(int(x) for x in top))
         total += len(top)
