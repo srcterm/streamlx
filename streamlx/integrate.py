@@ -100,7 +100,8 @@ def install_streaming(model, model_dir: str, n_slots: int):
 
 
 def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
-                         trust_remote_code: bool = False):
+                         trust_remote_code: bool = False,
+                         tokenizer_config: dict | None = None):
     """Load with lazy=True, wrap MoE layers, materialize ONLY the trunk.
 
     The replaced SwitchGLU modules are dropped before any eval, so expert
@@ -110,7 +111,9 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
     """
     from mlx_lm import load as _load
 
-    tok_cfg = {"trust_remote_code": True} if trust_remote_code else {}
+    tok_cfg = dict(tokenizer_config or {})
+    if trust_remote_code:
+        tok_cfg["trust_remote_code"] = True
     model, tokenizer = _load(model_dir, lazy=True, tokenizer_config=tok_cfg)
     index = SafetensorsIndex(model_dir)
     reader = ExpertReader(index)
@@ -125,6 +128,11 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
         model.layers[i].mlp.switch_mlp = StreamingSwitchGLU(pool)
         pools[i] = pool
     mx.eval(model.parameters())  # trunk only; experts were replaced unevaluated
+    # Pool slot buffers are plain-object attrs, invisible to parameters();
+    # eval them on the loader thread so multi-threaded hosts never touch
+    # lazy arrays stream-bound to a thread they don't run on.
+    mx.eval([t for p in pools.values()
+             for proj in p.pool.values() for t in proj.values()])
     return model, tokenizer, pools, reader
 
 
@@ -154,6 +162,9 @@ def preload_popular(pools: dict, trace_npz: str) -> int:
         hist = np.bincount(e[:, ax, :].ravel(), minlength=pool.n_experts)
         top = np.argsort(hist)[::-1][: pool.n_slots]
         pool.ensure(sorted(int(x) for x in top))
+        # Slice-updates from ensure() are lazy; eval per pool so buffers are
+        # real before another thread (multi-threaded hosts) reads them.
+        mx.eval([t for proj in pool.pool.values() for t in proj.values()])
         total += len(top)
     return total
 
