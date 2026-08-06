@@ -43,9 +43,18 @@ def switch_forward(x: mx.array, indices: mx.array, triples: dict,
                              rhs_indices=indices, transpose=True,
                              group_size=gs, bits=bits, mode="affine")
 
-    x_up = qmm(x, "up_proj")
-    x_gate = qmm(x, "gate_proj")
-    x = qmm(swiglu(x_gate, x_up), "down_proj")
+    if "gate_up" in triples:
+        # Fused routed path: gate and up concatenated along the output axis
+        # (affine rows dequantize independently, so one gather_qmm over
+        # [slots, 2*inter, in] is bit-identical to the two separate calls)
+        # — one launch instead of two per MoE layer per step.
+        y = qmm(x, "gate_up")
+        h = y.shape[-1] // 2
+        x = qmm(swiglu(y[..., :h], y[..., h:]), "down_proj")
+    else:
+        x_up = qmm(x, "up_proj")
+        x_gate = qmm(x, "gate_proj")
+        x = qmm(swiglu(x_gate, x_up), "down_proj")
     return x.squeeze(-2)
 
 
@@ -67,13 +76,34 @@ class StreamingSwitchMLP:
 
         import numpy as np  # local: only for dtype mapping at alloc
 
-        def alloc(loc):
+        def alloc(loc, out_mult: int = 1):
             dt = {"U32": mx.uint32, "BF16": mx.bfloat16,
                   "F16": mx.float16, "F32": mx.float32}[loc.dtype]
-            return mx.zeros((n_slots,) + loc.shape[1:], dtype=dt)
+            shape = (n_slots, out_mult * loc.shape[1]) + loc.shape[2:]
+            return mx.zeros(shape, dtype=dt)
 
-        self.pool = {p: {part: alloc(self.triples_loc[p][part])
-                         for part in PARTS} for p in PROJS}
+        # Fuse gate+up into one stacked tensor per part when the projections
+        # are identical in shape and quantization (the universal SwitchGLU
+        # case): halves the routed gather_qmm launches. Falls back to the
+        # split layout otherwise — behavior, not just output, is unchanged.
+        gl, ul = self.triples_loc["gate_proj"], self.triples_loc["up_proj"]
+        self.fuse_gate_up = (
+            self.qparams["gate_proj"] == self.qparams["up_proj"]
+            and all(gl[part].shape == ul[part].shape
+                    and gl[part].dtype == ul[part].dtype for part in PARTS))
+        if self.fuse_gate_up:
+            self.pool = {
+                "gate_up": {part: alloc(gl[part], out_mult=2)
+                            for part in PARTS},
+                "down_proj": {part: alloc(self.triples_loc["down_proj"][part])
+                              for part in PARTS},
+            }
+            in_f, out_f, bits, gs = self.qparams["gate_proj"]
+            self.qparams = {**self.qparams,
+                            "gate_up": (in_f, 2 * out_f, bits, gs)}
+        else:
+            self.pool = {p: {part: alloc(self.triples_loc[p][part])
+                             for part in PARTS} for p in PROJS}
         self.id2slot: OrderedDict[int, int] = OrderedDict()
         self.free = list(range(n_slots))
         # expert id -> slot, SENTINEL when absent; enables in-graph-free
@@ -117,9 +147,18 @@ class StreamingSwitchMLP:
             rows = self.reader.read_experts(self.triples_loc, missing)
             for e in missing:
                 slot = self.id2slot[e]
-                for proj in PROJS:
+                if self.fuse_gate_up:
                     for part in PARTS:
-                        self.pool[proj][part][slot] = rows[e][proj][part]
+                        dst = self.pool["gate_up"][part]
+                        h = dst.shape[1] // 2
+                        dst[slot, :h] = rows[e]["gate_proj"][part]
+                        dst[slot, h:] = rows[e]["up_proj"][part]
+                        self.pool["down_proj"][part][slot] = \
+                            rows[e]["down_proj"][part]
+                else:
+                    for proj in PROJS:
+                        for part in PARTS:
+                            self.pool[proj][part][slot] = rows[e][proj][part]
             self.fetch_s += time.perf_counter() - t0
         return slots
 
