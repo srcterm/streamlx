@@ -123,6 +123,21 @@ class StreamingSwitchMLP:
             self.fetch_s += time.perf_counter() - t0
         return slots
 
+    def resident(self, e: int) -> bool:
+        return e in self.id2slot
+
+    def touch(self, ids: list[int]) -> None:
+        """Mark resident experts most-recently-used (hit accounting only).
+
+        The overlap path touches hits before fetching misses, so a same-step
+        eviction can never reclaim a slot the GPU is still reading. Eviction
+        decisions match plain `ensure` whenever n_slots >= 2k (every real
+        budget); below that, touch-first merely avoids a double fetch.
+        """
+        for e in ids:
+            self.id2slot.move_to_end(e)
+            self.hits += 1
+
     def __call__(self, x: mx.array, expert_ids: list[int]) -> mx.array:
         if len(expert_ids) > self.n_slots:
             raise ValueError("n_slots must be >= k")

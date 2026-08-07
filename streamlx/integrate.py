@@ -35,6 +35,50 @@ class StreamingSwitchGLU(nn.Module):
                                f"(layer {self.pool.layer})")
         return slots
 
+    def _overlapped(self, x: mx.array, idx: np.ndarray) -> mx.array | None:
+        """Compute resident experts on the GPU while missing ones are read.
+
+        Baseline order per layer is strictly serial — gate sync, then a
+        blocking fetch (GPU idle), then the FFN (SSD idle). Here the hit half
+        is dispatched with async_eval first, so the pread overlaps real GPU
+        work. Exactness is preserved because switch_forward returns per-expert
+        outputs *before* the router's weighted sum: each row depends only on x
+        and its own expert, so computing two subsets and permuting back is
+        bitwise identical (verified against the stock model by
+        examples/validate.py).
+
+        Returns None when there is nothing to overlap (no misses, or no hits).
+        """
+        flat = idx.reshape(-1).tolist()
+        seen, hit_ids, miss_ids = set(), [], []
+        for e in flat:
+            if e in seen:
+                continue
+            seen.add(e)
+            (hit_ids if self.pool.resident(e) else miss_ids).append(e)
+        if not miss_ids or not hit_ids:
+            return None
+
+        self.pool.touch(hit_ids)          # protect hit slots before evicting
+        hits = set(hit_ids)
+        hit_pos = [i for i, e in enumerate(flat) if e in hits]
+        miss_pos = [i for i, e in enumerate(flat) if e not in hits]
+
+        slots = [self.pool.id2slot[flat[i]] for i in hit_pos]
+        y_hit = switch_forward(x, mx.array([[slots]], dtype=mx.uint32),
+                               self.pool.pool, self.pool.qparams)
+        mx.async_eval(y_hit)              # GPU starts; CPU proceeds to fetch
+
+        self.pool.ensure(miss_ids)
+
+        slots = [self.pool.id2slot[flat[i]] for i in miss_pos]
+        y_miss = switch_forward(x, mx.array([[slots]], dtype=mx.uint32),
+                                self.pool.pool, self.pool.qparams)
+
+        y = mx.concatenate([y_hit, y_miss], axis=-2)
+        inv = np.argsort(np.array(hit_pos + miss_pos, dtype=np.uint32))
+        return mx.take(y, mx.array(inv.astype(np.uint32)), axis=-2)
+
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         idx = np.array(indices)  # materializes the gate's selection (sync)
         if self.record_sink is not None:
@@ -42,6 +86,10 @@ class StreamingSwitchGLU(nn.Module):
         uniq = list(dict.fromkeys(idx.reshape(-1).tolist()))
         if len(uniq) <= self.pool.n_slots:
             # fast path: whole call fits the pool (always true for decode)
+            if idx.shape[0] * idx.shape[1] == 1:
+                y = self._overlapped(x, idx)
+                if y is not None:
+                    return y
             self.pool.ensure(uniq)
             return switch_forward(x, mx.array(self._remap(idx)),
                                   self.pool.pool, self.pool.qparams)
