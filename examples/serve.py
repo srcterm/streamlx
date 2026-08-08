@@ -26,6 +26,15 @@ _CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False}
 
 
 class StreamingModelProvider(srv.ModelProvider):
+    def load(self, model_path, adapter_path=None, draft_model_path=None):
+        # Single-model server: clients send arbitrary model names in the
+        # request body (opencode, most OpenAI SDKs). Treat any requested name
+        # as an alias of the model loaded at startup; the stock provider
+        # would try to resolve it as a new path/repo and hit the HF hub.
+        if self.model is not None:
+            return self.model, self.tokenizer
+        return super().load(model_path, adapter_path, draft_model_path)
+
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if adapter_path is not None or draft_model_path is not None:
             raise ValueError("adapters/draft models not supported with "
