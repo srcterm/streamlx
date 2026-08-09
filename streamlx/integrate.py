@@ -13,13 +13,16 @@ fundamental gate-then-fetch dependency of expert streaming.
 
 from __future__ import annotations
 
+import os
+import time
+
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
 from .pool import StreamingSwitchMLP, switch_forward
 from .reader import ExpertReader
-from .stindex import SafetensorsIndex
+from .stindex import PARTS, PROJS, SafetensorsIndex
 
 
 class StreamingSwitchGLU(nn.Module):
@@ -27,6 +30,10 @@ class StreamingSwitchGLU(nn.Module):
         super().__init__()
         self.pool = pool
         self.record_sink = None  # optional: list collecting (layer, idx np)
+        # Prefill strategy when a chunk's expert union exceeds the pool:
+        # "sweep" (expert-major, read-once) or "slice" (legacy token slices).
+        self.prefill_mode = os.environ.get("STREAMLX_PREFILL", "sweep")
+        self.sweep_batch = int(os.environ.get("STREAMLX_SWEEP_BATCH", "16"))
 
     def _remap(self, idx: np.ndarray) -> np.ndarray:
         slots = self.pool.slot_table[idx]
@@ -79,6 +86,65 @@ class StreamingSwitchGLU(nn.Module):
         inv = np.argsort(np.array(hit_pos + miss_pos, dtype=np.uint32))
         return mx.take(y, mx.array(inv.astype(np.uint32)), axis=-2)
 
+    def _expert_sweep(self, x: mx.array, idx: np.ndarray) -> mx.array:
+        """Expert-major prefill: read each routed expert once, in id order.
+
+        When a chunk's expert union exceeds the pool, the token-slicing path
+        re-reads evicted experts (measured 2.7x on Laguna) at scattered-read
+        bandwidth. Here (position, pick) pairs are grouped by expert instead:
+        experts stream through throwaway mini-pools in ascending id order
+        (adjacent rows coalesce into long sequential spans), each read exactly
+        once per chunk, and the LRU pool — decode's working set — is never
+        touched.
+
+        Bitwise-exact vs the pool path: both run switch_forward on the same
+        weight bytes, and every output row depends only on its own x row and
+        its own expert, so regrouping pairs by expert is a permutation of
+        independent computations (same basis as _overlapped, F9).
+
+        Batches dispatch with async_eval so the GPU computes batch i while
+        batch i+1 is read; mini-pool buffers are immutable so no per-slice
+        eval barrier is needed. One eval at the end materializes the layer
+        output and frees the mini-pools before the next layer runs.
+        """
+        pool = self.pool
+        b, t, k = idx.shape
+        P = b * t
+        x_rows = x.reshape(P, -1)
+        flat = idx.reshape(-1)                     # pair -> expert id
+        row_of_pair = np.repeat(np.arange(P, dtype=np.uint32), k)
+
+        order = np.argsort(flat, kind="stable")    # pairs grouped by expert
+        sorted_e = flat[order]
+        uniq, starts = np.unique(sorted_e, return_index=True)
+        bounds = np.append(starts, sorted_e.size)
+
+        outs = []
+        for i0 in range(0, len(uniq), self.sweep_batch):
+            i1 = min(i0 + self.sweep_batch, len(uniq))
+            ids = [int(e) for e in uniq[i0:i1]]
+            t0 = time.perf_counter()
+            rows = pool.reader.read_experts(pool.triples_loc, ids)
+            pool.sweep_fetch_s += time.perf_counter() - t0
+            pool.sweep_experts += len(ids)
+            mini = {p: {q: mx.stack([rows[e][p][q] for e in ids])
+                        for q in PARTS} for p in PROJS}
+            sel = order[bounds[i0]:bounds[i1]]
+            slot = np.searchsorted(uniq[i0:i1],
+                                   sorted_e[bounds[i0]:bounds[i1]])
+            xb = mx.take(x_rows, mx.array(row_of_pair[sel]), axis=0)[None]
+            inds = mx.array(slot.astype(np.uint32))[None, :, None]
+            y = switch_forward(xb, inds, mini, pool.qparams)  # [1, Nb, 1, D]
+            mx.async_eval(y)       # GPU busy while the next batch is read
+            outs.append(y)
+        y = mx.concatenate(outs, axis=1)[0, :, 0]  # rows in sorted-pair order
+        inv = np.empty_like(order)
+        inv[order] = np.arange(order.size)
+        y = mx.take(y, mx.array(inv.astype(np.uint32)), axis=0)
+        y = y.reshape(b, t, k, -1)
+        mx.eval(y)  # materialize: frees mini-pools before the next layer
+        return y
+
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         idx = np.array(indices)  # materializes the gate's selection (sync)
         if self.record_sink is not None:
@@ -94,10 +160,13 @@ class StreamingSwitchGLU(nn.Module):
             return switch_forward(x, mx.array(self._remap(idx)),
                                   self.pool.pool, self.pool.qparams)
 
-        # Chunked prefill: process position slices whose expert union fits.
-        # Each slice's output MUST be materialized before the next slice's
-        # ensure() mutates pool slots (the gather graph reads pool buffers
-        # in place); mx.eval per slice enforces that.
+        if self.prefill_mode == "sweep":
+            return self._expert_sweep(x, idx)
+
+        # Legacy chunked prefill: process position slices whose expert union
+        # fits. Each slice's output MUST be materialized before the next
+        # slice's ensure() mutates pool slots (the gather graph reads pool
+        # buffers in place); mx.eval per slice enforces that.
         b, t, k = idx.shape
         flat = idx.reshape(-1, k)                     # [P, k], P = B*T
         x_flat = x.reshape(1, -1, x.shape[-1])        # [1, P, D]
@@ -218,13 +287,16 @@ def preload_popular(pools: dict, trace_npz: str) -> int:
 
 
 def aggregate_stats(pools: dict) -> dict:
-    tot = {"hits": 0, "misses": 0, "evictions": 0, "fetch_s": 0.0}
+    tot = {"hits": 0, "misses": 0, "evictions": 0, "fetch_s": 0.0,
+           "sweep_experts": 0, "sweep_fetch_s": 0.0}
     for p in pools.values():
         s = p.stats
-        for k in ("hits", "misses", "evictions"):
-            tot[k] += s[k]
+        for k in ("hits", "misses", "evictions", "sweep_experts"):
+            tot[k] += s.get(k, 0)
         tot["fetch_s"] += s["fetch_s"]
+        tot["sweep_fetch_s"] += s.get("sweep_fetch_s", 0.0)
     acc = tot["hits"] + tot["misses"]
     tot["miss_rate"] = tot["misses"] / acc if acc else 0.0
     tot["fetch_s"] = round(tot["fetch_s"], 3)
+    tot["sweep_fetch_s"] = round(tot["sweep_fetch_s"], 3)
     return tot

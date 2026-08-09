@@ -85,6 +85,8 @@ class StreamingSwitchMLP:
         self.misses = 0
         self.evictions = 0
         self.fetch_s = 0.0
+        self.sweep_experts = 0   # expert-rows streamed by prefill sweeps
+        self.sweep_fetch_s = 0.0
 
     def ensure(self, ids: list[int]) -> list[int]:
         """Return slot ids for `ids` (touch order = given order, like the sim).
@@ -148,6 +150,8 @@ class StreamingSwitchMLP:
     def reset_stats(self) -> None:
         self.hits = self.misses = self.evictions = 0
         self.fetch_s = 0.0
+        self.sweep_experts = 0
+        self.sweep_fetch_s = 0.0
 
     @property
     def stats(self) -> dict:
@@ -156,5 +160,7 @@ class StreamingSwitchMLP:
                 "evictions": self.evictions,
                 "miss_rate": self.misses / total if total else 0.0,
                 "fetch_s": round(self.fetch_s, 4),
+                "sweep_experts": self.sweep_experts,
+                "sweep_fetch_s": round(self.sweep_fetch_s, 4),
                 "bytes_read": self.reader.bytes_read,
                 "reads": self.reader.reads}

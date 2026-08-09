@@ -5,7 +5,7 @@ with streamlx: trunk resident, experts streamed from SSD on demand.
 
   python examples/serve.py --budget-gib 16 \
       --model <local-model-dir> --port 8080 [--trust-remote-code] \
-      [--warmstart-trace trace.npz]
+      [--warmstart-trace trace.npz] [--tokenizer-config key=json ...]
 
 --model must be a LOCAL directory (the byte-range reader needs the shards on
 disk). Requests are handled sequentially: concurrent batching multiplies the
@@ -15,6 +15,7 @@ per-step expert working set and collapses cache hit rates.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 
@@ -22,7 +23,8 @@ import mlx_lm.server as srv
 
 from streamlx.integrate import load_streaming_model, preload_popular
 
-_CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False}
+_CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
+        "tokenizer_config": {}}
 
 
 class StreamingModelProvider(srv.ModelProvider):
@@ -47,7 +49,8 @@ class StreamingModelProvider(srv.ModelProvider):
         t0 = time.time()
         model, tokenizer, pools, reader = load_streaming_model(
             str(model_path), _CFG["budget_bytes"],
-            trust_remote_code=_CFG["trust"])
+            trust_remote_code=_CFG["trust"],
+            tokenizer_config=_CFG["tokenizer_config"])
         slots = sum(p.n_slots for p in pools.values())
         print(f"[streamlx] trunk loaded in {time.time()-t0:.1f}s; "
               f"{len(pools)} pools, {slots} slots "
@@ -76,10 +79,22 @@ def main() -> None:
     ap.add_argument("--budget-gib", type=float, default=8.0)
     ap.add_argument("--warmstart-trace", default=None)
     ap.add_argument("--trust-remote-code", action="store_true")
+    ap.add_argument("--tokenizer-config", action="append", default=[],
+                    metavar="KEY=JSON",
+                    help="extra tokenizer kwarg, repeatable "
+                         "(e.g. fix_mistral_regex=true)")
     ours, rest = ap.parse_known_args()
     _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
     _CFG["warmstart_trace"] = ours.warmstart_trace
     _CFG["trust"] = ours.trust_remote_code
+    for pair in ours.tokenizer_config:
+        key, sep, val = pair.partition("=")
+        if not sep:
+            ap.error(f"--tokenizer-config expects KEY=JSON, got {pair!r}")
+        try:
+            _CFG["tokenizer_config"][key] = json.loads(val)
+        except json.JSONDecodeError:
+            _CFG["tokenizer_config"][key] = val  # bare strings are fine
 
     srv.ModelProvider = StreamingModelProvider
     sys.argv = [sys.argv[0]] + rest
