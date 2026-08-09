@@ -14,7 +14,9 @@ fundamental gate-then-fetch dependency of expert streaming.
 from __future__ import annotations
 
 import os
+import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -34,6 +36,8 @@ class StreamingSwitchGLU(nn.Module):
         # "sweep" (expert-major, read-once) or "slice" (legacy token slices).
         self.prefill_mode = os.environ.get("STREAMLX_PREFILL", "sweep")
         self.sweep_batch = int(os.environ.get("STREAMLX_SWEEP_BATCH", "16"))
+        self.sweep_warm = os.environ.get("STREAMLX_SWEEP_WARM", "1") != "0"
+        self._sweep_ex = None   # lazy 1-thread executor: batch read-ahead
 
     def _remap(self, idx: np.ndarray) -> np.ndarray:
         slots = self.pool.slot_table[idx]
@@ -106,6 +110,12 @@ class StreamingSwitchGLU(nn.Module):
         batch i+1 is read; mini-pool buffers are immutable so no per-slice
         eval barrier is needed. One eval at the end materializes the layer
         output and frees the mini-pools before the next layer runs.
+
+        Reads run one batch ahead on a dedicated thread (sweep_fetch_s counts
+        only time actually blocked on IO). With sweep_warm (default on), the
+        chunk's most-routed experts are adopted into the LRU pool as their
+        batch streams by — no extra IO — so decode after prefill starts warm;
+        a final retouch leaves the most-frequent experts most-recently-used.
         """
         pool = self.pool
         b, t, k = idx.shape
@@ -119,16 +129,34 @@ class StreamingSwitchGLU(nn.Module):
         uniq, starts = np.unique(sorted_e, return_index=True)
         bounds = np.append(starts, sorted_e.size)
 
+        counts = bounds[1:] - bounds[:-1]
+        warm_ids: set = set()
+        if self.sweep_warm:
+            top = np.argsort(counts, kind="stable")[::-1][:pool.n_slots]
+            warm_ids = {int(uniq[i]) for i in top}
+
+        if self._sweep_ex is None:
+            self._sweep_ex = ThreadPoolExecutor(max_workers=1)
+        batches = [[int(e) for e in uniq[i0:i0 + self.sweep_batch]]
+                   for i0 in range(0, len(uniq), self.sweep_batch)]
+        fut = self._sweep_ex.submit(pool.reader.read_experts_raw,
+                                    pool.triples_loc, batches[0])
         outs = []
-        for i0 in range(0, len(uniq), self.sweep_batch):
-            i1 = min(i0 + self.sweep_batch, len(uniq))
-            ids = [int(e) for e in uniq[i0:i1]]
+        for bi, ids in enumerate(batches):
             t0 = time.perf_counter()
-            rows = pool.reader.read_experts(pool.triples_loc, ids)
-            pool.sweep_fetch_s += time.perf_counter() - t0
+            raw = fut.result()
+            pool.sweep_fetch_s += time.perf_counter() - t0   # blocked wait
+            if bi + 1 < len(batches):
+                fut = self._sweep_ex.submit(pool.reader.read_experts_raw,
+                                            pool.triples_loc,
+                                            batches[bi + 1])
+            # mx arrays must be created on this (compute) thread
+            rows = pool.reader.experts_from_raw(pool.triples_loc, ids, raw)
             pool.sweep_experts += len(ids)
             mini = {p: {q: mx.stack([rows[e][p][q] for e in ids])
                         for q in PARTS} for p in PROJS}
+            i0 = bi * self.sweep_batch
+            i1 = min(i0 + self.sweep_batch, len(uniq))
             sel = order[bounds[i0]:bounds[i1]]
             slot = np.searchsorted(uniq[i0:i1],
                                    sorted_e[bounds[i0]:bounds[i1]])
@@ -137,12 +165,22 @@ class StreamingSwitchGLU(nn.Module):
             y = switch_forward(xb, inds, mini, pool.qparams)  # [1, Nb, 1, D]
             mx.async_eval(y)       # GPU busy while the next batch is read
             outs.append(y)
+            for e in ids:
+                if e in warm_ids:
+                    pool.adopt(e, rows[e])
+        if warm_ids:
+            for i in np.argsort(counts, kind="stable"):  # ascending count
+                e = int(uniq[i])
+                if e in warm_ids and e in pool.id2slot:
+                    pool.id2slot.move_to_end(e)          # most-frequent = MRU
         y = mx.concatenate(outs, axis=1)[0, :, 0]  # rows in sorted-pair order
         inv = np.empty_like(order)
         inv[order] = np.arange(order.size)
         y = mx.take(y, mx.array(inv.astype(np.uint32)), axis=0)
         y = y.reshape(b, t, k, -1)
-        mx.eval(y)  # materialize: frees mini-pools before the next layer
+        # One eval materializes the layer output AND adopted pool slots,
+        # freeing this layer's mini-pools before the next layer runs.
+        mx.eval(y, *(pool.pool[p][q] for p in PROJS for q in PARTS))
         return y
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
@@ -216,9 +254,37 @@ def install_streaming(model, model_dir: str, n_slots: int):
     return pools, reader
 
 
+def plan_residency(layers: list, bpe: dict, n_exp: dict,
+                   budget_bytes: int, k: int) -> tuple[set, float]:
+    """Greedy water-fill: a layer goes FULLY RESIDENT when the fair share of
+    the remaining budget covers all its experts (cheapest layer first, freed
+    surplus cascades), provided every still-streamed layer keeps at least k
+    slots. Fully-resident layers keep their stock SwitchGLU: no gate sync,
+    no remap, no pool — the streaming wrapper never touches them.
+
+    Self-selecting by regime: fetch-dominated models (budget << expert
+    bytes, e.g. Laguna at 16-18 GiB) qualify no layers and are unchanged;
+    overhead-dominated ones (budget ~ expert bytes, e.g. Qwen3.6 at 20 GiB)
+    cascade to fully resident. Uniform-width models flip near budget ==
+    total expert bytes; mixed-width models (dense-first, varying widths) go
+    partial. Returns (resident layer set, budget left for pools)."""
+    resident: set = set()
+    streamed = list(layers)
+    left = float(budget_bytes)
+    for i in sorted(layers, key=lambda j: n_exp[j] * bpe[j]):
+        full = n_exp[i] * bpe[i]
+        min_rest = sum(k * bpe[j] for j in streamed if j != i)
+        if left / len(streamed) >= full and left - full >= min_rest:
+            resident.add(i)
+            streamed.remove(i)
+            left -= full
+    return resident, left
+
+
 def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
                          trust_remote_code: bool = False,
-                         tokenizer_config: dict | None = None):
+                         tokenizer_config: dict | None = None,
+                         resident: str | None = None):
     """Load with lazy=True, wrap MoE layers, materialize ONLY the trunk.
 
     The replaced SwitchGLU modules are dropped before any eval, so expert
@@ -236,15 +302,35 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
     reader = ExpertReader(index)
     moe_layers = [i for i, l in enumerate(model.layers)
                   if hasattr(getattr(l, "mlp", None), "switch_mlp")]
+    bpe = {i: index.layer_expert_bytes(i) for i in moe_layers}
+    n_exp = {i: index.switch_triples(i)["gate_proj"]["weight"].shape[0]
+             for i in moe_layers}
+    # Residency is OPT-IN ("auto"): it trades RAM headroom (KV cache for
+    # long agent/coding contexts) for speed, so the streaming default stays
+    # predictable. serve.py exposes it as --resident.
+    mode = resident if resident is not None else os.environ.get(
+        "STREAMLX_RESIDENT", "off")
+    res_layers: set = set()
+    budget_left = float(budget_bytes)
+    if mode not in ("off", "0"):
+        res_layers, budget_left = plan_residency(moe_layers, bpe, n_exp,
+                                                 budget_bytes, k)
+    streamed = [i for i in moe_layers if i not in res_layers]
     pools: dict[int, StreamingSwitchMLP] = {}
-    for i in moe_layers:
-        bpe = index.layer_expert_bytes(i)
-        slots = max(k, int(budget_bytes / len(moe_layers) / bpe))
+    for i in streamed:
+        slots = max(k, int(budget_left / len(streamed) / bpe[i]))
         pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
                                   reader=reader)
         model.layers[i].mlp.switch_mlp = StreamingSwitchGLU(pool)
         pools[i] = pool
-    mx.eval(model.parameters())  # trunk only; experts were replaced unevaluated
+    if res_layers:
+        rb = sum(n_exp[i] * bpe[i] for i in res_layers) / 2**30
+        print(f"[streamlx] {len(res_layers)} fully-resident MoE layers "
+              f"({rb:.1f} GiB, stock path); {len(streamed)} streamed",
+              file=sys.stderr)
+    # trunk + any fully-resident layers; streamed experts were replaced
+    # before eval and never materialize
+    mx.eval(model.parameters())
     # Pool slot buffers are plain-object attrs, invisible to parameters();
     # eval them on the loader thread so multi-threaded hosts never touch
     # lazy arrays stream-bound to a thread they don't run on.
@@ -288,10 +374,10 @@ def preload_popular(pools: dict, trace_npz: str) -> int:
 
 def aggregate_stats(pools: dict) -> dict:
     tot = {"hits": 0, "misses": 0, "evictions": 0, "fetch_s": 0.0,
-           "sweep_experts": 0, "sweep_fetch_s": 0.0}
+           "sweep_experts": 0, "sweep_fetch_s": 0.0, "adopted": 0}
     for p in pools.values():
         s = p.stats
-        for k in ("hits", "misses", "evictions", "sweep_experts"):
+        for k in ("hits", "misses", "evictions", "sweep_experts", "adopted"):
             tot[k] += s.get(k, 0)
         tot["fetch_s"] += s["fetch_s"]
         tot["sweep_fetch_s"] += s.get("sweep_fetch_s", 0.0)

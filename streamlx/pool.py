@@ -87,6 +87,7 @@ class StreamingSwitchMLP:
         self.fetch_s = 0.0
         self.sweep_experts = 0   # expert-rows streamed by prefill sweeps
         self.sweep_fetch_s = 0.0
+        self.adopted = 0         # experts placed by prefill sweeps (no IO)
 
     def ensure(self, ids: list[int]) -> list[int]:
         """Return slot ids for `ids` (touch order = given order, like the sim).
@@ -140,6 +141,30 @@ class StreamingSwitchMLP:
             self.id2slot.move_to_end(e)
             self.hits += 1
 
+    def adopt(self, e: int, arrays: dict) -> None:
+        """Place expert e's already-read rows into a slot without IO.
+
+        Used by the prefill sweep to warm the pool from data that just
+        streamed through a mini-pool. LRU semantics mirror ensure() (evicts
+        the LRU head when full); no hit/miss accounting — adoptions are free.
+        """
+        if e in self.id2slot:
+            self.id2slot.move_to_end(e)
+            slot = self.id2slot[e]
+        else:
+            if self.free:
+                slot = self.free.pop()
+            else:
+                old_id, slot = self.id2slot.popitem(last=False)
+                self.slot_table[old_id] = self.SENTINEL
+                self.evictions += 1
+            self.id2slot[e] = slot
+            self.slot_table[e] = slot
+        self.adopted += 1
+        for proj in PROJS:
+            for part in PARTS:
+                self.pool[proj][part][slot] = arrays[proj][part]
+
     def __call__(self, x: mx.array, expert_ids: list[int]) -> mx.array:
         if len(expert_ids) > self.n_slots:
             raise ValueError("n_slots must be >= k")
@@ -152,6 +177,7 @@ class StreamingSwitchMLP:
         self.fetch_s = 0.0
         self.sweep_experts = 0
         self.sweep_fetch_s = 0.0
+        self.adopted = 0
 
     @property
     def stats(self) -> dict:
@@ -162,5 +188,6 @@ class StreamingSwitchMLP:
                 "fetch_s": round(self.fetch_s, 4),
                 "sweep_experts": self.sweep_experts,
                 "sweep_fetch_s": round(self.sweep_fetch_s, 4),
+                "adopted": self.adopted,
                 "bytes_read": self.reader.bytes_read,
                 "reads": self.reader.reads}

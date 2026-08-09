@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import fcntl
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
@@ -39,22 +40,24 @@ class ExpertReader:
         self.merge_gap = merge_gap
         self.max_span = max_span
         self._fds: dict[str, int] = {}
+        self._fd_lock = threading.Lock()
         self._ex = ThreadPoolExecutor(max_workers=workers)
         self.bytes_read = 0      # actual bytes off the device (incl. gap waste)
         self.useful_bytes = 0    # bytes delivered to the pool
         self.reads = 0           # preads issued (post-merge)
 
     def _fd(self, path: str) -> int:
-        fd = self._fds.get(path)
-        if fd is None:
-            fd = os.open(path, os.O_RDONLY)
-            try:
-                fcntl.fcntl(fd, F_NOCACHE, 1)
-                fcntl.fcntl(fd, F_RDAHEAD, 0)
-            except OSError:
-                pass
-            self._fds[path] = fd
-        return fd
+        with self._fd_lock:
+            fd = self._fds.get(path)
+            if fd is None:
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    fcntl.fcntl(fd, F_NOCACHE, 1)
+                    fcntl.fcntl(fd, F_RDAHEAD, 0)
+                except OSError:
+                    pass
+                self._fds[path] = fd
+            return fd
 
     # -- planning ------------------------------------------------------------
 
@@ -106,8 +109,10 @@ class ExpertReader:
             out = out.view(_MX_VIEW[loc.dtype])
         return out
 
-    def read_experts(self, layer_triples: dict, ids: list[int]) -> dict:
-        """{expert_id: {proj: {part: mx.array}}} — one coalesced batch."""
+    def read_experts_raw(self, layer_triples: dict, ids: list[int]) -> dict:
+        """{(e, proj, part): memoryview} — raw bytes only, one coalesced
+        batch. Safe from any thread: no mx arrays are created (mx arrays are
+        stream-bound to the creating thread)."""
         requests = []
         for e in ids:
             for proj in PROJS:
@@ -115,12 +120,22 @@ class ExpertReader:
                     loc = layer_triples[proj][part]
                     path, off, n = loc.expert_range(e)
                     requests.append(((e, proj, part), path, off, n))
-        raw = self.read_ranges(requests)
+        return self.read_ranges(requests)
+
+    def experts_from_raw(self, layer_triples: dict, ids: list[int],
+                         raw: dict) -> dict:
+        """Materialize {e: {proj: {part: mx.array}}} from raw bytes.
+        Must run on the thread that will build the compute graph."""
         return {e: {proj: {part: self._to_mx(raw[(e, proj, part)],
                                              layer_triples[proj][part])
                            for part in PARTS}
                     for proj in PROJS}
                 for e in ids}
+
+    def read_experts(self, layer_triples: dict, ids: list[int]) -> dict:
+        """{expert_id: {proj: {part: mx.array}}} — one coalesced batch."""
+        return self.experts_from_raw(
+            layer_triples, ids, self.read_experts_raw(layer_triples, ids))
 
     def read_expert(self, layer_triples: dict, e: int) -> dict:
         return self.read_experts(layer_triples, [e])[e]

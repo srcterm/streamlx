@@ -5,7 +5,8 @@ with streamlx: trunk resident, experts streamed from SSD on demand.
 
   python examples/serve.py --budget-gib 16 \
       --model <local-model-dir> --port 8080 [--trust-remote-code] \
-      [--warmstart-trace trace.npz] [--tokenizer-config key=json ...]
+      [--warmstart-trace trace.npz] [--tokenizer-config key=json ...] \
+      [--resident]
 
 --model must be a LOCAL directory (the byte-range reader needs the shards on
 disk). Requests are handled sequentially: concurrent batching multiplies the
@@ -24,7 +25,7 @@ import mlx_lm.server as srv
 from streamlx.integrate import load_streaming_model, preload_popular
 
 _CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
-        "tokenizer_config": {}}
+        "tokenizer_config": {}, "resident": None}
 
 
 class StreamingModelProvider(srv.ModelProvider):
@@ -50,7 +51,8 @@ class StreamingModelProvider(srv.ModelProvider):
         model, tokenizer, pools, reader = load_streaming_model(
             str(model_path), _CFG["budget_bytes"],
             trust_remote_code=_CFG["trust"],
-            tokenizer_config=_CFG["tokenizer_config"])
+            tokenizer_config=_CFG["tokenizer_config"],
+            resident=_CFG["resident"])
         slots = sum(p.n_slots for p in pools.values())
         print(f"[streamlx] trunk loaded in {time.time()-t0:.1f}s; "
               f"{len(pools)} pools, {slots} slots "
@@ -83,10 +85,16 @@ def main() -> None:
                     metavar="KEY=JSON",
                     help="extra tokenizer kwarg, repeatable "
                          "(e.g. fix_mistral_regex=true)")
+    ap.add_argument("--resident", action="store_true",
+                    help="let fully-covered MoE layers stay on the stock "
+                         "resident path (faster; trades RAM headroom that "
+                         "long contexts need for KV cache)")
     ours, rest = ap.parse_known_args()
     _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
     _CFG["warmstart_trace"] = ours.warmstart_trace
     _CFG["trust"] = ours.trust_remote_code
+    if ours.resident:
+        _CFG["resident"] = "auto"
     for pair in ours.tokenizer_config:
         key, sep, val = pair.partition("=")
         if not sep:
