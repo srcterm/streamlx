@@ -22,10 +22,47 @@ import time
 
 import mlx_lm.server as srv
 
-from streamlx.integrate import load_streaming_model, preload_popular
+from streamlx.integrate import (aggregate_stats, load_streaming_model,
+                                preload_popular)
 
 _CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
         "tokenizer_config": {}, "resident": None}
+_STATE = {"pools": None, "reader": None}
+
+
+def _instrumented(fn):
+    """Log a per-request summary line (prefill/decode tok/s, miss rate,
+    bytes read) once the wrapped stream_generate finishes."""
+    def gen(*args, **kwargs):
+        pools, reader = _STATE["pools"], _STATE["reader"]
+        base = aggregate_stats(pools) if pools is not None else None
+        r0 = reader.bytes_read if reader else 0
+        last = None
+        try:
+            for last in fn(*args, **kwargs):
+                yield last
+        finally:
+            # The server breaks out of its loop on stop conditions, which
+            # closes this generator instead of exhausting it — log either way.
+            if last is not None:
+                msg = (f"[streamlx] prefill {last.prompt_tokens} tok @ "
+                       f"{last.prompt_tps:.1f} tok/s | decode "
+                       f"{last.generation_tokens} tok @ "
+                       f"{last.generation_tps:.1f} tok/s")
+                if base is not None:
+                    s = aggregate_stats(pools)
+                    acc = ((s["hits"] - base["hits"])
+                           + (s["misses"] - base["misses"]))
+                    if acc:
+                        miss = (s["misses"] - base["misses"]) / acc
+                        msg += f" | miss {miss * 100:.1f}%"
+                if reader:
+                    msg += f" | {(reader.bytes_read - r0) / 1e9:.1f} GB read"
+                print(msg, file=sys.stderr)
+    return gen
+
+
+srv.stream_generate = _instrumented(srv.stream_generate)
 
 
 class StreamingModelProvider(srv.ModelProvider):
@@ -64,6 +101,7 @@ class StreamingModelProvider(srv.ModelProvider):
                   f"in {time.time()-t0:.1f}s", file=sys.stderr)
         self.pools = pools
         self.reader = reader
+        _STATE["pools"], _STATE["reader"] = pools, reader
 
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:

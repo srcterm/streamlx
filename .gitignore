@@ -6,3 +6,4 @@ dist/
 build/
 sweep.csv
 *.npz
+.DS_Store
