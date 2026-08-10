@@ -32,10 +32,10 @@ python examples/serve.py --model /path/to/model --budget-gib 12 --port 8080
 To serve Laguna S-2.1 on 32GB ram for instance (also see config flags further below):
 
 ```sh
-python examples/serve.py --model /path/to/Laguna-S-2.1-OptiQ-2bit --budget-gib 18 --trust-remote-code --tokenizer-config fix_mistral_regex=true --port 8080
+python examples/serve.py --model /path/to/Laguna-S-2.1-oQ2e-fast --budget-gib 18 --trust-remote-code --tokenizer-config fix_mistral_regex=true --port 8080
 ```
 
-Models must be local directories in MLX format with the standard stacked `switch_mlp` expert layout. Validated on `laguna`, `kimi_linear`, and `qwen3_5_moe` (Qwen3.6); other mlx-lm MoE models should work unmodified.
+Models must be local directories in MLX format with the standard stacked `switch_mlp` expert layout. Validated on `laguna`, `kimi_linear`, and `qwen3_5_moe` (Qwen3.6); other mlx-lm MoE models should work unmodified. mlx-vlm text-only exports (tensors prefixed `language_model.`) are detected and remapped automatically.
 
 | Flag | Default | |
 |---|---|---|
@@ -44,6 +44,8 @@ Models must be local directories in MLX format with the standard stacked `switch
 | `--tokenizer-config` | none | Extra tokenizer kwargs as `key=json`, repeatable. Laguna's Mistral-derived tokenizer needs `fix_mistral_regex=true`. |
 | `--resident` | off | Let fully-covered MoE layers stay stock-resident (no sync, no pool). Faster when the model nearly fits in RAM; costs KV-cache headroom. |
 | `--warmstart-trace` | none | Preload popular experts from a routing trace. See below. |
+| `--prompt-cache-gib` | auto | Byte cap for the server's prompt-cache LRU (default `RAM − budget − 12 GiB`, clamped to 1–8). |
+| `--mlx-cache-gib` | 2.0 | Cap for MLX's freed-buffer cache (its own default hoards ~95% of RAM). |
 
 All `mlx_lm.server` flags pass through (`--port`, `--host`, `--temp`, ...). Requests run one at a time by design (batching collapses the expert hit rate); `--draft-model` and `--adapter-path` are unsupported.
 
@@ -51,14 +53,14 @@ All `mlx_lm.server` flags pass through (`--port`, `--host`, `--temp`, ...). Requ
 
 **M4 MacBook Air, 32 GB**, macOS 26.3, ~2.4 GB/s SSD, batch-1 greedy decode. Resident memory is about `trunk + budget + 1-2 GB`. On tested models:
 
-**>> Laguna-S-2.1** (Poolside, 117B, top-10-of-256 routing, OptiQ ~3 bpw, 44.2 GB). Stock loading dies with swap on this machine; with streaming though:
+**>> Laguna-S-2.1** (Poolside, 117B, top-10-of-256 routing; [oQ2e-fast](https://huggingface.co/mlx-community/Laguna-S-2.1-oQ2e-fast) community imatrix quant, 2-bit experts, 34.7 GB). Stock loading dies with swap on this machine; with streaming though:
 
 | Budget | Resident | tok/s | Miss rate |
 |---|---|---|---|
-| 8 GiB | 12 GB | 2.6 | 39% |
-| 12 GiB | 17 GB | 3.1 | 28% |
-| 16 GiB | 21 GB | 3.8 | 21% |
-| 18 GiB | 23 GB | 4.1 | 18% |
+| 8 GiB | 12 GB | 3.4 | 25.9% |
+| 12 GiB | 16 GB | 4.5 | 14.7% |
+| 16 GiB | 20 GB | 7.2 | 7.6% |
+| 18 GiB | 22 GB | 9.2 | 6.2% |
 
 **>> Qwen3.6-35B-A3B** (4-bit, 22.1 GB; fits in RAM at ~32 tok/s, shown for the curve):
 
