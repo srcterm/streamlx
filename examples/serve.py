@@ -102,8 +102,9 @@ def _instrumented(fn):
             if last is not None:
                 msg = (f"[streamlx] prefill {last.prompt_tokens} tok @ "
                        f"{last.prompt_tps:.1f} tok/s | decode "
-                       f"{last.generation_tokens} tok @ "
-                       f"{last.generation_tps:.1f} tok/s")
+                       f"{last.generation_tokens} tok")
+                if last.generation_tokens >= 2:  # rate meaningless below
+                    msg += f" @ {last.generation_tps:.1f} tok/s"
                 if base is not None:
                     s = aggregate_stats(pools)
                     acc = ((s["hits"] - base["hits"])
