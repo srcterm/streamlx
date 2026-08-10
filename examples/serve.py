@@ -16,7 +16,9 @@ per-step expert working set and collapses cache hit rates.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import os
 import sys
 import time
 
@@ -30,6 +32,58 @@ _CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
 _STATE = {"pools": None, "reader": None}
 
 
+_orig_fetch = srv.LRUPromptCache.fetch_nearest_cache
+
+
+def _recording_fetch(self, model, tokens):
+    # Stash the request's full token key for the prompt-boundary snapshot.
+    _STATE["fetch"] = (self, model, list(tokens))
+    return _orig_fetch(self, model, tokens)
+
+
+srv.LRUPromptCache.fetch_nearest_cache = _recording_fetch
+
+
+def _snapshot_progress(kwargs):
+    """Cache an extra copy of the KV state at the prompt boundary.
+
+    Agent clients rewrite history every turn (reasoning stripped, tool
+    output re-rendered), so the post-generation cache the server stores is
+    never a strict prefix of the next prompt — and hybrid-cache models
+    (rotating KV, conv state) cannot trim back to the divergence point, so
+    every turn reprocesses the whole prompt. An extra entry keyed by the
+    prompt itself makes the next turn a pure extension: no trim needed.
+
+    The copy is taken at the prefill progress callback where
+    total - processed == 1: the one point where the cache holds exactly
+    prompt[:-1], evaluated. (After that, generate_step builds the next
+    step's graph before the first yield, so the cache is already one
+    generated token ahead — one token no hybrid cache can give back.)
+    Disable with STREAMLX_PROMPT_SNAPSHOT=0.
+    """
+    fetch = _STATE.pop("fetch", None)
+    cache = kwargs.get("prompt_cache")
+    if (os.environ.get("STREAMLX_PROMPT_SNAPSHOT", "1") == "0"
+            or fetch is None or cache is None):
+        return
+    lru, model, tokens = fetch
+    if len(tokens) < 256:
+        return
+    orig_cb = kwargs.get("prompt_progress_callback")
+
+    def cb(processed, total):
+        if total - processed == 1:
+            t0 = time.perf_counter()
+            lru.insert_cache(model, tokens[:-1], copy.deepcopy(cache),
+                             cache_type="user")
+            print(f"[streamlx] prompt snapshot: {len(tokens) - 1} tok "
+                  f"({time.perf_counter() - t0:.2f}s)", file=sys.stderr)
+        if orig_cb is not None:
+            orig_cb(processed, total)
+
+    kwargs["prompt_progress_callback"] = cb
+
+
 def _instrumented(fn):
     """Log a per-request summary line (prefill/decode tok/s, miss rate,
     bytes read) once the wrapped stream_generate finishes."""
@@ -37,6 +91,7 @@ def _instrumented(fn):
         pools, reader = _STATE["pools"], _STATE["reader"]
         base = aggregate_stats(pools) if pools is not None else None
         r0 = reader.bytes_read if reader else 0
+        _snapshot_progress(kwargs)
         last = None
         try:
             for last in fn(*args, **kwargs):
