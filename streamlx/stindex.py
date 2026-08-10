@@ -26,6 +26,7 @@ class TensorLoc:
     nbytes: int
     dtype: str
     shape: tuple
+    name: str = ""   # tensor key in the checkpoint
 
     @property
     def row_stride(self) -> int:
@@ -53,9 +54,25 @@ class SafetensorsIndex:
                 a, b = info["data_offsets"]
                 self.tensors[name] = TensorLoc(
                     path=shard, abs_start=data_base + a, nbytes=b - a,
-                    dtype=info["dtype"], shape=tuple(info["shape"]))
+                    dtype=info["dtype"], shape=tuple(info["shape"]),
+                    name=name)
         if not self.tensors:
             raise FileNotFoundError(f"no shards under {model_dir}")
+        # Quantization table: bits/group_size come from here (mixed-precision
+        # checkpoints override per path), shapes only cross-check. Keys are
+        # normalized so mlx-vlm's "language_model." prefix matches either way.
+        quant = {}
+        cfg = Path(self.model_dir) / "config.json"
+        if cfg.exists():
+            quant = json.loads(cfg.read_text()).get("quantization") or {}
+        self._quant_default = {k: v for k, v in quant.items()
+                               if not isinstance(v, dict)}
+        self._quant_by_path = {self._norm(k): v for k, v in quant.items()
+                               if isinstance(v, dict)}
+
+    @staticmethod
+    def _norm(key: str) -> str:
+        return key.removeprefix("language_model.")
 
     def switch_triples(self, layer: int) -> dict[str, dict[str, TensorLoc]]:
         """{proj: {weight/scales/biases: TensorLoc}} for one MoE layer."""
@@ -80,15 +97,23 @@ class SafetensorsIndex:
                    for parts in self.switch_triples(layer).values()
                    for loc in parts.values())
 
-    @staticmethod
-    def quant_params(triple: dict[str, TensorLoc],
-                     group_size: int = 64) -> tuple[int, int, int, int]:
-        """(in_features, out_features, bits, group_size) from shapes alone."""
+    def quant_params(self,
+                     triple: dict[str, TensorLoc]) -> tuple[int, int, int, int]:
+        """(in_features, out_features, bits, group_size) for one projection:
+        bits/group_size from the config's quantization table (per-path
+        override, else top-level, else shape inference at gs=64), verified
+        against the packed weight/scales shapes."""
         w, s = triple["weight"], triple["scales"]
-        n_groups = s.shape[-1]
-        in_features = n_groups * group_size
-        packed = w.shape[-1]
-        bits = packed * 32 // in_features
-        if packed * 32 % in_features or bits not in (2, 3, 4, 5, 6, 8):
-            raise ValueError(f"cannot infer bits: W{w.shape} S{s.shape}")
-        return in_features, w.shape[1], bits, group_size
+        n_groups, packed = s.shape[-1], w.shape[-1]
+        ov = self._quant_by_path.get(self._norm(w.name)[: -len(".weight")], {})
+        bits = ov.get("bits", self._quant_default.get("bits"))
+        gs = ov.get("group_size", self._quant_default.get("group_size"))
+        if gs is None:
+            gs = 64
+        in_features = n_groups * gs
+        if bits is None:
+            bits = packed * 32 // in_features
+        if packed * 32 != in_features * bits or bits not in (2, 3, 4, 5, 6, 8):
+            raise ValueError(f"quant mismatch for {w.name}: W{w.shape} "
+                             f"S{s.shape} with bits={bits} group_size={gs}")
+        return in_features, w.shape[1], bits, gs

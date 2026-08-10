@@ -281,6 +281,54 @@ def plan_residency(layers: list, bpe: dict, n_exp: dict,
     return resident, left
 
 
+def _vlm_export_shim(model_dir: str) -> dict | None:
+    """mlx-vlm exports of text-only models prefix every tensor AND every
+    per-path quantization override with "language_model.", which stock
+    mlx-lm text impls don't expect (strict load fails on the extra keys,
+    and the override table would silently never match a module). Detected
+    via the safetensors index; returns a model_config overlay with the
+    prefixes stripped from the quantization table and installs a sanitize
+    wrapper that strips them from the weights. None/no-op for native
+    exports."""
+    import json
+    from pathlib import Path
+
+    idx = Path(model_dir) / "model.safetensors.index.json"
+    if not idx.exists():
+        return None
+    wm = json.loads(idx.read_text())["weight_map"]
+    if not wm or not all(k.startswith("language_model.") for k in wm):
+        return None
+
+    import mlx_lm.utils as _u
+
+    def _remap(k: str) -> str:
+        # mlx-vlm wraps the router matrix in a proj Linear; mlx-lm's
+        # MoEGate holds it directly as `gate.weight`.
+        return k.removeprefix("language_model.").replace(
+            ".mlp.gate.proj.", ".mlp.gate.")
+
+    cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    model_cls, _ = _u._get_classes(config=cfg)
+    if not getattr(model_cls, "_streamlx_vlm_sanitize", False):
+        prev = getattr(model_cls, "sanitize", None)
+
+        def sanitize(self, weights):
+            if prev is not None:
+                weights = prev(self, weights)
+            if any(k.startswith("language_model.") for k in weights):
+                weights = {_remap(k): v for k, v in weights.items()}
+            return weights
+
+        model_cls.sanitize = sanitize
+        model_cls._streamlx_vlm_sanitize = True
+
+    quant = cfg.get("quantization")
+    if not quant:
+        return None
+    return {"quantization": {_remap(k): v for k, v in quant.items()}}
+
+
 def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
                          trust_remote_code: bool = False,
                          tokenizer_config: dict | None = None,
@@ -297,7 +345,8 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
     tok_cfg = dict(tokenizer_config or {})
     if trust_remote_code:
         tok_cfg["trust_remote_code"] = True
-    model, tokenizer = _load(model_dir, lazy=True, tokenizer_config=tok_cfg)
+    model, tokenizer = _load(model_dir, lazy=True, tokenizer_config=tok_cfg,
+                             model_config=_vlm_export_shim(model_dir))
     index = SafetensorsIndex(model_dir)
     reader = ExpertReader(index)
     moe_layers = [i for i, l in enumerate(model.layers)
