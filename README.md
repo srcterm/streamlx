@@ -14,7 +14,7 @@ streamlx keeps a quantized MLX checkpoint's trunk resident and leaves the routed
 
 ## Install
 
-Apple Silicon, Python 3.10+, `mlx-lm` 0.31+. Not on PyPI yet.
+Apple Silicon, Python 3.10+, `mlx-lm` from git main (`pip install git+https://github.com/ml-explore/mlx-lm` — the PyPI release predates `laguna`/`qwen3_5_moe` support). Not on PyPI yet.
 
 ```sh
 git clone https://github.com/srcterm/streamlx
