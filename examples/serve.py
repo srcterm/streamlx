@@ -6,11 +6,19 @@ with streamlx: trunk resident, experts streamed from SSD on demand.
   python examples/serve.py --budget-gib 16 \
       --model <local-model-dir> --port 8080 [--trust-remote-code] \
       [--warmstart-trace trace.npz] [--tokenizer-config key=json ...] \
-      [--resident]
+      [--resident] [--prompt-cache-gib N] [--mlx-cache-gib N]
 
 --model must be a LOCAL directory (the byte-range reader needs the shards on
 disk). Requests are handled sequentially: concurrent batching multiplies the
 per-step expert working set and collapses cache hit rates.
+
+RAM guard: the stock server bounds its prompt-cache LRU by sequence count
+only (bytes are enforced on the batch path we don't use) and MLX's default
+buffer-cache limit is ~95% of RAM, so freed buffers are hoarded forever.
+With most of that wired for Metal, a long agent session runs the machine out
+of unpageable memory. Both get hard byte caps here: --prompt-cache-gib
+(default: RAM - budget - 12 GiB, clamped to [1, 8]) and --mlx-cache-gib
+(default 2).
 """
 
 from __future__ import annotations
@@ -22,13 +30,16 @@ import os
 import sys
 import time
 
+import mlx.core as mx
 import mlx_lm.server as srv
+from mlx_lm.models.cache import can_trim_prompt_cache
 
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
                                 preload_popular)
 
 _CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
-        "tokenizer_config": {}, "resident": None}
+        "tokenizer_config": {}, "resident": None,
+        "prompt_cache_bytes": 4 * 2**30}
 _STATE = {"pools": None, "reader": None}
 
 
@@ -42,6 +53,20 @@ def _recording_fetch(self, model, tokens):
 
 
 srv.LRUPromptCache.fetch_nearest_cache = _recording_fetch
+
+
+_orig_lru_init = srv.LRUPromptCache.__init__
+
+
+def _bounded_lru_init(self, *args, **kwargs):
+    # The stock server only enforces --prompt-cache-bytes on its batch path;
+    # ours is sequential, where inserts are bounded by sequence count alone.
+    # Setting max_bytes makes the stock insert_cache evict on every path.
+    _orig_lru_init(self, *args, **kwargs)
+    self.max_bytes = min(self.max_bytes, _CFG["prompt_cache_bytes"])
+
+
+srv.LRUPromptCache.__init__ = _bounded_lru_init
 
 
 def _snapshot_progress(kwargs):
@@ -59,6 +84,11 @@ def _snapshot_progress(kwargs):
     prompt[:-1], evaluated. (After that, generate_step builds the next
     step's graph before the first yield, so the cache is already one
     generated token ahead — one token no hybrid cache can give back.)
+
+    Skipped when the filled cache is still trimmable (the stock trim path
+    already reuses those; a copy would only double memory) and when the
+    copy alone would exceed half the LRU byte cap (storing it would evict
+    everything else and then be evicted itself — pure churn).
     Disable with STREAMLX_PROMPT_SNAPSHOT=0.
     """
     fetch = _STATE.pop("fetch", None)
@@ -72,12 +102,19 @@ def _snapshot_progress(kwargs):
     orig_cb = kwargs.get("prompt_progress_callback")
 
     def cb(processed, total):
-        if total - processed == 1:
-            t0 = time.perf_counter()
-            lru.insert_cache(model, tokens[:-1], copy.deepcopy(cache),
-                             cache_type="user")
-            print(f"[streamlx] prompt snapshot: {len(tokens) - 1} tok "
-                  f"({time.perf_counter() - t0:.2f}s)", file=sys.stderr)
+        if total - processed == 1 and not can_trim_prompt_cache(cache):
+            snap = sum(c.nbytes for c in cache)
+            if snap > lru.max_bytes // 2:
+                print(f"[streamlx] prompt snapshot skipped: "
+                      f"{snap / 2**30:.2f} GiB copy vs "
+                      f"{lru.max_bytes / 2**30:.1f} GiB cache cap",
+                      file=sys.stderr)
+            else:
+                t0 = time.perf_counter()
+                lru.insert_cache(model, tokens[:-1], copy.deepcopy(cache),
+                                 cache_type="user")
+                print(f"[streamlx] prompt snapshot: {len(tokens) - 1} tok "
+                      f"({time.perf_counter() - t0:.2f}s)", file=sys.stderr)
         if orig_cb is not None:
             orig_cb(processed, total)
 
@@ -170,6 +207,15 @@ class StreamingModelProvider(srv.ModelProvider):
         self.is_batchable = False  # batch-1 by design
 
 
+def _auto_prompt_cache_bytes(ram: int, budget: int) -> int:
+    """Whatever RAM the budget leaves after ~12 GiB for trunk, OS, the
+    active generation's cache and the per-turn copy transients — clamped
+    to [1, 8] GiB. Fallback 4 GiB if RAM can't be detected."""
+    if not ram:
+        return 4 * 2**30
+    return min(max(ram - budget - 12 * 2**30, 1 * 2**30), 8 * 2**30)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--budget-gib", type=float, default=8.0)
@@ -183,12 +229,33 @@ def main() -> None:
                     help="let fully-covered MoE layers stay on the stock "
                          "resident path (faster; trades RAM headroom that "
                          "long contexts need for KV cache)")
+    ap.add_argument("--prompt-cache-gib", type=float, default=None,
+                    help="byte cap for the server's prompt-cache LRU "
+                         "(default: RAM - budget - 12 GiB, clamped to "
+                         "[1, 8]); replaces --prompt-cache-bytes here")
+    ap.add_argument("--mlx-cache-gib", type=float, default=2.0,
+                    help="cap for MLX's freed-buffer cache (default 2; "
+                         "MLX's own default hoards ~95% of RAM)")
     ours, rest = ap.parse_known_args()
     _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
     _CFG["warmstart_trace"] = ours.warmstart_trace
     _CFG["trust"] = ours.trust_remote_code
     if ours.resident:
         _CFG["resident"] = "auto"
+    try:
+        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError):
+        ram = 0
+    if ours.prompt_cache_gib is not None:
+        _CFG["prompt_cache_bytes"] = int(ours.prompt_cache_gib * 2**30)
+    else:
+        _CFG["prompt_cache_bytes"] = _auto_prompt_cache_bytes(
+            ram, _CFG["budget_bytes"])
+    mx.set_cache_limit(int(ours.mlx_cache_gib * 2**30))
+    print(f"[streamlx] ram guard: {ram / 2**30:.0f} GiB RAM, "
+          f"prompt-cache cap {_CFG['prompt_cache_bytes'] / 2**30:.1f} GiB, "
+          f"mlx buffer-cache cap {ours.mlx_cache_gib:.1f} GiB",
+          file=sys.stderr)
     for pair in ours.tokenizer_config:
         key, sep, val = pair.partition("=")
         if not sep:
