@@ -27,6 +27,17 @@ from .reader import ExpertReader
 from .stindex import PARTS, PROJS, SafetensorsIndex
 
 
+_PF_EX = None   # shared 1-thread executor for prefetch submissions
+
+
+def _pf_ex():
+    global _PF_EX
+    if _PF_EX is None:
+        _PF_EX = ThreadPoolExecutor(max_workers=1,
+                                    thread_name_prefix="streamlx-pf")
+    return _PF_EX
+
+
 class StreamingSwitchGLU(nn.Module):
     def __init__(self, pool: StreamingSwitchMLP):
         super().__init__()
@@ -38,6 +49,43 @@ class StreamingSwitchGLU(nn.Module):
         self.sweep_batch = int(os.environ.get("STREAMLX_SWEEP_BATCH", "16"))
         self.sweep_warm = os.environ.get("STREAMLX_SWEEP_WARM", "1") != "0"
         self._sweep_ex = None   # lazy 1-thread executor: batch read-ahead
+        # Attention-window prefetch (F18): predict the NEXT MoE layer's
+        # routing from this layer's residual and read its missing experts
+        # while this layer's FFN and the next layer's attention compute.
+        # (next pool, next gate module, this/next post-attn norm weights);
+        # wired by load_streaming_model when STREAMLX_PREFETCH != 0.
+        self._pf_next = None
+        self._pf_ratio = None    # lazy: w_next / w_this, built on first use
+
+    def _pf_pred_lazy(self, x: mx.array, k: int) -> mx.array | None:
+        """Lazy prediction of the next MoE layer's experts from this
+        layer's input.
+
+        x here is post_ln_this(h); the next gate wants post_ln_next(h).
+        Both RMSNorms divide by the same rms(h), so rescaling by
+        w_next / w_this reproduces the next layer's gate input exactly
+        (F18 depth-2: 71.8% top-k agreement on decode). The returned array
+        is NOT materialized here — the caller evaluates it inside the index
+        sync this layer already pays, so prefetch adds zero extra graph
+        splits. Layers whose routing isn't predictable this early gate
+        themselves off via the absorbing pool's agreement counters."""
+        nxt = self._pf_next
+        if nxt is None:
+            return None
+        pool_j, gate_j, w_i, w_j = nxt
+        if pool_j.pf_agree_tot >= 512 and pool_j.prefetch_agreement() < 0.55:
+            return None
+        try:
+            if self._pf_ratio is None:
+                self._pf_ratio = (w_j / w_i).astype(x.dtype)
+            out = gate_j(x * self._pf_ratio)
+            if isinstance(out, tuple):
+                return out[0], out[1]       # (inds, router scores)
+            inds = mx.argpartition(-out, kth=k - 1, axis=-1)[..., :k]
+            return inds, mx.take_along_axis(out, inds, axis=-1)
+        except Exception:
+            self._pf_next = None   # arch surprise: disable for this link
+            return None
 
     def _remap(self, idx: np.ndarray) -> np.ndarray:
         slots = self.pool.slot_table[idx]
@@ -184,16 +232,33 @@ class StreamingSwitchGLU(nn.Module):
         return y
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        decode = indices.shape[0] * indices.shape[1] == 1  # shape is metadata
+        pred = None
+        if decode:
+            pred = self._pf_pred_lazy(x, indices.shape[-1])
+            if pred is not None:
+                mx.eval(indices, *pred)  # one sync covers all three graphs
         idx = np.array(indices)  # materializes the gate's selection (sync)
         if self.record_sink is not None:
             self.record_sink.append((self.pool.layer, idx.copy()))
         uniq = list(dict.fromkeys(idx.reshape(-1).tolist()))
+        if decode:
+            self.pool.prefetch_absorb(uniq)   # adopt predicted arrivals
         if len(uniq) <= self.pool.n_slots:
             # fast path: whole call fits the pool (always true for decode)
-            if idx.shape[0] * idx.shape[1] == 1:
+            if decode:
                 y = self._overlapped(x, idx)
-                if y is not None:
-                    return y
+                if y is None:
+                    self.pool.ensure(uniq)
+                    y = switch_forward(x, mx.array(self._remap(idx)),
+                                       self.pool.pool, self.pool.qparams)
+                if pred is not None:
+                    pi = np.asarray(pred[0]).reshape(-1)
+                    ps = np.asarray(pred[1]).reshape(-1)
+                    ordered = list(dict.fromkeys(
+                        int(pi[j]) for j in np.argsort(-ps)))
+                    self._pf_next[0].prefetch_start(ordered, _pf_ex())
+                return y
             self.pool.ensure(uniq)
             return switch_forward(x, mx.array(self._remap(idx)),
                                   self.pool.pool, self.pool.qparams)
@@ -372,6 +437,26 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
                                   reader=reader)
         model.layers[i].mlp.switch_mlp = StreamingSwitchGLU(pool)
         pools[i] = pool
+    if os.environ.get("STREAMLX_PREFETCH", "1") != "0":
+        # Link adjacent streamed MoE layers for attention-window prefetch
+        # (F18). Non-adjacent pairs are skipped: an extra block between them
+        # stales the residual the prediction reads.
+        linked = 0
+        ordered = sorted(streamed)
+        for a, b in zip(ordered, ordered[1:]):
+            if b != a + 1:
+                continue
+            gate = getattr(model.layers[b].mlp, "gate", None)
+            ln_a = getattr(model.layers[a], "post_attention_layernorm", None)
+            ln_b = getattr(model.layers[b], "post_attention_layernorm", None)
+            if gate is None or ln_a is None or ln_b is None:
+                continue
+            model.layers[a].mlp.switch_mlp._pf_next = (
+                pools[b], gate, ln_a.weight, ln_b.weight)
+            linked += 1
+        if linked:
+            print(f"[streamlx] attention-window prefetch: {linked} layer "
+                  f"links", file=sys.stderr)
     if res_layers:
         rb = sum(n_exp[i] * bpe[i] for i in res_layers) / 2**30
         print(f"[streamlx] {len(res_layers)} fully-resident MoE layers "
@@ -423,10 +508,14 @@ def preload_popular(pools: dict, trace_npz: str) -> int:
 
 def aggregate_stats(pools: dict) -> dict:
     tot = {"hits": 0, "misses": 0, "evictions": 0, "fetch_s": 0.0,
-           "sweep_experts": 0, "sweep_fetch_s": 0.0, "adopted": 0}
+           "sweep_experts": 0, "sweep_fetch_s": 0.0, "adopted": 0,
+           "pf_calls": 0, "pf_launched": 0, "pf_used": 0,
+           "pf_agree_hit": 0, "pf_agree_tot": 0}
     for p in pools.values():
         s = p.stats
-        for k in ("hits", "misses", "evictions", "sweep_experts", "adopted"):
+        for k in ("hits", "misses", "evictions", "sweep_experts", "adopted",
+                  "pf_calls", "pf_launched", "pf_used",
+                  "pf_agree_hit", "pf_agree_tot"):
             tot[k] += s.get(k, 0)
         tot["fetch_s"] += s["fetch_s"]
         tot["sweep_fetch_s"] += s.get("sweep_fetch_s", 0.0)
