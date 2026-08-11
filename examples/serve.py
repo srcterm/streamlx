@@ -265,6 +265,13 @@ def main() -> None:
         except json.JSONDecodeError:
             _CFG["tokenizer_config"][key] = val  # bare strings are fine
 
+    if not any(a.startswith("--prefill-step-size") for a in rest):
+        # Expert-major sweeps read each chunk's expert union once, so bytes
+        # scale ~1/chunk: 8k prefill = 455 GB at the stock 512 default vs
+        # 124 GB at 2048, wall-clock identical (F20). 4096 halves bytes
+        # again but widens attention transients at long contexts; 2048 is
+        # the safe default.
+        rest += ["--prefill-step-size", "2048"]
     srv.ModelProvider = StreamingModelProvider
     sys.argv = [sys.argv[0]] + rest
     srv.main()
