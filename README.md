@@ -9,6 +9,7 @@ streamlx keeps a quantized MLX checkpoint's trunk resident and leaves the routed
 - The trunk loads via `mlx_lm.load(lazy=True)`; each `SwitchGLU` is swapped for a pool-backed wrapper before evaluation, so expert weights never load.
 - Missing experts are `pread` straight from the safetensors byte ranges, which are span-merged into multi-MB reads for SSD throughput.
 - Experts already resident start on the GPU (`async_eval`) while misses are fetched, so the SSD read overlaps compute, i.e. fetch/compute overlapping, speeding up processing.
+- During decode each layer also predicts the *next* layer's routing from the current residual (~70% accurate) and starts reading the predicted missing experts while attention computes, so most misses are absorbed before they can stall. On by default.
 - Every step is exact: each expert's output depends only on the input and its own weights, so relocating experts into slots and regrouping rows cannot change a bit.
 - Prefill is expert-major: when a chunk's routed set exceeds the pool, each needed expert streams through a throwaway buffer exactly once, in id order, which is ˜5x faster than slicing prefill to fit the pool and the chunk's hottest experts are adopted into the pool, so decode starts warm.
 
@@ -46,8 +47,11 @@ Models must be local directories in MLX format with the standard stacked `switch
 | `--warmstart-trace` | none | Preload popular experts from a routing trace. See below. |
 | `--prompt-cache-gib` | auto | Byte cap for the server's prompt-cache LRU (default `RAM − budget − 12 GiB`, clamped to 1–8). |
 | `--mlx-cache-gib` | 2.0 | Cap for MLX's freed-buffer cache (its own default hoards ~95% of RAM). |
+| `--prefill-step-size` | 2048 | Prefill chunk. Expert-sweep bytes scale ~1/chunk (the mlx-lm default of 512 reads 3.7× more per prompt at identical speed). |
 
 All `mlx_lm.server` flags pass through (`--port`, `--host`, `--temp`, ...). Requests run one at a time by design (batching collapses the expert hit rate); `--draft-model` and `--adapter-path` are unsupported.
+
+Tuning env vars: `STREAMLX_PREFETCH=0` disables the routing-lookahead prefetch, `STREAMLX_PF_TOPM` (default 7) caps how many predicted experts are read per layer, `STREAMLX_EVICT=s3fifo` switches the pool eviction policy (default LRU).
 
 ## Performance
 
