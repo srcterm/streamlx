@@ -56,6 +56,7 @@ class StreamingSwitchGLU(nn.Module):
         # wired by load_streaming_model when STREAMLX_PREFETCH != 0.
         self._pf_next = None
         self._pf_ratio = None    # lazy: w_next / w_this, built on first use
+        self._scout = None       # ScoutDriver when SEF scout is installed
 
     def _pf_pred_lazy(self, x: mx.array, k: int) -> mx.array | None:
         """Lazy prediction of the next MoE layer's experts from this
@@ -63,8 +64,7 @@ class StreamingSwitchGLU(nn.Module):
 
         x here is post_ln_this(h); the next gate wants post_ln_next(h).
         Both RMSNorms divide by the same rms(h), so rescaling by
-        w_next / w_this reproduces the next layer's gate input exactly
-        (F18 depth-2: 71.8% top-k agreement on decode). The returned array
+        w_next / w_this reproduces the next layer's gate input exactly. The returned array
         is NOT materialized here — the caller evaluates it inside the index
         sync this layer already pays, so prefetch adds zero extra graph
         splits. Layers whose routing isn't predictable this early gate
@@ -80,9 +80,12 @@ class StreamingSwitchGLU(nn.Module):
                 self._pf_ratio = (w_j / w_i).astype(x.dtype)
             out = gate_j(x * self._pf_ratio)
             if isinstance(out, tuple):
-                return out[0], out[1]       # (inds, router scores)
+                # scores as float32: bf16 -> numpy trips PEP 3118 buffer
+                # mismatches on some numpy versions
+                return out[0], out[1].astype(mx.float32)
             inds = mx.argpartition(-out, kth=k - 1, axis=-1)[..., :k]
-            return inds, mx.take_along_axis(out, inds, axis=-1)
+            return inds, mx.take_along_axis(out, inds, axis=-1).astype(
+                mx.float32)
         except Exception:
             self._pf_next = None   # arch surprise: disable for this link
             return None
@@ -101,7 +104,7 @@ class StreamingSwitchGLU(nn.Module):
         blocking fetch (GPU idle), then the FFN (SSD idle). Here the hit half
         is dispatched with async_eval first, so the pread overlaps real GPU
         work. Exactness is preserved because switch_forward returns per-expert
-        outputs *before* the router's weighted sum: each row depends only on x
+        outputs before the router's weighted sum: each row depends only on x
         and its own expert, so computing two subsets and permuting back is
         bitwise identical (verified against the stock model by
         examples/validate.py).
@@ -139,32 +142,7 @@ class StreamingSwitchGLU(nn.Module):
         return mx.take(y, mx.array(inv.astype(np.uint32)), axis=-2)
 
     def _expert_sweep(self, x: mx.array, idx: np.ndarray) -> mx.array:
-        """Expert-major prefill: read each routed expert once, in id order.
-
-        When a chunk's expert union exceeds the pool, the token-slicing path
-        re-reads evicted experts (measured 2.7x on Laguna) at scattered-read
-        bandwidth. Here (position, pick) pairs are grouped by expert instead:
-        experts stream through throwaway mini-pools in ascending id order
-        (adjacent rows coalesce into long sequential spans), each read exactly
-        once per chunk, and the LRU pool — decode's working set — is never
-        touched.
-
-        Bitwise-exact vs the pool path: both run switch_forward on the same
-        weight bytes, and every output row depends only on its own x row and
-        its own expert, so regrouping pairs by expert is a permutation of
-        independent computations (same basis as _overlapped, F9).
-
-        Batches dispatch with async_eval so the GPU computes batch i while
-        batch i+1 is read; mini-pool buffers are immutable so no per-slice
-        eval barrier is needed. One eval at the end materializes the layer
-        output and frees the mini-pools before the next layer runs.
-
-        Reads run one batch ahead on a dedicated thread (sweep_fetch_s counts
-        only time actually blocked on IO). With sweep_warm (default on), the
-        chunk's most-routed experts are adopted into the LRU pool as their
-        batch streams by — no extra IO — so decode after prefill starts warm;
-        a final retouch leaves the most-frequent experts most-recently-used.
-        """
+        """Expert-major prefill: read each routed expert once, in id order."""
         pool = self.pool
         b, t, k = idx.shape
         P = b * t
@@ -231,10 +209,24 @@ class StreamingSwitchGLU(nn.Module):
         mx.eval(y, *(pool.pool[p][q] for p in PROJS for q in PARTS))
         return y
 
-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, indices: mx.array,
+                 scores: mx.array | None = None, **_kw) -> mx.array:
+        # `scores`/extra kwargs are fusion hints some hosts pass (e.g. omlx's
+        # deepseek_v4 SwitchGLU); returning per-expert outputs (ndim ==
+        # scores.ndim + 1) makes the caller apply the weighted sum itself.
+        if self._scout is not None and self._scout.building:
+            # scout graph build (same thread, before the exact forward):
+            # pure-graph approximate FFN, no syncs, no state touched
+            from .scout import scout_graph_forward
+            return scout_graph_forward(self, x, indices, scores, self._scout)
         decode = indices.shape[0] * indices.shape[1] == 1  # shape is metadata
         pred = None
-        if decode:
+        # Norm-ratio prefetch yields to a LIVE scout (running both tiers
+        # measured net-negative, F33/F40) and resumes when the scout gates
+        # itself off. STREAMLX_NR_WITH_SCOUT=1 forces coexistence.
+        scout_live = (self._scout is not None and self._scout.enabled
+                      and os.environ.get("STREAMLX_NR_WITH_SCOUT") != "1")
+        if decode and not scout_live:
             pred = self._pf_pred_lazy(x, indices.shape[-1])
             if pred is not None:
                 mx.eval(indices, *pred)  # one sync covers all three graphs
@@ -243,6 +235,9 @@ class StreamingSwitchGLU(nn.Module):
             self.record_sink.append((self.pool.layer, idx.copy()))
         uniq = list(dict.fromkeys(idx.reshape(-1).tolist()))
         if decode:
+            if self._scout is not None:
+                self._scout.observe(self.pool.layer, uniq)
+                self._scout.poll(self.pool.layer)  # harvest scout lookahead
             self.pool.prefetch_absorb(uniq)   # adopt predicted arrivals
         if len(uniq) <= self.pool.n_slots:
             # fast path: whole call fits the pool (always true for decode)
@@ -298,6 +293,16 @@ class StreamingSwitchGLU(nn.Module):
         return y.reshape(b, t, k, y.shape[-1])
 
 
+def _moe_block(layer):
+    """The submodule holding switch_mlp: `mlp` in most mlx-lm MoE models,
+    `ffn` in deepseek_v4."""
+    for attr in ("mlp", "ffn"):
+        m = getattr(layer, attr, None)
+        if m is not None and hasattr(m, "switch_mlp"):
+            return m
+    return None
+
+
 def install_streaming(model, model_dir: str, n_slots: int):
     """Swap every MoE layer's switch_mlp for a streaming wrapper.
 
@@ -307,12 +312,12 @@ def install_streaming(model, model_dir: str, n_slots: int):
     reader = ExpertReader(index)
     pools: dict[int, StreamingSwitchMLP] = {}
     for i, layer in enumerate(model.layers):
-        mlp = getattr(layer, "mlp", None)
-        if mlp is None or not hasattr(mlp, "switch_mlp"):
+        mlp = _moe_block(layer)
+        if mlp is None:
             continue
         pool = StreamingSwitchMLP(model_dir, i, n_slots, index=index,
                                   reader=reader)
-        layer.mlp.switch_mlp = StreamingSwitchGLU(pool)
+        mlp.switch_mlp = StreamingSwitchGLU(pool)
         pools[i] = pool
     if not pools:
         raise RuntimeError("no MoE layers found to wrap")
@@ -397,7 +402,9 @@ def _vlm_export_shim(model_dir: str) -> dict | None:
 def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
                          trust_remote_code: bool = False,
                          tokenizer_config: dict | None = None,
-                         resident: str | None = None):
+                         resident: str | None = None,
+                         model_config: dict | None = None,
+                         scout: str | None = None):
     """Load with lazy=True, wrap MoE layers, materialize ONLY the trunk.
 
     The replaced SwitchGLU modules are dropped before any eval, so expert
@@ -410,12 +417,14 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
     tok_cfg = dict(tokenizer_config or {})
     if trust_remote_code:
         tok_cfg["trust_remote_code"] = True
+    cfg_overlay = _vlm_export_shim(model_dir) or {}
+    cfg_overlay.update(model_config or {})
     model, tokenizer = _load(model_dir, lazy=True, tokenizer_config=tok_cfg,
-                             model_config=_vlm_export_shim(model_dir))
+                             model_config=cfg_overlay or None)
     index = SafetensorsIndex(model_dir)
     reader = ExpertReader(index)
     moe_layers = [i for i, l in enumerate(model.layers)
-                  if hasattr(getattr(l, "mlp", None), "switch_mlp")]
+                  if _moe_block(l) is not None]
     bpe = {i: index.layer_expert_bytes(i) for i in moe_layers}
     n_exp = {i: index.switch_triples(i)["gate_proj"]["weight"].shape[0]
              for i in moe_layers}
@@ -435,7 +444,7 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
         slots = max(k, int(budget_left / len(streamed) / bpe[i]))
         pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
                                   reader=reader)
-        model.layers[i].mlp.switch_mlp = StreamingSwitchGLU(pool)
+        _moe_block(model.layers[i]).switch_mlp = StreamingSwitchGLU(pool)
         pools[i] = pool
     if os.environ.get("STREAMLX_PREFETCH", "1") != "0":
         # Link adjacent streamed MoE layers for attention-window prefetch
@@ -446,17 +455,26 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
         for a, b in zip(ordered, ordered[1:]):
             if b != a + 1:
                 continue
-            gate = getattr(model.layers[b].mlp, "gate", None)
+            gate = getattr(_moe_block(model.layers[b]), "gate", None)
             ln_a = getattr(model.layers[a], "post_attention_layernorm", None)
             ln_b = getattr(model.layers[b], "post_attention_layernorm", None)
             if gate is None or ln_a is None or ln_b is None:
                 continue
-            model.layers[a].mlp.switch_mlp._pf_next = (
+            _moe_block(model.layers[a]).switch_mlp._pf_next = (
                 pools[b], gate, ln_a.weight, ln_b.weight)
             linked += 1
         if linked:
             print(f"[streamlx] attention-window prefetch: {linked} layer "
                   f"links", file=sys.stderr)
+    # SEF scout (F28-F31c): opt-in while experimental; env STREAMLX_SCOUT=1
+    # or scout="on". Requires streamed pools to have anything to predict.
+    sc_mode = scout if scout is not None else os.environ.get(
+        "STREAMLX_SCOUT", "0")
+    if sc_mode not in ("0", "off", "") and pools:
+        from .scout import install_scout
+        drv = install_scout(model, pools)
+        print(f"[streamlx] SEF scout: m={drv.m}, {len(pools)} layers",
+              file=sys.stderr)
     if res_layers:
         rb = sum(n_exp[i] * bpe[i] for i in res_layers) / 2**30
         print(f"[streamlx] {len(res_layers)} fully-resident MoE layers "

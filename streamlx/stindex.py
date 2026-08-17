@@ -78,6 +78,9 @@ class SafetensorsIndex:
         """{proj: {weight/scales/biases: TensorLoc}} for one MoE layer."""
         out: dict[str, dict[str, TensorLoc]] = {}
         tag = f"layers.{layer}.mlp.switch_mlp."
+        if not any(tag in name for name in self.tensors):
+            # deepseek_v4 hangs the MoE block off `ffn`, not `mlp`
+            tag = f"layers.{layer}.ffn.switch_mlp."
         for name, loc in self.tensors.items():
             if tag not in name:
                 continue
