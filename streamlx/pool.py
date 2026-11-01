@@ -67,6 +67,9 @@ class StreamingSwitchMLP:
                         for p in PROJS}
         k_any = self.triples_loc["gate_proj"]["weight"]
         self.n_experts = k_any.shape[0]
+        self.expert_bytes = sum(loc.row_stride
+                                for parts in self.triples_loc.values()
+                                for loc in parts.values())
         if n_slots < 1:
             raise ValueError("n_slots must be >= 1")
         self.n_slots = n_slots
@@ -104,6 +107,8 @@ class StreamingSwitchMLP:
         self.sweep_experts = 0   # expert-rows streamed by prefill sweeps
         self.sweep_fetch_s = 0.0
         self.adopted = 0         # experts placed by prefill sweeps (no IO)
+        self.next_layer_reads = 0   # read for this layer's next sweep early
+        self.next_layer_used = 0    # of those, routed by that sweep
         self._pf = None          # in-flight: (pred_set, launch, fut, rank_of)
         self.pf_calls = 0        # predictions targeting this layer
         self.pf_launched = 0     # experts submitted to async read
@@ -314,6 +319,7 @@ class StreamingSwitchMLP:
         self.sweep_experts = 0
         self.sweep_fetch_s = 0.0
         self.adopted = 0
+        self.next_layer_reads = self.next_layer_used = 0
         self.pf_calls = self.pf_launched = self.pf_used = 0
         self.pf_agree_hit = self.pf_agree_tot = 0
         self.pf_rank = {}
@@ -328,6 +334,8 @@ class StreamingSwitchMLP:
                 "sweep_experts": self.sweep_experts,
                 "sweep_fetch_s": round(self.sweep_fetch_s, 4),
                 "adopted": self.adopted,
+                "next_layer_reads": self.next_layer_reads,
+                "next_layer_used": self.next_layer_used,
                 "pf_calls": self.pf_calls,
                 "pf_launched": self.pf_launched,
                 "pf_used": self.pf_used,
