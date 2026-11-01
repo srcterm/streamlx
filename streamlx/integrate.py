@@ -38,6 +38,15 @@ def _pf_ex():
     return _PF_EX
 
 
+def _stock_sorted(n_routes: int, n_experts: int) -> bool:
+    """Whether the stock module's call runs gather_qmm's sorted matmul
+    kernel: SwitchGLU sorts its routes from 64 on, and gather_qmm takes the
+    sorted kernel from 16 rows and 4 rows per expert on (MLX's GatherQMM
+    rule); otherwise every row is its own matrix-vector product. streamlx
+    picks the same kernel so its outputs match stock's bitwise."""
+    return n_routes >= 64 and n_routes // n_experts >= 4
+
+
 class StreamingSwitchGLU(nn.Module):
     def __init__(self, pool: StreamingSwitchMLP):
         super().__init__()
@@ -138,6 +147,26 @@ class StreamingSwitchGLU(nn.Module):
         inv = np.argsort(np.array(hit_pos + miss_pos, dtype=np.uint32))
         return mx.take(y, mx.array(inv.astype(np.uint32)), axis=-2)
 
+    def _pooled(self, x: mx.array, slots: np.ndarray) -> mx.array:
+        """A non-decode call over pool slots on the kernel stock's call
+        uses (_stock_sorted): sorted by slot where stock sorts and takes the
+        sorted kernel (a pool holds at most the layer's experts, so
+        gather_qmm takes that kernel here too), else the per-row path."""
+        pool = self.pool
+        if not _stock_sorted(slots.size, pool.n_experts):
+            return switch_forward(x, mx.array(slots), pool.pool, pool.qparams)
+        b, t, k = slots.shape
+        flat = slots.reshape(-1)
+        order = np.argsort(flat, kind="stable")
+        xs = mx.take(x.reshape(b * t, -1),
+                     mx.array((order // k).astype(np.uint32)), axis=0)
+        y = switch_forward(xs, mx.array(flat[order]), pool.pool,
+                           pool.qparams, sorted_indices=True)
+        inv = np.empty_like(order)
+        inv[order] = np.arange(order.size)
+        y = mx.take(y, mx.array(inv.astype(np.uint32)), axis=0)
+        return y.reshape(b, t, k, -1)
+
     def _expert_sweep(self, x: mx.array, idx: np.ndarray) -> mx.array:
         """Expert-major prefill: read each routed expert once, in id order.
 
@@ -149,10 +178,14 @@ class StreamingSwitchGLU(nn.Module):
         once per chunk, and the LRU pool — decode's working set — is never
         touched.
 
-        Bitwise-exact vs the pool path: both run switch_forward on the same
-        weight bytes, and every output row depends only on its own x row and
-        its own expert, so regrouping pairs by expert is a permutation of
-        independent computations (same basis as _overlapped, F9).
+        Bitwise-exact vs the stock module: where stock's call runs the
+        sorted matmul kernel (_stock_sorted), each batch here is a run of
+        experts on that kernel (padded when too sparse for it), else every
+        row is a matrix-vector product as in stock; either way every output
+        row depends only on its own x row and its own expert, so splitting
+        the experts into batches is a permutation of independent
+        computations (same basis as _overlapped, F9).
+
 
         Batches dispatch with async_eval so the GPU computes batch i while
         batch i+1 is read; mini-pool buffers are immutable so no per-slice
@@ -169,6 +202,7 @@ class StreamingSwitchGLU(nn.Module):
         b, t, k = idx.shape
         P = b * t
         x_rows = x.reshape(P, -1)
+        srt = _stock_sorted(idx.size, pool.n_experts)
         flat = idx.reshape(-1)                     # pair -> expert id
         row_of_pair = np.repeat(np.arange(P, dtype=np.uint32), k)
 
@@ -208,9 +242,24 @@ class StreamingSwitchGLU(nn.Module):
             sel = order[bounds[i0]:bounds[i1]]
             slot = np.searchsorted(uniq[i0:i1],
                                    sorted_e[bounds[i0]:bounds[i1]])
-            xb = mx.take(x_rows, mx.array(row_of_pair[sel]), axis=0)[None]
-            inds = mx.array(slot.astype(np.uint32))[None, :, None]
-            y = switch_forward(xb, inds, mini, pool.qparams)  # [1, Nb, 1, D]
+            xb = mx.take(x_rows, mx.array(row_of_pair[sel]), axis=0)
+            inds = slot.astype(np.uint32)
+            if srt:
+                # a batch too sparse for the sorted kernel gets zero rows on
+                # its last expert (outputs dropped), so it runs stock's kernel
+                pad = max(16, 4 * len(ids)) - len(inds)
+                if pad > 0:
+                    xb = mx.concatenate(
+                        [xb, mx.zeros((pad, xb.shape[-1]), xb.dtype)])
+                    inds = np.append(inds, np.full(pad, len(ids) - 1,
+                                                   np.uint32))
+                y = switch_forward(xb, mx.array(inds), mini, pool.qparams,
+                                   sorted_indices=True)          # [Nb, D]
+                if pad > 0:
+                    y = y[:-pad]
+            else:
+                y = switch_forward(xb[None], mx.array(inds)[None, :, None],
+                                   mini, pool.qparams)[0, :, 0]
             mx.async_eval(y)       # GPU busy while the next batch is read
             outs.append(y)
             for e in ids:
@@ -221,7 +270,7 @@ class StreamingSwitchGLU(nn.Module):
                 e = int(uniq[i])
                 if e in warm_ids and e in pool.id2slot:
                     pool.id2slot.move_to_end(e)          # most-frequent = MRU
-        y = mx.concatenate(outs, axis=1)[0, :, 0]  # rows in sorted-pair order
+        y = mx.concatenate(outs, axis=0)           # rows in sorted-pair order
         inv = np.empty_like(order)
         inv[order] = np.arange(order.size)
         y = mx.take(y, mx.array(inv.astype(np.uint32)), axis=0)
@@ -260,8 +309,7 @@ class StreamingSwitchGLU(nn.Module):
                     self._pf_next[0].prefetch_start(ordered, _pf_ex())
                 return y
             self.pool.ensure(uniq)
-            return switch_forward(x, mx.array(self._remap(idx)),
-                                  self.pool.pool, self.pool.qparams)
+            return self._pooled(x, self._remap(idx))
 
         if self.prefill_mode == "sweep":
             return self._expert_sweep(x, idx)
@@ -433,6 +481,7 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
     pools: dict[int, StreamingSwitchMLP] = {}
     for i in streamed:
         slots = max(k, int(budget_left / len(streamed) / bpe[i]))
+        slots = min(slots, n_exp[i])   # never more slots than experts
         pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
                                   reader=reader)
         model.layers[i].mlp.switch_mlp = StreamingSwitchGLU(pool)

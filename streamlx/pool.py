@@ -28,21 +28,26 @@ from .stindex import PARTS, PROJS, SafetensorsIndex
 
 
 def switch_forward(x: mx.array, indices: mx.array, triples: dict,
-                   qparams: dict) -> mx.array:
-    """Mirror of SwitchGLU.__call__ decode path (indices.size < 64, no bias).
+                   qparams: dict, sorted_indices: bool = False) -> mx.array:
+    """Mirror of SwitchGLU.__call__ (no bias).
 
-    x: [B, T, D]; indices: [B, T, k] (expert ids for the full tensors, or
-    slot ids for pool tensors). triples: {proj: {weight, scales, biases}}.
-    qparams: {proj: (in_features, out_features, bits, group_size)}.
+    Decode path (stock's below 64 routes): x [B, T, D], indices [B, T, k]
+    (expert ids for the full tensors, or slot ids for pool tensors) ->
+    [B, T, k, D]. Sorted path (stock's from 64 routes on): x [N, D] rows
+    grouped by index, indices [N] ascending -> [N, D]; gather_qmm then runs
+    one matmul per run of equal indices instead of a matrix-vector product
+    per row. triples: {proj: {weight, scales, biases}}. qparams: {proj:
+    (in_features, out_features, bits, group_size)}.
     """
-    x = mx.expand_dims(x, (-2, -3))
+    x = mx.expand_dims(x, -2 if sorted_indices else (-2, -3))
 
     def qmm(inp, proj):
         t = triples[proj]
         _, _, bits, gs = qparams[proj]
         return mx.gather_qmm(inp, t["weight"], t["scales"], t["biases"],
                              rhs_indices=indices, transpose=True,
-                             group_size=gs, bits=bits, mode="affine")
+                             group_size=gs, bits=bits, mode="affine",
+                             sorted_indices=sorted_indices)
 
     x_up = qmm(x, "up_proj")
     x_gate = qmm(x, "gate_proj")
