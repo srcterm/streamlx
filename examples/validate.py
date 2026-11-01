@@ -1,9 +1,12 @@
-"""Correctness gate: with a model that FITS in RAM, greedy decode through
-deliberately tiny streaming pools must match the full-RAM reference
-token-for-token. For >RAM models (no reference possible), run twice at two
-budgets instead — outputs must be identical (pool-size invariance).
+"""Correctness gate: with a model that FITS in RAM, a prefill and greedy
+decode through deliberately tiny streaming pools must match the full-RAM
+reference token-for-token. The prompt is prefilled in one call, so the gate
+covers the prefill sweep too. For >RAM models (no reference possible), run
+twice at two budgets instead — outputs must be identical (pool-size
+invariance).
 
-  python examples/validate.py --model <local-dir> --slots 16 --tokens 256
+  python examples/validate.py --model <local-dir> --slots 16 --tokens 256 \
+      [--prompt-tokens 512]
 """
 
 from __future__ import annotations
@@ -25,8 +28,8 @@ PROMPT = ("The tradeoff between memory bandwidth and storage bandwidth in "
 
 def greedy(model, cache_factory, prompt_ids, n_new, sync_each=False):
     cache = cache_factory()
-    for pid in prompt_ids:
-        logits = model(mx.array([[pid]]), cache=cache)
+    logits = model(mx.array([prompt_ids]), cache=cache)
+    first = logits[:, -1, :]
     tok = mx.argmax(logits[:, -1:, :], axis=-1)
     toks = [tok]
     for _ in range(n_new - 1):
@@ -35,8 +38,8 @@ def greedy(model, cache_factory, prompt_ids, n_new, sync_each=False):
         toks.append(tok)
         if sync_each:
             mx.eval(tok)
-    mx.eval(*toks)
-    return [int(t.item()) for t in toks]
+    mx.eval(first, *toks)
+    return [int(t.item()) for t in toks], first
 
 
 def main() -> int:
@@ -44,6 +47,9 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--slots", type=int, default=16)
     ap.add_argument("--tokens", type=int, default=256)
+    ap.add_argument("--prompt-tokens", type=int, default=512,
+                    help="the prompt repeated to this length: long enough "
+                         "that the prefill takes the sorted-kernel sweep")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -52,19 +58,24 @@ def main() -> int:
           file=sys.stderr)
     cache_factory = lambda: make_prompt_cache(model)  # noqa: E731
     prompt_ids = tokenizer.encode(PROMPT)
+    prompt_ids = (prompt_ids * (args.prompt_tokens // len(prompt_ids) + 1)
+                  )[:args.prompt_tokens]
 
-    ref = greedy(model, cache_factory, prompt_ids, args.tokens,
-                 sync_each=True)
+    ref, ref_logits = greedy(model, cache_factory, prompt_ids, args.tokens,
+                             sync_each=True)
     pools, reader = install_streaming(model, args.model, args.slots)
     print(f"[validate] streaming installed: {len(pools)} layers x "
           f"{args.slots} slots", file=sys.stderr)
-    stream = greedy(model, cache_factory, prompt_ids, args.tokens)
+    stream, logits = greedy(model, cache_factory, prompt_ids, args.tokens)
 
     st = aggregate_stats(pools)
-    match = stream == ref
+    exact = bool(mx.array_equal(logits, ref_logits))
+    match = stream == ref and exact
     print(f"CORRECTNESS GATE: {'PASS' if match else 'FAIL'} — "
           f"{sum(a == b for a, b in zip(ref, stream))}/{args.tokens} "
-          f"tokens identical (miss_rate={st['miss_rate']:.3f}, "
+          f"tokens identical, prefill logits "
+          f"{'bitwise identical' if exact else 'DIFFER'} "
+          f"(miss_rate={st['miss_rate']:.3f}, "
           f"{reader.bytes_read/1e9:.1f} GB streamed)")
     return 0 if match else 1
 
