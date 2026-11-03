@@ -12,7 +12,8 @@ drafter (pip install mlx-vlm), e.g. Mistral Large 4's bundled DSpark head
 split out once with `python -m mlx_vlm.split_mtp --model <checkpoint>
 --output <dir> --q-bits 4`: K tokens in flight, one layer apart, so each
 token's expert reads overlap the others' compute; greedy output identical
-to plain decoding.
+to plain decoding. A self-gate times drafting against plain decoding and
+keeps whichever is faster.
 """
 
 from __future__ import annotations
@@ -121,8 +122,10 @@ def main() -> int:
                                      for i in taps], axis=-1)
             drafter.reset()
             drafter.prime_pairs(hidden[:, :-1], None)
-            dec = PipelinedDecoder(adapter_for(model, drafter), pools, cache,
-                                   k_max=args.draft_k)
+            ad = adapter_for(model, drafter)
+            # plain_fn arms the self-gate: drafting only while it is faster
+            dec = PipelinedDecoder(ad, pools, cache, k_max=args.draft_k,
+                                   plain_fn=ad.plain)
             emit(first)
             out = dec.generate(first, hidden[:, -1:], len(ids),
                                args.max_tokens, on_token=emit, stop=eos)
@@ -147,9 +150,12 @@ def main() -> int:
           f"hit rate {1-st['miss_rate']:.1%} | "
           f"streamed {reader.bytes_read/1e9:.1f} GB from SSD ---")
     if dec is not None:
+        gate = dec.stats()["gate"]
         print(f"--- pipeline: {dec.draft_ok}/{dec.draft_tried} drafts "
               f"accepted, tokens per step "
-              f"{dict(sorted(dec.accepted_hist.items()))} ---")
+              f"{dict(sorted(dec.accepted_hist.items()))}, "
+              f"{dec.plain_steps} plain steps, gate "
+              f"{gate['decisions'] or gate['arm']} ---")
     return 0
 
 

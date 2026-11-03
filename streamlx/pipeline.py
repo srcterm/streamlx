@@ -190,9 +190,13 @@ class PipelinedDecoder:
         # steps + gated plain steps, draft time included) and OFF (plain_fn
         # only), keeps the faster arm for a hold period, and re-probes the
         # other arm afterwards. Needs plain_fn; a decoder without one
-        # always drafts.
+        # always drafts. It starts on the plain arm and ends a probe early
+        # once its arm is clearly the slower: a losing drafter costs seconds
+        # per token on a slow model, a winning one gives up little.
         self.self_gate = bool(self_gate) and plain_fn is not None
         self.gate_probe = 24          # steps (on) / tokens (off) per probe
+        self.gate_min = 8             # samples before a probe may end early,
+        self.gate_early = 0.15        # when this much slower than the other
         self.gate_hold = 192          # tokens between re-probes (doubles on
         self.gate_hold_max = 3072     # a repeated verdict, up to this)
         self._g_hold_cur = 192
@@ -205,6 +209,10 @@ class PipelinedDecoder:
         self._g_hold_left = 0         # tokens left in the hold
         self._g_spt = {"on": None, "off": None}   # sec/token per arm
         self._g_decisions: list = []  # (spt_on, spt_off, chosen)
+        self._g_settle = False        # skip the first step after a switch
+        self._g_draft = 0.0           # draft seconds of the step in flight
+        if self.self_gate:
+            self._g_begin("off")
         self.plain_steps = 0
         # a host whose caches mutate live state in place (rotating windows,
         # pooling rings) supplies its own snapshot/restore
@@ -390,24 +398,35 @@ class PipelinedDecoder:
         return int(mx.argmax(logits[0, -1]).item()), logits, hidden
 
     def _gate_account(self, dt: float, tokens: int) -> None:
-        """Charge `dt` seconds for `tokens` committed tokens to the current
-        gate phase (draft time is charged separately by _draft_for)."""
+        """Charge `dt` seconds, plus the step's draft time, for `tokens`
+        committed tokens to the current gate phase."""
         if not self.self_gate:
             return
+        dt += self._g_draft
+        self._g_draft = 0.0
         self._warm_gate = getattr(self, "_warm_gate", 0) + 1
         if self._warm_gate <= 2:
             return                        # a sequence's cold steps
-        self._g_t += dt
-        self._g_tok += tokens
-        self._g_n += 1
         if self._g_hold_left > 0:
             self._g_hold_left -= tokens
             if self._g_hold_left <= 0:
                 # hold over: probe the OTHER arm
                 self._g_begin(self._other())
             return
-        if self._g_n >= self.gate_probe:
-            self._g_spt[self._g_phase] = self._g_t / max(self._g_tok, 1)
+        if self._g_settle:
+            # an arm's first step pays the switch (the drafter catching up
+            # on the context it skipped, the pool turning over), not its rate
+            self._g_settle = False
+            return
+        self._g_t += dt
+        self._g_tok += tokens
+        self._g_n += 1
+        spt = self._g_t / max(self._g_tok, 1)
+        other = self._g_spt[self._other()]
+        early = (other is not None and self._g_n >= self.gate_min
+                 and spt > other * (1.0 + self.gate_early))
+        if self._g_n >= self.gate_probe or early:
+            self._g_spt[self._g_phase] = spt
             on, off = self._g_spt["on"], self._g_spt["off"]
             if on is None or off is None:
                 self._g_begin(self._other())        # measure the other arm
@@ -432,6 +451,7 @@ class PipelinedDecoder:
         self._g_t = 0.0
         self._g_tok = 0
         self._g_hold_left = hold
+        self._g_settle = True
 
     # -- the decode loop -----------------------------------------------------
     def generate(self, first_tok: int, first_hidden, offset: int,
@@ -651,8 +671,7 @@ class PipelinedDecoder:
             res = self.ad.draft(tok_pairs, depth)
         dt = time.perf_counter() - t0
         self.t_draft += dt
-        if self.self_gate and getattr(self, "_warm_gate", 0) > 2:
-            self._g_t += dt                     # the drafter's cost is the
+        self._g_draft = dt                  # charged with this step's time
         drafts, conf = list(res[0]), list(res[1])
         self._draft_q = list(res[2]) if len(res) > 2 and res[2] is not None else None
         if self.tau > 0:

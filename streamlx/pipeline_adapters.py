@@ -80,11 +80,17 @@ class StandardMoEAdapter:
             blk = getattr(l, self._mlp, None)
             self._switch_attr[id(blk)] = _find_switch(l)
         self.drafter = drafter if drafter is not None else _MtpDrafter.maybe(model, self)
+        # a block drafter (DSpark, DFlash) reads these layers' outputs,
+        # concatenated in its order; other drafters read the last layer's
+        drafter = self.drafter
+        self.tap_layers = tuple(getattr(drafter, "tap_layers", None) or ())
+        self.taps = frozenset(self.tap_layers)
 
     # -- token entry / exit ----------------------------------------------------
     def prep(self, tok: int, offset: int, pos_base=None, i: int = 0):
         ids = mx.array([[tok]])
-        return ids, self.embed_tokens(ids), None
+        pos = SimpleNamespace(taps={}) if self.taps else None
+        return ids, self.embed_tokens(ids), pos
 
     def offset(self, cache) -> int:
         for c in cache:
@@ -119,7 +125,8 @@ class StandardMoEAdapter:
         h2 = h + r
         blk = getattr(layer, self._mlp, None)
         xn = getattr(layer, self._norm2)(h2)
-        return SimpleNamespace(h=h2, xn=xn, inds=self._route(blk, xn), blk=blk)
+        return SimpleNamespace(h=h2, xn=xn, inds=self._route(blk, xn), blk=blk,
+                               pos=pos)
 
     def _route(self, blk, xn):
         """The block's routed expert ids for xn, captured by running it with
@@ -137,7 +144,29 @@ class StandardMoEAdapter:
         return stub.inds
 
     def finish(self, l, st):
-        return st.h + st.blk(st.xn)
+        h = st.h + st.blk(st.xn)
+        if l in self.taps:
+            st.pos.taps[l] = h
+        return h
+
+    def draft_hidden(self, h, pos):
+        """A stream's hidden for its drafter: the tap layers' outputs
+        concatenated, else the last layer's output."""
+        if not self.taps:
+            return h
+        return mx.concatenate([pos.taps[i] for i in self.tap_layers], axis=-1)
+
+    def plain(self, tok: int, cache, pos_base=None):
+        """The model's own one-token forward, expert prefetch included: the
+        pipeline's plain_fn. Returns (logits, the hidden draft_hidden
+        gives). Hosts that pass position ids supply their own."""
+        want = self.tap_layers or (len(self.layers) - 1,)
+        with capture_layer_outputs(self.model, want) as got:
+            logits = self.model(mx.array([[tok]]), cache=cache)
+        if not self.taps:
+            return logits, got[want[0]][-1]
+        return logits, mx.concatenate([got[i][-1] for i in self.tap_layers],
+                                      axis=-1)
 
     # -- drafting ----------------------------------------------------------------
     @property
@@ -170,9 +199,7 @@ class MistralLarge4Adapter(StandardMoEAdapter):
     """mlx-lm's mistral_large4: attention takes (mask, rope, log_pos, cache,
     shared_kv, prev_topk) and returns (out, topk), and the model threads
     per-token RoPE, latents shared across layers and the DSA indexer's top-k
-    through its layers, so each stream carries its own (in `pos`). With a
-    drafter that names tap layers (a DSpark head) a stream's draft hidden is
-    those layers' outputs, concatenated."""
+    through its layers, so each stream carries its own (in `pos`)."""
 
     def __init__(self, model, drafter=None):
         super().__init__(model, drafter)
@@ -181,7 +208,6 @@ class MistralLarge4Adapter(StandardMoEAdapter):
         self._log_positions = _log_positions
         self._dims, self._freqs = self.inner.rope.dims, self.inner.rope.freqs()
         self._cap = getattr(model.text_args, "final_logit_softcapping", None)
-        self.taps = frozenset(getattr(drafter, "tap_layers", ()))
 
     def prep(self, tok: int, offset: int, pos_base=None, i: int = 0):
         ids = mx.array([[tok]])
@@ -192,7 +218,7 @@ class MistralLarge4Adapter(StandardMoEAdapter):
                                 scale=1.0, offset=offset, freqs=freqs)
 
         pos = SimpleNamespace(rope=rope, log_pos=self._log_positions(offset, 1),
-                              shared={}, topk=None, taps=[])
+                              shared={}, topk=None, taps={})
         return ids, self.embed_tokens(ids), pos
 
     def offset(self, cache) -> int:
@@ -214,15 +240,6 @@ class MistralLarge4Adapter(StandardMoEAdapter):
         xn = layer.post_attention_layernorm(h2)
         return SimpleNamespace(h=h2, xn=xn, inds=self._route(layer.mlp, xn),
                                blk=layer.mlp, pos=pos)
-
-    def finish(self, l, st):
-        h = st.h + st.blk(st.xn)
-        if l in self.taps:
-            st.pos.taps.append(h)
-        return h
-
-    def draft_hidden(self, h, pos):
-        return mx.concatenate(pos.taps, axis=-1) if self.taps else h
 
 
 def adapter_for(model, drafter=None):
