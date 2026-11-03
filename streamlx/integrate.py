@@ -389,7 +389,7 @@ class StreamingSwitchGLU(nn.Module):
                                        self.pool.pool, self.pool.qparams)
                 if pred is not None:
                     pi = np.asarray(pred[0]).reshape(-1)
-                    ps = np.asarray(pred[1]).reshape(-1)
+                    ps = np.asarray(pred[1].astype(mx.float32)).reshape(-1)
                     ordered = list(dict.fromkeys(
                         int(pi[j]) for j in np.argsort(-ps)))
                     self._pf_next[0].prefetch_start(ordered, _pf_ex())
