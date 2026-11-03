@@ -6,7 +6,8 @@ with streamlx: trunk resident, experts streamed from SSD on demand.
   python examples/serve.py --budget-gib 16 \
       --model <local-model-dir> --port 8080 [--trust-remote-code] \
       [--warmstart-trace trace.npz] [--tokenizer-config key=json ...] \
-      [--resident] [--prompt-cache-gib N] [--mlx-cache-gib N]
+      [--resident] [--prompt-cache-gib N] [--mlx-cache-gib N] \
+      [--kv-cache-dir DIR [--kv-cache-gib N]]
 
 --model must be a LOCAL directory (the byte-range reader needs the shards on
 disk). Requests are handled sequentially: concurrent batching multiplies the
@@ -24,6 +25,12 @@ Long prefills of models whose attention head size MLX's fused kernel does
 not cover (256 in Qwen3.5/3.6) would build heads x queries x keys of scores
 per layer, GiBs at coding-agent context lengths: streamlx.attention runs
 them in blocks of query rows, bitwise the same output (always on).
+
+--kv-cache-dir moves prompt caches to SSD instead (streamlx.kvcache): stored
+once as segments shared by every request with the same prefix, so RAM holds
+only the active request's cache. --kv-cache-gib bounds the disk use (default
+32; oldest segments go first). A drive other than the model's avoids sharing
+its bandwidth with expert reads.
 """
 
 from __future__ import annotations
@@ -42,6 +49,7 @@ from mlx_lm.models.cache import can_trim_prompt_cache
 from streamlx import attention
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
                                 preload_popular)
+from streamlx.kvcache import PagedPromptCache
 
 _CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
         "tokenizer_config": {}, "resident": None,
@@ -135,7 +143,13 @@ def _instrumented(fn):
         base = aggregate_stats(pools) if pools is not None else None
         r0 = reader.bytes_read if reader else 0
         mx.reset_peak_memory()
-        _snapshot_progress(kwargs)
+        paged = _STATE.get("paged")
+        if paged is not None and kwargs.get("prompt_cache") is not None:
+            kwargs["prompt_progress_callback"] = paged.progress_callback(
+                kwargs["prompt_cache"], len(kwargs.get("prompt") or ()),
+                kwargs.get("prompt_progress_callback"))
+        else:
+            _snapshot_progress(kwargs)
         last = None
         try:
             for last in fn(*args, **kwargs):
@@ -158,6 +172,9 @@ def _instrumented(fn):
                         msg += f" | miss {miss * 100:.1f}%"
                 if reader:
                     msg += f" | {(reader.bytes_read - r0) / 1e9:.1f} GB read"
+                if paged is not None:
+                    msg += (f" | kv: {paged.last[0]} of {paged.last[1]} tok "
+                            f"from SSD, {paged.nbytes / 1e9:.1f} GB stored")
                 msg += f" | peak {mx.get_peak_memory() / 2**30:.1f} GiB"
                 print(msg, file=sys.stderr)
     return gen
@@ -244,6 +261,11 @@ def main() -> None:
     ap.add_argument("--mlx-cache-gib", type=float, default=2.0,
                     help="cap for MLX's freed-buffer cache (default 2; "
                          "MLX's own default hoards ~95% of RAM)")
+    ap.add_argument("--kv-cache-dir", default=None,
+                    help="keep prompt caches on SSD in this directory "
+                         "(paged; replaces the RAM prompt cache)")
+    ap.add_argument("--kv-cache-gib", type=float, default=32.0,
+                    help="disk space for --kv-cache-dir (default 32)")
     ours, rest = ap.parse_known_args()
     _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
     _CFG["warmstart_trace"] = ours.warmstart_trace
@@ -261,8 +283,19 @@ def main() -> None:
             ram, _CFG["budget_bytes"])
     mx.set_cache_limit(int(ours.mlx_cache_gib * 2**30))
     attention.install()
-    print(f"[streamlx] ram guard: {ram / 2**30:.0f} GiB RAM, "
-          f"prompt-cache cap {_CFG['prompt_cache_bytes'] / 2**30:.1f} GiB, "
+    if ours.kv_cache_dir:
+        def paged(*_args, **_kwargs):
+            _STATE["paged"] = PagedPromptCache(
+                ours.kv_cache_dir, int(ours.kv_cache_gib * 2**30))
+            return _STATE["paged"]
+
+        srv.LRUPromptCache = paged
+        where = (f"prompt caches on SSD at {ours.kv_cache_dir} "
+                 f"(<= {ours.kv_cache_gib:.0f} GiB)")
+    else:
+        where = (f"prompt-cache cap "
+                 f"{_CFG['prompt_cache_bytes'] / 2**30:.1f} GiB")
+    print(f"[streamlx] ram guard: {ram / 2**30:.0f} GiB RAM, {where}, "
           f"mlx buffer-cache cap {ours.mlx_cache_gib:.1f} GiB",
           file=sys.stderr)
     for pair in ours.tokenizer_config:
