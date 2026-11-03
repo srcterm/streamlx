@@ -26,6 +26,14 @@ not cover (256 in Qwen3.5/3.6) would build heads x queries x keys of scores
 per layer, GiBs at coding-agent context lengths: streamlx.attention runs
 them in blocks of query rows, bitwise the same output (always on).
 
+Prefill stops where a chat prompt's history ends, before the template's
+answer prompt, and the prompt cache stores that point: the next turn repeats
+everything before it, so it restores it whole and prefills only what is new
+(thinking templates drop a past answer's "<think>", and hybrid caches cannot
+trim back to a divergence). Chunks are evened out, at most 1.25x
+--prefill-step-size, instead of ending in a small one: each chunk's expert
+sweep reads ~every expert.
+
 --kv-cache-dir moves prompt caches to SSD instead (streamlx.kvcache): stored
 once as segments shared by every request with the same prefix, so RAM holds
 only the active request's cache. --kv-cache-gib bounds the disk use (default
@@ -44,6 +52,8 @@ import time
 
 import mlx.core as mx
 import mlx_lm.server as srv
+from mlx_lm.generate import (generation_stream, maybe_quantize_kv_cache,
+                             wired_limit)
 from mlx_lm.models.cache import can_trim_prompt_cache
 
 from streamlx import attention
@@ -61,7 +71,7 @@ _orig_fetch = srv.LRUPromptCache.fetch_nearest_cache
 
 
 def _recording_fetch(self, model, tokens):
-    # Stash the request's full token key for the prompt-boundary snapshot.
+    # Stash the request's full token key for the history snapshot.
     _STATE["fetch"] = (self, model, list(tokens))
     return _orig_fetch(self, model, tokens)
 
@@ -83,73 +93,120 @@ def _bounded_lru_init(self, *args, **kwargs):
 srv.LRUPromptCache.__init__ = _bounded_lru_init
 
 
-def _snapshot_progress(kwargs):
-    """Cache an extra copy of the KV state at the prompt boundary.
+def _gen_suffix(tokenizer, template_args: dict) -> list[int]:
+    """The tokens the chat template appends for add_generation_prompt, e.g.
+    Qwen3.6's "<|im_start|>assistant\\n<think>\\n" ([] if none)."""
+    msgs = [{"role": "user", "content": "x"}]
+    try:
+        a, b = (list(tokenizer.apply_chat_template(
+            msgs, add_generation_prompt=g, tokenize=True, **template_args))
+            for g in (False, True))
+    except Exception:  # noqa: BLE001 — no template, or one needing more
+        return []
+    return b[len(a):] if b[:len(a)] == a else []
 
-    Agent clients rewrite history every turn (reasoning stripped, tool
-    output re-rendered), so the post-generation cache the server stores is
-    never a strict prefix of the next prompt — and hybrid-cache models
-    (rotating KV, conv state) cannot trim back to the divergence point, so
-    every turn reprocesses the whole prompt. An extra entry keyed by the
-    prompt itself makes the next turn a pure extension: no trim needed.
 
-    The copy is taken at the prefill progress callback where
-    total - processed == 1: the one point where the cache holds exactly
-    prompt[:-1], evaluated. (After that, generate_step builds the next
-    step's graph before the first yield, so the cache is already one
-    generated token ahead — one token no hybrid cache can give back.)
+def _chunks(n: int, step: int) -> list[int]:
+    """Prefill chunk sizes for n tokens: as many as step-size chunks take,
+    one fewer when the last would be under a quarter step, evened out. Each
+    chunk's expert sweep reads ~every expert, so a small last chunk costs as
+    many bytes as a full one."""
+    k = -(-n // step)
+    if k > 1 and n - (k - 1) * step < step // 4:
+        k -= 1
+    q, r = divmod(n, k)
+    return [q + 1] * r + [q] * (k - r)
 
-    Skipped when the filled cache is still trimmable (the stock trim path
-    already reuses those; a copy would only double memory) and when the
-    copy alone would exceed half the LRU byte cap (storing it would evict
-    everything else and then be evicted itself — pure churn).
-    Disable with STREAMLX_PROMPT_SNAPSHOT=0.
+
+def _snapshot(fetch, n: int, cache) -> None:
+    """RAM prompt cache: store a copy of the live cache at tokens[:n].
+
+    Skipped when the cache is still trimmable (the stock trim path already
+    reuses those; a copy would only double memory) and when the copy alone
+    would exceed half the LRU byte cap (storing it would evict everything
+    else and then be evicted itself). Disable with STREAMLX_PROMPT_SNAPSHOT=0.
+    """
+    lru, model, tokens = fetch
+    if (os.environ.get("STREAMLX_PROMPT_SNAPSHOT", "1") == "0" or n < 256
+            or can_trim_prompt_cache(cache)):
+        return
+    snap = sum(c.nbytes for c in cache)
+    if snap > lru.max_bytes // 2:
+        print(f"[streamlx] prompt snapshot skipped: {snap / 2**30:.2f} GiB "
+              f"copy vs {lru.max_bytes / 2**30:.1f} GiB cache cap",
+              file=sys.stderr)
+        return
+    t0 = time.perf_counter()
+    lru.insert_cache(model, tokens[:n], copy.deepcopy(cache),
+                     cache_type="user")
+    print(f"[streamlx] prompt snapshot: {n} tok "
+          f"({time.perf_counter() - t0:.2f}s)", file=sys.stderr)
+
+
+def _prefill_history(kwargs: dict) -> int:
+    """Prefill the request's uncached prompt up to where its history ends,
+    store the cache there and leave the rest to stream_generate (updates
+    kwargs); returns the tokens prefilled here.
+
+    The history ends before the tokens the chat template appends to ask for
+    an answer. The next turn's prompt repeats this one up to there but not
+    always beyond (a thinking template renders a past answer without the
+    "<think>" it was prompted with), and hybrid caches (recurrent state,
+    rotating KV) cannot trim back, so a cache stored any later is of no use
+    to it. Stored there (a segment with --kv-cache-dir, else a RAM copy), the
+    next turn restores it and prefills only its new tokens. Prompts without
+    that suffix stop one token short of their end.
     """
     fetch = _STATE.pop("fetch", None)
-    cache = kwargs.get("prompt_cache")
-    if (os.environ.get("STREAMLX_PROMPT_SNAPSHOT", "1") == "0"
-            or fetch is None or cache is None):
-        return
-    lru, model, tokens = fetch
-    if len(tokens) < 256:
-        return
-    orig_cb = kwargs.get("prompt_progress_callback")
-
-    def cb(processed, total):
-        if total - processed == 1 and not can_trim_prompt_cache(cache):
-            snap = sum(c.nbytes for c in cache)
-            if snap > lru.max_bytes // 2:
-                print(f"[streamlx] prompt snapshot skipped: "
-                      f"{snap / 2**30:.2f} GiB copy vs "
-                      f"{lru.max_bytes / 2**30:.1f} GiB cache cap",
-                      file=sys.stderr)
-            else:
-                t0 = time.perf_counter()
-                lru.insert_cache(model, tokens[:-1], copy.deepcopy(cache),
-                                 cache_type="user")
-                print(f"[streamlx] prompt snapshot: {len(tokens) - 1} tok "
-                      f"({time.perf_counter() - t0:.2f}s)", file=sys.stderr)
-        if orig_cb is not None:
-            orig_cb(processed, total)
-
-    kwargs["prompt_progress_callback"] = cb
+    prompt, cache, model = (kwargs.get(k)
+                            for k in ("prompt", "prompt_cache", "model"))
+    if (cache is None or model is None or not isinstance(prompt, list)
+            or kwargs.get("draft_model") is not None):
+        return 0
+    sfx = _STATE.get("suffix") or []
+    cut = len(prompt) - (len(sfx) if sfx and prompt[-len(sfx):] == sfx
+                         else 1)
+    if cut < 1:
+        return 0
+    paged = _STATE.get("paged")
+    base = (paged.last[0] if paged is not None
+            else len(fetch[2]) - len(prompt) if fetch else 0)
+    cb = kwargs.get("prompt_progress_callback") or (lambda *_: None)
+    stream = kwargs.get("stream", generation_stream)
+    tokens, done = mx.array(prompt[:cut]), 0
+    cb(0, len(prompt))
+    with wired_limit(model, [stream]), mx.stream(stream):
+        for n in _chunks(cut, kwargs.get("prefill_step_size", 2048)):
+            model(tokens[None, done:done + n], cache=cache)
+            maybe_quantize_kv_cache(
+                cache, kwargs.get("quantized_kv_start", 0),
+                kwargs.get("kv_group_size", 64), kwargs.get("kv_bits"))
+            mx.eval([c.state for c in cache])
+            done += n
+            if paged is not None:
+                paged.save_progress(base + done, cache)
+            cb(done, len(prompt))
+            mx.clear_cache()
+    if paged is None and fetch is not None:
+        _snapshot(fetch, base + cut, cache)
+    kwargs["prompt"] = prompt[cut:]
+    kwargs["prompt_progress_callback"] = lambda p, t: cb(cut + p, cut + t)
+    return cut
 
 
 def _instrumented(fn):
-    """Log a per-request summary line (prefill/decode tok/s, miss rate,
-    bytes read) once the wrapped stream_generate finishes."""
+    """Run the request's history prefill (_prefill_history), then the
+    wrapped stream_generate; log a summary line (prefill/decode tok/s, miss
+    rate, bytes read, KV restored, peak memory) once it finishes."""
     def gen(*args, **kwargs):
         pools, reader = _STATE["pools"], _STATE["reader"]
         base = aggregate_stats(pools) if pools is not None else None
         r0 = reader.bytes_read if reader else 0
         mx.reset_peak_memory()
         paged = _STATE.get("paged")
-        if paged is not None and kwargs.get("prompt_cache") is not None:
-            kwargs["prompt_progress_callback"] = paged.progress_callback(
-                kwargs["prompt_cache"], len(kwargs.get("prompt") or ()),
-                kwargs.get("prompt_progress_callback"))
-        else:
-            _snapshot_progress(kwargs)
+        t0 = time.perf_counter()
+        pre = _prefill_history(kwargs)
+        t_pre = time.perf_counter() - t0
         last = None
         try:
             for last in fn(*args, **kwargs):
@@ -158,9 +215,10 @@ def _instrumented(fn):
             # The server breaks out of its loop on stop conditions, which
             # closes this generator instead of exhausting it — log either way.
             if last is not None:
-                msg = (f"[streamlx] prefill {last.prompt_tokens} tok @ "
-                       f"{last.prompt_tps:.1f} tok/s | decode "
-                       f"{last.generation_tokens} tok")
+                n = pre + last.prompt_tokens
+                t = t_pre + last.prompt_tokens / last.prompt_tps
+                msg = (f"[streamlx] prefill {n} tok @ {n / t:.1f} tok/s | "
+                       f"decode {last.generation_tokens} tok")
                 if last.generation_tokens >= 2:  # rate meaningless below
                     msg += f" @ {last.generation_tps:.1f} tok/s"
                 if base is not None:
@@ -224,6 +282,11 @@ class StreamingModelProvider(srv.ModelProvider):
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
+        _STATE["suffix"] = _gen_suffix(tokenizer,
+                                       self.cli_args.chat_template_args)
+        if _STATE["suffix"]:
+            print(f"[streamlx] history ends before "
+                  f"{tokenizer.decode(_STATE['suffix'])!r}", file=sys.stderr)
 
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model

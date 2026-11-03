@@ -4,11 +4,11 @@ Coding agents resend a long, mostly unchanged prompt every turn. mlx-lm's
 server keeps finished caches in a RAM LRU and deep-copies one into every
 request, so at long contexts the stored caches and their copies are what
 fill RAM. Here prompt caches live on disk as segments of the token sequence,
-each keyed by a hash of every token before its end. Segments are written at
-each prefill chunk boundary (an aborted request keeps what it computed), at
-the prompt's end and after generation; a request restores the longest prefix
-it shares with anything stored, from any earlier turn or conversation, and
-RAM holds only the active request's cache.
+each keyed by a hash of every token before its end. Segments are written as
+prefill proceeds (save_progress; an aborted request keeps what it computed)
+and after generation; a request restores the longest prefix it shares with
+anything stored, from any earlier turn or conversation, and RAM holds only
+the active request's cache.
 
 Layers whose cache grows along the sequence (KVCache, QuantizedKVCache,
 ConcatenateKVCache and CacheLists of them) store each segment's slice: a
@@ -19,7 +19,7 @@ restore at segment ends only.
 
 Drop-in for mlx_lm's LRUPromptCache in the sequential server (one request at
 a time): the same fetch_nearest_cache / insert_cache interface, plus
-save_progress for prefill chunk boundaries.
+save_progress(n, cache) when the active request's prefill reaches token n.
 """
 
 from __future__ import annotations
@@ -409,20 +409,6 @@ class PagedPromptCache:
         self._cur = (tokens, best[-1].end if best else 0,
                      best[-1].key if best else "")
         return cache, tokens[n:]
-
-    def progress_callback(self, cache, n_rest: int, callback=None):
-        """Wrap a prefill progress callback (processed, total over the
-        n_rest tokens the restored cache left) so every chunk boundary is
-        stored."""
-        base = len(self._cur[0]) - n_rest if self._cur else 0
-
-        def cb(processed, total):
-            if self._cur is not None and 0 < processed < total:
-                self.save_progress(base + processed, cache)
-            if callback is not None:
-                callback(processed, total)
-
-        return cb
 
     def save_progress(self, n: int, cache) -> None:
         """Prefill reached tokens[:n] of the active request: store it."""
