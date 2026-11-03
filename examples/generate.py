@@ -5,7 +5,14 @@ Streams tokens to stdout live, then prints the punchline stats
 
   python examples/generate.py --model <local-model-dir> --budget-gib 16 \
       --prompt "..." --max-tokens 200 [--trust-remote-code] \
-      [--warmstart-trace trace.npz]
+      [--warmstart-trace trace.npz] [--draft-head DIR [--draft-k 4]]
+
+--draft-head decodes through streamlx.pipeline with an mlx-vlm block
+drafter (pip install mlx-vlm), e.g. Mistral Large 4's bundled DSpark head
+split out once with `python -m mlx_vlm.split_mtp --model <checkpoint>
+--output <dir> --q-bits 4`: K tokens in flight, one layer apart, so each
+token's expert reads overlap the others' compute; greedy output identical
+to plain decoding.
 """
 
 from __future__ import annotations
@@ -17,11 +24,14 @@ import time
 from pathlib import Path
 
 import mlx.core as mx
-
+from mlx_lm.generate import generation_stream, wired_limit
 from mlx_lm.models.cache import make_prompt_cache
 
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
                                 preload_popular)
+from streamlx.pipeline_adapters import capture_layer_outputs
+
+PREFILL_STEP = 4096
 
 
 def model_size_gb(model_dir: str) -> float:
@@ -44,6 +54,10 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=200)
     ap.add_argument("--warmstart-trace", default=None)
     ap.add_argument("--trust-remote-code", action="store_true")
+    ap.add_argument("--draft-head", default=None,
+                    help="mlx-vlm drafter directory: pipelined decoding")
+    ap.add_argument("--draft-k", type=int, default=4,
+                    help="tokens in flight with --draft-head (default 4)")
     args = ap.parse_args()
 
     size = model_size_gb(args.model)
@@ -64,32 +78,66 @@ def main() -> int:
         print(f"[load] warm-start in {time.time()-t0:.1f}s "
               f"({reader.bytes_read/1e9:.1f} GB)", file=sys.stderr)
 
-    cache = make_prompt_cache(model)
-    for pid in tokenizer.encode(args.prompt):
-        logits = model(mx.array([[pid]]), cache=cache)
-    tok = mx.argmax(logits[:, -1:, :], axis=-1)
+    drafter = None
+    if args.draft_head:
+        from streamlx.pipeline_adapters import load_drafter
 
-    detok = tokenizer.detokenizer
-    detok.reset()
-    for p in pools.values():
-        p.reset_stats()
-    reader.reset_stats()
+        t0 = time.time()
+        drafter = load_drafter(args.draft_head, model)
+        print(f"[load] draft head in {time.time()-t0:.1f}s", file=sys.stderr)
 
-    t0 = time.time()
-    n = 0
-    for _ in range(args.max_tokens):
-        mx.eval(tok)
-        tid = int(tok.item())
-        if tid in (tokenizer.eos_token_ids or set()):
-            break
-        detok.add_token(tid)
-        print(detok.last_segment, end="", flush=True)
-        logits = model(tok, cache=cache)
-        tok = mx.argmax(logits[:, -1:, :], axis=-1)
-        n += 1
-    detok.finalize()
-    print(detok.last_segment)
-    dt = time.time() - t0
+    # what stream_generate holds while it runs: MLX's buffers stay wired
+    # instead of pageable, so a large trunk is not compressed or swapped
+    with wired_limit(model, [generation_stream]):
+        ids = tokenizer.encode(args.prompt)
+        cache = make_prompt_cache(model)
+        taps = list(drafter.tap_layers) if drafter is not None else []
+        with capture_layer_outputs(model, taps) as got:
+            for i in range(0, len(ids), PREFILL_STEP):
+                chunk = mx.array([ids[i:i + PREFILL_STEP]])
+                logits = model(chunk, cache=cache)
+                mx.eval(logits)
+        first = int(mx.argmax(logits[0, -1]).item())
+
+        eos = set(tokenizer.eos_token_ids or ())
+        detok = tokenizer.detokenizer
+        detok.reset()
+        for p in pools.values():
+            p.reset_stats()
+        reader.reset_stats()
+
+        def emit(t: int) -> None:
+            if t not in eos:
+                detok.add_token(t)
+                print(detok.last_segment, end="", flush=True)
+
+        t0 = time.time()
+        dec = None
+        if drafter is not None:
+            from streamlx.pipeline import PipelinedDecoder
+            from streamlx.pipeline_adapters import adapter_for
+
+            hidden = mx.concatenate([mx.concatenate(got[i], axis=1)
+                                     for i in taps], axis=-1)
+            drafter.reset()
+            drafter.prime_pairs(hidden[:, :-1], None)
+            dec = PipelinedDecoder(adapter_for(model, drafter), pools, cache,
+                                   k_max=args.draft_k)
+            emit(first)
+            out = dec.generate(first, hidden[:, -1:], len(ids),
+                               args.max_tokens, on_token=emit, stop=eos)
+        else:
+            out, tok = [first], first
+            emit(first)
+            while len(out) < args.max_tokens and tok not in eos:
+                logits = model(mx.array([[tok]]), cache=cache)
+                tok = int(mx.argmax(logits[0, -1]).item())
+                out.append(tok)
+                emit(tok)
+        n = len([t for t in out if t not in eos])
+        detok.finalize()
+        print(detok.last_segment)
+        dt = time.time() - t0
 
     st = aggregate_stats(pools)
     peak = mx.get_peak_memory() / 1e9
@@ -98,6 +146,10 @@ def main() -> int:
           f"peak resident {peak:.1f} GB | "
           f"hit rate {1-st['miss_rate']:.1%} | "
           f"streamed {reader.bytes_read/1e9:.1f} GB from SSD ---")
+    if dec is not None:
+        print(f"--- pipeline: {dec.draft_ok}/{dec.draft_tried} drafts "
+              f"accepted, tokens per step "
+              f"{dict(sorted(dec.accepted_hist.items()))} ---")
     return 0
 
 
