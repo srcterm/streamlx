@@ -57,6 +57,7 @@ from dataclasses import dataclass, field
 import mlx.core as mx
 import numpy as np
 
+from .pool import KEEPALIVE, keepalive_wait
 
 # -- generic cache snapshot ---------------------------------------------------
 
@@ -296,6 +297,8 @@ class PipelinedDecoder:
         if s.fut is not None:
             pool = self.pools[l]
             t0 = time.perf_counter()
+            if KEEPALIVE:
+                keepalive_wait([s.fut])                     # GPU kept busy
             raw = s.fut.result()                            # IO residual
             t1 = time.perf_counter()
             rows = self.reader.experts_from_raw(pool.triples_loc, s.missing,

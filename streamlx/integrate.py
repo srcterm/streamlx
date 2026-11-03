@@ -22,7 +22,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .pool import StreamingSwitchMLP, switch_forward
+from .pool import KEEPALIVE, StreamingSwitchMLP, keepalive_wait, switch_forward
 from .reader import ExpertReader
 from .stindex import PROJS, SafetensorsIndex
 
@@ -137,7 +137,8 @@ class StreamingSwitchGLU(nn.Module):
             eidx = mx.array(eidx, dtype=mx.uint32)
         return (es[0], es[1], eidx)
 
-    def _overlapped(self, x: mx.array, idx: np.ndarray) -> mx.array | None:
+    def _overlapped(self, x: mx.array, idx: np.ndarray,
+                    wait=None) -> mx.array | None:
         """Compute resident experts on the GPU while missing ones are read.
 
         Baseline order per layer is strictly serial — gate sync, then a
@@ -150,6 +151,7 @@ class StreamingSwitchGLU(nn.Module):
         examples/validate.py).
 
         Returns None when there is nothing to overlap (no misses, or no hits).
+        `wait` is handed to the pool's fetch (the GPU keepalive).
         """
         flat = idx.reshape(-1).tolist()
         seen, hit_ids, miss_ids = set(), [], []
@@ -174,7 +176,7 @@ class StreamingSwitchGLU(nn.Module):
                                    [[[flat[i] for i in hit_pos]]]))
         mx.async_eval(y_hit)              # GPU starts; CPU proceeds to fetch
 
-        self.pool.ensure(miss_ids)
+        self.pool.ensure(miss_ids, wait=wait)
 
         slots = [self.pool.id2slot[flat[i]] for i in miss_pos]
         y_miss = switch_forward(x, mx.array([[slots]], dtype=mx.uint32),
@@ -418,19 +420,25 @@ class StreamingSwitchGLU(nn.Module):
         sweep = len(uniq) > self.pool.n_slots and self.prefill_mode == "sweep"
         if self._early is not None and not sweep:
             self._take_early(set())   # the previous layer read for a sweep
+        # Decode reads wait with the GPU kept busy (see pool._GpuKeepalive).
+        ka = keepalive_wait if decode and KEEPALIVE else None
         if decode:
-            self.pool.prefetch_absorb(uniq)   # adopt predicted arrivals
+            self.pool.prefetch_absorb(uniq, wait=ka)  # adopt predicted arrivals
         if len(uniq) <= self.pool.n_slots:
             # fast path: whole call fits the pool (always true for decode)
             if decode:
-                y = self._overlapped(x, idx)
+                y = self._overlapped(x, idx, wait=ka)
                 if y is None:
-                    self.pool.ensure(uniq)
+                    self.pool.ensure(uniq, wait=ka)
                     y = switch_forward(x, mx.array(self._remap(idx)),
                                        self.pool.pool, self.pool.qparams,
                                        self.pool.act,
                                        escales=self._esc(
                                            idx.astype(np.uint32)))
+                if ka is not None:
+                    # Dispatch the layer's experts now, so the GPU starts on
+                    # them while the host builds the rest of the layer.
+                    mx.async_eval(y)
                 if pred is not None:
                     pi = np.asarray(pred[0]).reshape(-1)
                     ps = np.asarray(pred[1].astype(mx.float32)).reshape(-1)

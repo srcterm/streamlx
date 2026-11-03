@@ -16,8 +16,10 @@ compute graph is built). Requires n_slots >= k.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import wait as _wait_all
 
 import mlx.core as mx
 import numpy as np
@@ -25,6 +27,47 @@ from mlx_lm.models.activations import swiglu
 
 from .reader import ExpertReader
 from .stindex import PARTS, PROJS, SafetensorsIndex
+
+# STREAMLX_KEEPALIVE=0 turns off the decode-time GPU keepalive below and the
+# wrapper's early output dispatch (integrate.py).
+KEEPALIVE = os.environ.get("STREAMLX_KEEPALIVE", "1") != "0"
+_KEEPALIVE_PERIOD_S = 50e-6
+_KEEPALIVE_LOCAL = threading.local()
+
+
+class _GpuKeepalive:
+    """Keeps the GPU clocked while the decode thread waits on expert reads.
+
+    Apple GPUs lower their clock after a couple of milliseconds idle, and the
+    next layer's work runs slower until it recovers. One gather at the start
+    of the wait does not hold the clock (sparse bursts measured slower than a
+    plain idle gap); near-continuous tiny submissions do. At most two trivial
+    kernels are in flight, touching nothing the model reads. One per thread:
+    an mx array is bound to the stream of the thread that made it.
+    """
+
+    def __init__(self):
+        self._x = mx.zeros((8,), dtype=mx.float32)
+        self._inflight: list = []
+
+    def wait(self, futures) -> None:
+        while True:
+            _, pending = _wait_all(futures, timeout=_KEEPALIVE_PERIOD_S)
+            if not pending:
+                return
+            y = self._x + 1
+            mx.async_eval(y)
+            self._inflight.append(y)
+            if len(self._inflight) > 2:
+                mx.eval(self._inflight.pop(0))
+
+
+def keepalive_wait(futures) -> None:
+    """Block until `futures` finish, keeping the GPU busy meanwhile."""
+    ka = getattr(_KEEPALIVE_LOCAL, "ka", None)
+    if ka is None:
+        ka = _KEEPALIVE_LOCAL.ka = _GpuKeepalive()
+    ka.wait(futures)
 
 
 def switch_forward(x: mx.array, indices: mx.array, triples: dict,
@@ -204,13 +247,15 @@ class StreamingSwitchMLP:
         self.slot_table[e] = slot
         return slot
 
-    def ensure(self, ids: list[int]) -> list[int]:
+    def ensure(self, ids: list[int], wait=None) -> list[int]:
         """Return slot ids for `ids` (touch order = given order, like the sim).
 
         Misses are slot-assigned in order (eviction policy above, identical
         semantics to the simulator) but FETCHED as one coalesced batch —
         eviction decisions never depend on fetch timing, so miss counts stay
         sim-exact while IO gets span-merged + threaded (M4 coalescing).
+        `wait`, when given, blocks on the batch's read futures in place of a
+        plain wait (the decode path's GPU keepalive).
         """
         slots = []
         missing: list[int] = []
@@ -225,7 +270,8 @@ class StreamingSwitchMLP:
             slots.append(self.id2slot[e])
         if missing:
             t0 = time.perf_counter()
-            rows = self.reader.read_experts(self.triples_loc, missing)
+            rows = self.reader.read_experts(self.triples_loc, missing,
+                                            wait=wait)
             for e in missing:
                 slot = self.id2slot[e]
                 for proj in PROJS:
@@ -277,7 +323,7 @@ class StreamingSwitchMLP:
                     ex.submit(self.reader.read_experts_raw,
                               self.triples_loc, launch), rank_of)
 
-    def prefetch_absorb(self, wanted: list[int]) -> None:
+    def prefetch_absorb(self, wanted: list[int], wait=None) -> None:
         """Adopt prefetched experts this step actually routed to. Called
         before ensure(), so absorbed experts are hits with no blocking read.
         Blocks on the in-flight read only when the step needs its bytes
@@ -298,6 +344,8 @@ class StreamingSwitchMLP:
         if not take:
             return
         try:
+            if wait is not None:
+                wait([fut])
             raws = fut.result()
             rows = self.reader.experts_from_raw(self.triples_loc, launch,
                                                 raws)

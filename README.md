@@ -51,7 +51,7 @@ Models must be local directories in MLX format with the standard stacked `switch
 
 All `mlx_lm.server` flags pass through (`--port`, `--host`, `--temp`, ...). Requests run one at a time by design (batching collapses the expert hit rate); `--draft-model` and `--adapter-path` are unsupported.
 
-Tuning env vars: `STREAMLX_PREFETCH=0` disables the routing-lookahead prefetch, `STREAMLX_PF_TOPM` (default 7) caps how many predicted experts are read per layer, `STREAMLX_EVICT=s3fifo` switches the pool eviction policy (default LRU).
+Tuning env vars: `STREAMLX_PREFETCH=0` disables the routing-lookahead prefetch, `STREAMLX_PF_TOPM` (default 7) caps how many predicted experts are read per layer, `STREAMLX_EVICT=s3fifo` switches the pool eviction policy (default LRU), `STREAMLX_KEEPALIVE=0` stops keeping the GPU busy while a decode step waits on its expert reads (Apple GPUs lower their clock after a few milliseconds idle, which slows the next layer's work).
 
 ## Pipelined expert fetching (models with an MTP head)
 

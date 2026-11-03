@@ -78,8 +78,10 @@ class ExpertReader:
             spans.append((path, off, n, [(key, 0, n)]))
         return spans
 
-    def read_ranges(self, requests) -> dict:
-        """[(key, path, off, n)] -> {key: memoryview of exactly n bytes}."""
+    def read_ranges(self, requests, wait=None) -> dict:
+        """[(key, path, off, n)] -> {key: memoryview of exactly n bytes}.
+        `wait`, when given, is called with the read futures before they are
+        harvested (it must return only once all of them are done)."""
         spans = self._plan(requests)
 
         def read_span(span):
@@ -115,10 +117,16 @@ class ExpertReader:
                 i = loads.index(min(loads))
                 buckets[i].append(sp)
                 loads[i] += sp[2]
-            for fut in [self._ex.submit(read_bucket, b) for b in buckets if b]:
+            futs = [self._ex.submit(read_bucket, b) for b in buckets if b]
+            if wait is not None:
+                wait(futs)
+            for fut in futs:
                 harvest(fut.result())
             return out
-        for fut in [self._ex.submit(read_span, s) for s in spans]:
+        futs = [self._ex.submit(read_span, s) for s in spans]
+        if wait is not None:
+            wait(futs)
+        for fut in futs:
             harvest([fut.result()])
         return out
 
@@ -132,7 +140,8 @@ class ExpertReader:
             out = out.view(_MX_VIEW[loc.dtype])
         return out
 
-    def read_experts_raw(self, layer_triples: dict, ids: list[int]) -> dict:
+    def read_experts_raw(self, layer_triples: dict, ids: list[int],
+                         wait=None) -> dict:
         """{(e, proj, part): memoryview} — raw bytes only, one coalesced
         batch. Safe from any thread: no mx arrays are created (mx arrays are
         stream-bound to the creating thread)."""
@@ -143,7 +152,7 @@ class ExpertReader:
                     loc = layer_triples[proj][part]
                     path, off, n = loc.expert_range(e)
                     requests.append(((e, proj, part), path, off, n))
-        return self.read_ranges(requests)
+        return self.read_ranges(requests, wait=wait)
 
     def experts_from_raw(self, layer_triples: dict, ids: list[int],
                          raw: dict) -> dict:
@@ -155,10 +164,12 @@ class ExpertReader:
                     for proj in PROJS}
                 for e in ids}
 
-    def read_experts(self, layer_triples: dict, ids: list[int]) -> dict:
+    def read_experts(self, layer_triples: dict, ids: list[int],
+                     wait=None) -> dict:
         """{expert_id: {proj: {part: mx.array}}} — one coalesced batch."""
         return self.experts_from_raw(
-            layer_triples, ids, self.read_experts_raw(layer_triples, ids))
+            layer_triples, ids,
+            self.read_experts_raw(layer_triples, ids, wait=wait))
 
     def read_expert(self, layer_triples: dict, e: int) -> dict:
         return self.read_experts(layer_triples, [e])[e]
