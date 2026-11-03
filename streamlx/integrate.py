@@ -537,7 +537,24 @@ def _vlm_export_shim(model_dir: str) -> dict | None:
     return {"quantization": {_remap(k): v for k, v in quant.items()}}
 
 
-def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
+def _routed_topk(model_dir: str, default: int = 8) -> int:
+    """The checkpoint's num_experts_per_tok (top level or text_config)."""
+    import json
+    from pathlib import Path
+
+    try:
+        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    except (OSError, ValueError):
+        return default
+    for c in (cfg, cfg.get("text_config") or {}):
+        v = c.get("num_experts_per_tok")
+        if isinstance(v, int) and v > 0:
+            return v
+    return default
+
+
+def load_streaming_model(model_dir: str, budget_bytes: int,
+                         k: int | None = None,
                          trust_remote_code: bool = False,
                          tokenizer_config: dict | None = None,
                          resident: str | None = None):
@@ -546,8 +563,12 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
     The replaced SwitchGLU modules are dropped before any eval, so expert
     tensors are never materialized — resident memory = trunk + pools. Budget
     is split per layer by that layer's actual expert byte size (same
-    equal-bytes policy as sim/lru_sim.py).
+    equal-bytes policy as sim/lru_sim.py). Every streamed layer keeps at
+    least k slots (default: the model's experts per token, which one decode
+    step needs at once; 8 if the config does not say).
     """
+    if k is None:
+        k = _routed_topk(model_dir)
     from mlx_lm import load as _load
 
     tok_cfg = dict(tokenizer_config or {})
