@@ -21,10 +21,11 @@ of unpageable memory. Both get hard byte caps here: --prompt-cache-gib
 (default: RAM - budget - 12 GiB, clamped to [1, 8]) and --mlx-cache-gib
 (default 2).
 
-Long prefills of models whose attention head size MLX's fused kernel does
-not cover (256 in Qwen3.5/3.6) would build heads x queries x keys of scores
-per layer, GiBs at coding-agent context lengths: streamlx.attention runs
-them in blocks of query rows, bitwise the same output (always on).
+Long prefills of models whose attention head size MLX does not fuse by
+default (256 in Qwen3.5/3.6) would build heads x queries x keys of scores per
+layer, GiBs at coding-agent context lengths: streamlx.attention sends those
+calls to MLX's fused kernel where it has one (MLX >= 0.32.2), else runs them
+in blocks of query rows, bitwise the unfused output (always on).
 
 Prefill stops where a chat prompt's history ends, before the template's
 answer prompt, and the prompt cache stores that point: the next turn repeats
