@@ -19,6 +19,11 @@ With most of that wired for Metal, a long agent session runs the machine out
 of unpageable memory. Both get hard byte caps here: --prompt-cache-gib
 (default: RAM - budget - 12 GiB, clamped to [1, 8]) and --mlx-cache-gib
 (default 2).
+
+Long prefills of models whose attention head size MLX's fused kernel does
+not cover (256 in Qwen3.5/3.6) would build heads x queries x keys of scores
+per layer, GiBs at coding-agent context lengths: streamlx.attention runs
+them in blocks of query rows, bitwise the same output (always on).
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ import mlx.core as mx
 import mlx_lm.server as srv
 from mlx_lm.models.cache import can_trim_prompt_cache
 
+from streamlx import attention
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
                                 preload_popular)
 
@@ -128,6 +134,7 @@ def _instrumented(fn):
         pools, reader = _STATE["pools"], _STATE["reader"]
         base = aggregate_stats(pools) if pools is not None else None
         r0 = reader.bytes_read if reader else 0
+        mx.reset_peak_memory()
         _snapshot_progress(kwargs)
         last = None
         try:
@@ -151,6 +158,7 @@ def _instrumented(fn):
                         msg += f" | miss {miss * 100:.1f}%"
                 if reader:
                     msg += f" | {(reader.bytes_read - r0) / 1e9:.1f} GB read"
+                msg += f" | peak {mx.get_peak_memory() / 2**30:.1f} GiB"
                 print(msg, file=sys.stderr)
     return gen
 
@@ -252,6 +260,7 @@ def main() -> None:
         _CFG["prompt_cache_bytes"] = _auto_prompt_cache_bytes(
             ram, _CFG["budget_bytes"])
     mx.set_cache_limit(int(ours.mlx_cache_gib * 2**30))
+    attention.install()
     print(f"[streamlx] ram guard: {ram / 2**30:.0f} GiB RAM, "
           f"prompt-cache cap {_CFG['prompt_cache_bytes'] / 2**30:.1f} GiB, "
           f"mlx buffer-cache cap {ours.mlx_cache_gib:.1f} GiB",
