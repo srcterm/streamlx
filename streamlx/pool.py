@@ -28,43 +28,60 @@ from .stindex import PARTS, PROJS, SafetensorsIndex
 
 
 def switch_forward(x: mx.array, indices: mx.array, triples: dict,
-                   qparams: dict, sorted_indices: bool = False) -> mx.array:
-    """Mirror of SwitchGLU.__call__ (no bias).
+                   qparams: dict, act=None, escales=None,
+                   sorted_indices: bool = False) -> mx.array:
+    """Mirror of SwitchGLU.__call__ decode path (indices.size < 64, no bias).
 
-    Decode path (stock's below 64 routes): x [B, T, D], indices [B, T, k]
-    (expert ids for the full tensors, or slot ids for pool tensors) ->
-    [B, T, k, D]. Sorted path (stock's from 64 routes on): x [N, D] rows
-    grouped by index, indices [N] ascending -> [N, D]; gather_qmm then runs
-    one matmul per run of equal indices instead of a matrix-vector product
-    per row. triples: {proj: {weight, scales, biases}}. qparams: {proj:
-    (in_features, out_features, bits, group_size)}.
+    x: [B, T, D]; indices: [B, T, k] (expert ids for the full tensors, or
+    slot ids for pool tensors). triples: {proj: {weight, scales[, biases]}}
+    (mxfp modes ship no biases). qparams: {proj: (in_features,
+    out_features, bits, group_size, mode)}. act: the model's activation
+    module when it is not plain SwiGLU, called with SwitchGLU's (up, gate)
+    order. escales: optional (gate_vec[E], out_vec[E], eidx) per-expert
+    output scales applied exactly as the stock module does; eidx indexes
+    the vectors by EXPERT id with the same nesting as `indices` (which may
+    hold pool slot ids, a different numbering).
     """
     x = mx.expand_dims(x, -2 if sorted_indices else (-2, -3))
 
     def qmm(inp, proj):
         t = triples[proj]
-        _, _, bits, gs = qparams[proj]
-        return mx.gather_qmm(inp, t["weight"], t["scales"], t["biases"],
+        _, _, bits, gs, mode = qparams[proj]
+        return mx.gather_qmm(inp, t["weight"], t["scales"], t.get("biases"),
                              rhs_indices=indices, transpose=True,
-                             group_size=gs, bits=bits, mode="affine",
+                             group_size=gs, bits=bits, mode=mode,
                              sorted_indices=sorted_indices)
+
+    def esc(vec, eidx, like):
+        sc = vec[eidx].astype(like.dtype)
+        return sc.reshape(sc.shape + (1,) * (like.ndim - sc.ndim))
 
     x_up = qmm(x, "up_proj")
     x_gate = qmm(x, "gate_proj")
-    x = qmm(swiglu(x_gate, x_up), "down_proj")
+    if escales is not None:
+        x_gate = x_gate * esc(escales[0], escales[2], x_gate)
+    h = swiglu(x_gate, x_up) if act is None else act(x_up, x_gate)
+    x = qmm(h, "down_proj")
+    if escales is not None:
+        x = x * esc(escales[1], escales[2], x)
     return x.squeeze(-2)
 
 
 class StreamingSwitchMLP:
     def __init__(self, model_dir: str, layer: int, n_slots: int,
                  index: SafetensorsIndex | None = None,
-                 reader: ExpertReader | None = None):
+                 reader: ExpertReader | None = None,
+                 tag: str | None = None):
         self.index = index or SafetensorsIndex(model_dir)
         self.reader = reader or ExpertReader(self.index)
         self.layer = layer
-        self.triples_loc = self.index.switch_triples(layer)
+        self.tag = tag              # module path of a non-trunk block
+        self.triples_loc = self.index.switch_triples(layer, tag=tag)
         self.qparams = {p: self.index.quant_params(self.triples_loc[p])
                         for p in PROJS}
+        # parts present in this layer's tensors (affine: W/S/B; mxfp: W/S)
+        self.parts = tuple(pt for pt in PARTS
+                           if pt in self.triples_loc["gate_proj"])
         k_any = self.triples_loc["gate_proj"]["weight"]
         self.n_experts = k_any.shape[0]
         self.expert_bytes = sum(loc.row_stride
@@ -76,16 +93,20 @@ class StreamingSwitchMLP:
         # on the slab's size, and stock's holds exactly the layer's experts
         n_slots = min(n_slots, self.n_experts)
         self.n_slots = n_slots
+        self.act = None       # non-default activation, set at wrap time
+        self.escales = None   # optional (gate_vec, out_vec), set at wrap time
+        self._pf_suspend = False  # a pipelined step is running: no lookahead
 
         import numpy as np  # local: only for dtype mapping at alloc
 
         def alloc(loc):
             dt = {"U32": mx.uint32, "BF16": mx.bfloat16,
-                  "F16": mx.float16, "F32": mx.float32}[loc.dtype]
+                  "F16": mx.float16, "F32": mx.float32,
+                  "U8": mx.uint8, "U16": mx.uint16}[loc.dtype]
             return mx.zeros((n_slots,) + loc.shape[1:], dtype=dt)
 
         self.pool = {p: {part: alloc(self.triples_loc[p][part])
-                         for part in PARTS} for p in PROJS}
+                         for part in self.parts} for p in PROJS}
         self.id2slot: OrderedDict[int, int] = OrderedDict()
         self.free = list(range(n_slots))
         # Eviction policy: "lru" (default) or "s3fifo" (F19: -9..-12% misses
@@ -208,7 +229,7 @@ class StreamingSwitchMLP:
             for e in missing:
                 slot = self.id2slot[e]
                 for proj in PROJS:
-                    for part in PARTS:
+                    for part in self.parts:
                         self.pool[proj][part][slot] = rows[e][proj][part]
             self.fetch_s += time.perf_counter() - t0
         return slots
@@ -306,7 +327,7 @@ class StreamingSwitchMLP:
             slot = self._take_slot_for(e)
         self.adopted += 1
         for proj in PROJS:
-            for part in PARTS:
+            for part in self.parts:
                 self.pool[proj][part][slot] = arrays[proj][part]
 
     def __call__(self, x: mx.array, expert_ids: list[int]) -> mx.array:
@@ -314,7 +335,10 @@ class StreamingSwitchMLP:
             raise ValueError("n_slots must be >= k")
         slots = self.ensure(expert_ids)
         inds = mx.array([[slots]], dtype=mx.uint32)
-        return switch_forward(x, inds, self.pool, self.qparams)
+        es = (None if self.escales is None else
+              (*self.escales, mx.array([[expert_ids]], dtype=mx.uint32)))
+        return switch_forward(x, inds, self.pool, self.qparams, self.act,
+                              escales=es)
 
     def reset_stats(self) -> None:
         self.hits = self.misses = self.evictions = 0

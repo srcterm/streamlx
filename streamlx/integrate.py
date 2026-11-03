@@ -24,7 +24,7 @@ import numpy as np
 
 from .pool import StreamingSwitchMLP, switch_forward
 from .reader import ExpertReader
-from .stindex import PARTS, PROJS, SafetensorsIndex
+from .stindex import PROJS, SafetensorsIndex
 
 
 _PF_EX = None   # shared 1-thread executor for prefetch submissions
@@ -83,6 +83,11 @@ class StreamingSwitchGLU(nn.Module):
         # wired by load_streaming_model when STREAMLX_PREFETCH != 0.
         self._pf_next = None
         self._pf_ratio = None    # lazy: w_next / w_this, built on first use
+        # Hosts probe these to pick fused resident-tensor fast paths; None
+        # sends them down the standard switch_mlp(x, indices) call.
+        self.gate_proj = None
+        self.up_proj = None
+        self.down_proj = None
 
     def _pf_pred_lazy(self, x: mx.array, k: int) -> mx.array | None:
         """Lazy prediction of the next MoE layer's experts from this
@@ -121,6 +126,17 @@ class StreamingSwitchGLU(nn.Module):
                                f"(layer {self.pool.layer})")
         return slots
 
+    def _esc(self, eidx) -> tuple | None:
+        """switch_forward's escales triple, or None (the common case). eidx:
+        EXPERT-id index nested like the call site's slot indices — the scale
+        vectors are expert-addressed while pool slots permute."""
+        es = self.pool.escales
+        if es is None:
+            return None
+        if not isinstance(eidx, mx.array):
+            eidx = mx.array(eidx, dtype=mx.uint32)
+        return (es[0], es[1], eidx)
+
     def _overlapped(self, x: mx.array, idx: np.ndarray) -> mx.array | None:
         """Compute resident experts on the GPU while missing ones are read.
 
@@ -152,34 +168,46 @@ class StreamingSwitchGLU(nn.Module):
 
         slots = [self.pool.id2slot[flat[i]] for i in hit_pos]
         y_hit = switch_forward(x, mx.array([[slots]], dtype=mx.uint32),
-                               self.pool.pool, self.pool.qparams)
+                               self.pool.pool, self.pool.qparams,
+                               self.pool.act,
+                               escales=self._esc(
+                                   [[[flat[i] for i in hit_pos]]]))
         mx.async_eval(y_hit)              # GPU starts; CPU proceeds to fetch
 
         self.pool.ensure(miss_ids)
 
         slots = [self.pool.id2slot[flat[i]] for i in miss_pos]
         y_miss = switch_forward(x, mx.array([[slots]], dtype=mx.uint32),
-                                self.pool.pool, self.pool.qparams)
+                                self.pool.pool, self.pool.qparams,
+                                self.pool.act,
+                                escales=self._esc(
+                                    [[[flat[i] for i in miss_pos]]]))
 
         y = mx.concatenate([y_hit, y_miss], axis=-2)
         inv = np.argsort(np.array(hit_pos + miss_pos, dtype=np.uint32))
         return mx.take(y, mx.array(inv.astype(np.uint32)), axis=-2)
 
-    def _pooled(self, x: mx.array, slots: np.ndarray) -> mx.array:
+    def _pooled(self, x: mx.array, idx: np.ndarray,
+                slots: np.ndarray) -> mx.array:
         """A non-decode call over pool slots on the kernel stock's call
         uses (_stock_sorted): sorted by slot where stock sorts and takes the
         sorted kernel (a pool holds at most the layer's experts, so
         gather_qmm takes that kernel here too), else the per-row path."""
         pool = self.pool
         if not _stock_sorted(slots.size, pool.n_experts):
-            return switch_forward(x, mx.array(slots), pool.pool, pool.qparams)
+            return switch_forward(x, mx.array(slots), pool.pool, pool.qparams,
+                                  pool.act,
+                                  escales=self._esc(idx.astype(np.uint32)))
         b, t, k = slots.shape
         flat = slots.reshape(-1)
         order = np.argsort(flat, kind="stable")
         xs = mx.take(x.reshape(b * t, -1),
                      mx.array((order // k).astype(np.uint32)), axis=0)
+        eidx = idx.reshape(-1)[order].astype(np.uint32)
         y = switch_forward(xs, mx.array(flat[order]), pool.pool,
-                           pool.qparams, sorted_indices=True)
+                           pool.qparams, pool.act,
+                           escales=self._esc(mx.array(eidx)),
+                           sorted_indices=True)
         inv = np.empty_like(order)
         inv[order] = np.arange(order.size)
         y = mx.take(y, mx.array(inv.astype(np.uint32)), axis=0)
@@ -319,7 +347,7 @@ class StreamingSwitchGLU(nn.Module):
             rows = pool.reader.experts_from_raw(pool.triples_loc, ids, raw)
             pool.sweep_experts += len(ids)
             mini = {p: {q: mx.stack([rows[e][p][q] for e in ids])
-                        for q in PARTS} for p in PROJS}
+                        for q in pool.parts} for p in PROJS}
             i0 = bi * self.sweep_batch
             i1 = min(i0 + self.sweep_batch, len(uniq))
             sel = order[bounds[i0]:bounds[i1]]
@@ -327,6 +355,7 @@ class StreamingSwitchGLU(nn.Module):
                                    sorted_e[bounds[i0]:bounds[i1]])
             xb = mx.take(x_rows, mx.array(row_of_pair[sel]), axis=0)
             inds = slot.astype(np.uint32)
+            eb = sorted_e[bounds[i0]:bounds[i1]].astype(np.uint32)
             if srt:
                 # a batch too sparse for the sorted kernel gets zero rows on
                 # its last expert (outputs dropped), so it runs stock's kernel
@@ -336,13 +365,17 @@ class StreamingSwitchGLU(nn.Module):
                         [xb, mx.zeros((pad, xb.shape[-1]), xb.dtype)])
                     inds = np.append(inds, np.full(pad, len(ids) - 1,
                                                    np.uint32))
+                    eb = np.append(eb, np.full(pad, ids[-1], np.uint32))
                 y = switch_forward(xb, mx.array(inds), mini, pool.qparams,
+                                   pool.act, escales=self._esc(mx.array(eb)),
                                    sorted_indices=True)          # [Nb, D]
                 if pad > 0:
                     y = y[:-pad]
             else:
                 y = switch_forward(xb[None], mx.array(inds)[None, :, None],
-                                   mini, pool.qparams)[0, :, 0]
+                                   mini, pool.qparams, pool.act,
+                                   escales=self._esc(
+                                       mx.array(eb)[None, :, None]))[0, :, 0]
             mx.async_eval(y)       # GPU busy while the next batch is read
             outs.append(y)
             for e in ids:
@@ -360,13 +393,21 @@ class StreamingSwitchGLU(nn.Module):
         y = y.reshape(b, t, k, -1)
         # One eval materializes the layer output AND adopted pool slots,
         # freeing this layer's mini-pools before the next layer runs.
-        mx.eval(y, *(pool.pool[p][q] for p in PROJS for q in PARTS))
+        mx.eval(y, *(pool.pool[p][q] for p in PROJS for q in pool.parts))
         return y
 
-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, indices: mx.array,
+                 scores: mx.array | None = None, **_kw) -> mx.array:
+        if x.ndim == 2:
+            # hosts that flatten [B, T, D] -> [P, D] before the switch call
+            return self.__call__(x[None], indices[None], scores,
+                                 **_kw).squeeze(0)
+        # `scores` / extra kwargs are fusion hints some hosts pass; returning
+        # per-expert outputs (ndim == scores.ndim + 1) makes the caller
+        # apply the weighted sum itself.
         decode = indices.shape[0] * indices.shape[1] == 1  # shape is metadata
         pred = None
-        if decode:
+        if decode and not self.pool._pf_suspend:
             pred = self._pf_pred_lazy(x, indices.shape[-1])
             if pred is not None:
                 mx.eval(indices, *pred)  # one sync covers all three graphs
@@ -386,7 +427,10 @@ class StreamingSwitchGLU(nn.Module):
                 if y is None:
                     self.pool.ensure(uniq)
                     y = switch_forward(x, mx.array(self._remap(idx)),
-                                       self.pool.pool, self.pool.qparams)
+                                       self.pool.pool, self.pool.qparams,
+                                       self.pool.act,
+                                       escales=self._esc(
+                                           idx.astype(np.uint32)))
                 if pred is not None:
                     pi = np.asarray(pred[0]).reshape(-1)
                     ps = np.asarray(pred[1].astype(mx.float32)).reshape(-1)
@@ -395,7 +439,7 @@ class StreamingSwitchGLU(nn.Module):
                     self._pf_next[0].prefetch_start(ordered, _pf_ex())
                 return y
             self.pool.ensure(uniq)
-            return self._pooled(x, self._remap(idx))
+            return self._pooled(x, idx, self._remap(idx))
 
         if sweep:
             return self._expert_sweep(x, idx)
@@ -424,12 +468,60 @@ class StreamingSwitchGLU(nn.Module):
             self.pool.ensure(ids)
             sl = self._remap(flat[s:e])[None]         # [1, T', k]
             y = switch_forward(x_flat[:, s:e], mx.array(sl),
-                               self.pool.pool, self.pool.qparams)
+                               self.pool.pool, self.pool.qparams,
+                               self.pool.act,
+                               escales=self._esc(flat[s:e][None]
+                                                 .astype(np.uint32)))
             mx.eval(y)
             outs.append(y)
             s = e
         y = mx.concatenate(outs, axis=1)              # [1, P, k, D_out]
         return y.reshape(b, t, k, y.shape[-1])
+
+
+def _moe_block(layer):
+    """The submodule holding switch_mlp: `mlp` in most mlx-lm MoE models,
+    `ffn` in deepseek_v4."""
+    for attr in ("mlp", "ffn"):
+        m = getattr(layer, attr, None)
+        if m is not None and hasattr(m, "switch_mlp"):
+            return m
+    return None
+
+
+def _uncompile_ffn(layer) -> None:
+    """Hosts that mx.compile a layer's FFN half for single-token decode must
+    run it eagerly once the switch is pool-backed: the wrapper materializes
+    the routing indices (a sync) to know which experts to read, and an eval
+    inside a compiled function is an error."""
+    if getattr(layer, "compile_ffn", None):
+        layer.compile_ffn = False
+    if getattr(layer, "_ffn_c", None) is not None:
+        layer._ffn_c = None
+    inner = getattr(layer, "block", None)     # an MTP stage wrapping a layer
+    if inner is not None and inner is not layer:
+        _uncompile_ffn(inner)
+
+
+def _wrap(layer, mlp, pool) -> None:
+    """Swap a block's switch_mlp for the streaming wrapper, carrying over
+    what the stock module computed besides the gathers."""
+    # A non-default activation (deepseek_v4's LimitedSwiGLU) must survive
+    # the swap; plain SwiGLU stays on the fused default.
+    act = getattr(mlp.switch_mlp, "activation", None)
+    if type(act).__name__ != "SwiGLU":
+        pool.act = act
+    # Per-expert output scales are tiny [E] vectors riding the module being
+    # dropped: materialize them now (expert tensors stay lazy). Trivial
+    # all-ones stays None so models without them pay nothing.
+    gsv = getattr(mlp.switch_mlp, "gate_scale", None)
+    osv = getattr(mlp.switch_mlp, "out_scale", None)
+    if gsv is not None and osv is not None:
+        mx.eval(gsv, osv)
+        if not (mx.all(gsv == 1) & mx.all(osv == 1)).item():
+            pool.escales = (gsv, osv)
+    _uncompile_ffn(layer)
+    mlp.switch_mlp = StreamingSwitchGLU(pool)
 
 
 def install_streaming(model, model_dir: str, n_slots: int):
@@ -441,12 +533,12 @@ def install_streaming(model, model_dir: str, n_slots: int):
     reader = ExpertReader(index)
     pools: dict[int, StreamingSwitchMLP] = {}
     for i, layer in enumerate(model.layers):
-        mlp = getattr(layer, "mlp", None)
-        if mlp is None or not hasattr(mlp, "switch_mlp"):
+        mlp = _moe_block(layer)
+        if mlp is None:
             continue
         pool = StreamingSwitchMLP(model_dir, i, n_slots, index=index,
                                   reader=reader)
-        layer.mlp.switch_mlp = StreamingSwitchGLU(pool)
+        _wrap(layer, mlp, pool)
         pools[i] = pool
     if not pools:
         raise RuntimeError("no MoE layers found to wrap")
@@ -457,7 +549,8 @@ def install_streaming(model, model_dir: str, n_slots: int):
 def _link_next_layers(model, pools: dict) -> None:
     """Point each streamed layer at the next streamed one for prefill
     next-layer reads (dense layers between them see the same tokens too)."""
-    ws = [model.layers[i].mlp.switch_mlp for i in sorted(pools)]
+    ws = [_moe_block(model.layers[i]).switch_mlp for i in sorted(pools)
+          if i < len(model.layers)]     # MTP stages are not linked
     for a, b in zip(ws, ws[1:]):
         a._next = b
 
@@ -557,7 +650,9 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
                          k: int | None = None,
                          trust_remote_code: bool = False,
                          tokenizer_config: dict | None = None,
-                         resident: str | None = None):
+                         resident: str | None = None,
+                         model_config: dict | None = None,
+                         loader=None):
     """Load with lazy=True, wrap MoE layers, materialize ONLY the trunk.
 
     The replaced SwitchGLU modules are dropped before any eval, so expert
@@ -566,20 +661,38 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
     equal-bytes policy as sim/lru_sim.py). Every streamed layer keeps at
     least k slots (default: the model's experts per token, which one decode
     step needs at once; 8 if the config does not say).
+
+    loader: optional host load hook for checkpoints mlx-lm's registry can't
+    build (VLM-packaged model types, vendored implementations). Called as
+    loader(model_dir, tokenizer_config=..., model_config=...) and must
+    return (model, tokenizer) with LAZY weights, `model.layers` exposing
+    the decoder stack, and MoE blocks discoverable by _moe_block. The
+    mlx-lm path (and its vlm-export shim) is skipped.
+
+    A checkpoint's MTP stages (`model.mtp`) that hold their own switch
+    tensors stream through pools like trunk layers, keyed past the trunk
+    (len(model.layers) + s) and sharing the budget split.
     """
     if k is None:
         k = _routed_topk(model_dir)
-    from mlx_lm import load as _load
-
     tok_cfg = dict(tokenizer_config or {})
     if trust_remote_code:
         tok_cfg["trust_remote_code"] = True
-    model, tokenizer = _load(model_dir, lazy=True, tokenizer_config=tok_cfg,
-                             model_config=_vlm_export_shim(model_dir))
+    if loader is not None:
+        model, tokenizer = loader(model_dir, tokenizer_config=tok_cfg or None,
+                                  model_config=model_config)
+    else:
+        from mlx_lm import load as _load
+
+        cfg_overlay = _vlm_export_shim(model_dir) or {}
+        cfg_overlay.update(model_config or {})
+        model, tokenizer = _load(model_dir, lazy=True,
+                                 tokenizer_config=tok_cfg,
+                                 model_config=cfg_overlay or None)
     index = SafetensorsIndex(model_dir)
     reader = ExpertReader(index)
     moe_layers = [i for i, l in enumerate(model.layers)
-                  if hasattr(getattr(l, "mlp", None), "switch_mlp")]
+                  if _moe_block(l) is not None]
     bpe = {i: index.layer_expert_bytes(i) for i in moe_layers}
     n_exp = {i: index.switch_triples(i)["gate_proj"]["weight"].shape[0]
              for i in moe_layers}
@@ -594,34 +707,72 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
         res_layers, budget_left = plan_residency(moe_layers, bpe, n_exp,
                                                  budget_bytes, k)
     streamed = [i for i in moe_layers if i not in res_layers]
+    mtp_keys: dict[int, tuple[int, object, str]] = {}
+    for st, stage in enumerate(getattr(model, "mtp", None) or []):
+        blk = _moe_block(stage)
+        if blk is None:
+            continue
+        key = len(model.layers) + st
+        # `mtp.<s>.mlp...` (Qwen, DeepSeek) or one module deeper at
+        # `mtp.<s>.block.mlp...` (a stage wrapping a full decoder layer)
+        tag = None
+        for cand in (f"mtp.{st}", f"mtp.{st}.block"):
+            try:
+                bpe[key] = index.layer_expert_bytes(key, tag=cand)
+                tag = cand
+                break
+            except KeyError:
+                continue
+        if tag is None:
+            continue            # the stage has no streamable switch tensors
+        mtp_keys[key] = (st, blk, tag)
+        streamed.append(key)
     pools: dict[int, StreamingSwitchMLP] = {}
     for i in streamed:
         slots = max(k, int(budget_left / len(streamed) / bpe[i]))
-        pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
-                                  reader=reader)
-        model.layers[i].mlp.switch_mlp = StreamingSwitchGLU(pool)
+        if i in mtp_keys:
+            st, mlp, tag = mtp_keys[i]
+            pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
+                                      reader=reader, tag=tag)
+            _wrap(model.mtp[st], mlp, pool)
+        else:
+            pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
+                                      reader=reader)
+            _wrap(model.layers[i], _moe_block(model.layers[i]), pool)
         pools[i] = pool
     _link_next_layers(model, pools)
     if os.environ.get("STREAMLX_PREFETCH", "1") != "0":
-        # Link adjacent streamed MoE layers for attention-window prefetch
-        # (F18). Non-adjacent pairs are skipped: an extra block between them
-        # stales the residual the prediction reads.
+        # Link adjacent streamed MoE layers for attention-window prefetch.
+        # Non-adjacent pairs are skipped: an extra block between them stales
+        # the residual the prediction reads. MTP stages are not linked (the
+        # link reads trunk layer norms).
         linked = 0
-        ordered = sorted(streamed)
+        ordered = sorted(i for i in streamed if i not in mtp_keys)
+
+        def _post_ln(layer):
+            # `post_attention_layernorm` in mlx-lm models, `ffn_norm` in
+            # deepseek_v4 (there the residual passes a hyper-connection
+            # collapse before the norm, so the norm-ratio identity is
+            # approximate; the agreement gate decides per layer)
+            for attr in ("post_attention_layernorm", "ffn_norm"):
+                m = getattr(layer, attr, None)
+                if m is not None:
+                    return m
+            return None
+
         for a, b in zip(ordered, ordered[1:]):
             if b != a + 1:
                 continue
-            gate = getattr(model.layers[b].mlp, "gate", None)
-            ln_a = getattr(model.layers[a], "post_attention_layernorm", None)
-            ln_b = getattr(model.layers[b], "post_attention_layernorm", None)
+            gate = getattr(_moe_block(model.layers[b]), "gate", None)
+            ln_a = _post_ln(model.layers[a])
+            ln_b = _post_ln(model.layers[b])
             if gate is None or ln_a is None or ln_b is None:
                 continue
-            model.layers[a].mlp.switch_mlp._pf_next = (
+            _moe_block(model.layers[a]).switch_mlp._pf_next = (
                 pools[b], gate, ln_a.weight, ln_b.weight)
             linked += 1
-        if linked:
-            print(f"[streamlx] attention-window prefetch: {linked} layer "
-                  f"links", file=sys.stderr)
+        print(f"[streamlx] attention-window prefetch: {linked} layer links",
+              file=sys.stderr)
     if res_layers:
         rb = sum(n_exp[i] * bpe[i] for i in res_layers) / 2**30
         print(f"[streamlx] {len(res_layers)} fully-resident MoE layers "

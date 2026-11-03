@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import glob
 import json
+import re
 import struct
 from dataclasses import dataclass
 from math import prod
@@ -74,40 +75,56 @@ class SafetensorsIndex:
     def _norm(key: str) -> str:
         return key.removeprefix("language_model.")
 
-    def switch_triples(self, layer: int) -> dict[str, dict[str, TensorLoc]]:
-        """{proj: {weight/scales/biases: TensorLoc}} for one MoE layer."""
+    def switch_triples(self, layer: int,
+                       tag: str | None = None) -> dict[str, dict[str, TensorLoc]]:
+        """{proj: {weight/scales[/biases]: TensorLoc}} for one MoE layer.
+
+        `tag` overrides the module path for non-trunk MoE blocks (an MTP
+        stage at `mtp.{s}`, or `mtp.{s}.block` when the stage wraps a full
+        decoder layer). biases are optional (mxfp modes ship weight and
+        scales only); weight and scales are required for every projection.
+        """
         out: dict[str, dict[str, TensorLoc]] = {}
-        tag = f"layers.{layer}.mlp.switch_mlp."
+        base = tag if tag is not None else f"layers.{layer}"
+        # Anchored at the start of the normalized name: a substring match
+        # also hits an MTP head that repeats the trunk's numbering
+        # (`mtp.layers.0.mlp.switch_mlp.*`). `_norm` strips `language_model.`;
+        # an optional `model.` may follow it. deepseek_v4 hangs the MoE
+        # block off `ffn`, not `mlp`.
+        anchored = re.compile(r"^(?:model\.)?" + re.escape(base)
+                              + r"\.(?:mlp|ffn)\.switch_mlp\.")
         for name, loc in self.tensors.items():
-            if tag not in name:
+            if anchored.match(self._norm(name)) is None:
                 continue
             for proj in PROJS:
                 for part in PARTS:
                     if name.endswith(f"{proj}.{part}"):
                         out.setdefault(proj, {})[part] = loc
-        missing = [(p, q) for p in PROJS for q in PARTS
+        missing = [(p, q) for p in PROJS for q in ("weight", "scales")
                    if q not in out.get(p, {})]
         if missing:
-            raise KeyError(f"layer {layer}: missing switch tensors {missing}")
+            raise KeyError(f"layer {base}: missing switch tensors {missing}")
         return out
 
-    def layer_expert_bytes(self, layer: int) -> int:
-        """Bytes for ONE expert of one layer (all 3 projections, W+S+B)."""
+    def layer_expert_bytes(self, layer: int, tag: str | None = None) -> int:
+        """Bytes for ONE expert of one layer (all projections+parts)."""
         return sum(loc.row_stride
-                   for parts in self.switch_triples(layer).values()
+                   for parts in self.switch_triples(layer, tag).values()
                    for loc in parts.values())
 
-    def quant_params(self,
-                     triple: dict[str, TensorLoc]) -> tuple[int, int, int, int]:
-        """(in_features, out_features, bits, group_size) for one projection:
-        bits/group_size from the config's quantization table (per-path
-        override, else top-level, else shape inference at gs=64), verified
-        against the packed weight/scales shapes."""
+    def quant_params(
+            self,
+            triple: dict[str, TensorLoc]) -> tuple[int, int, int, int, str]:
+        """(in_features, out_features, bits, group_size, mode) for one
+        projection: bits/group_size/mode from the config's quantization
+        table (per-path override, else top-level, else shape inference at
+        gs=64 affine), verified against the packed weight/scales shapes."""
         w, s = triple["weight"], triple["scales"]
         n_groups, packed = s.shape[-1], w.shape[-1]
         ov = self._quant_by_path.get(self._norm(w.name)[: -len(".weight")], {})
         bits = ov.get("bits", self._quant_default.get("bits"))
         gs = ov.get("group_size", self._quant_default.get("group_size"))
+        mode = ov.get("mode", self._quant_default.get("mode", "affine"))
         if gs is None:
             gs = 64
         in_features = n_groups * gs
@@ -116,4 +133,4 @@ class SafetensorsIndex:
         if packed * 32 != in_features * bits or bits not in (2, 3, 4, 5, 6, 8):
             raise ValueError(f"quant mismatch for {w.name}: W{w.shape} "
                              f"S{s.shape} with bits={bits} group_size={gs}")
-        return in_features, w.shape[1], bits, gs
+        return in_features, w.shape[1], bits, gs, mode
