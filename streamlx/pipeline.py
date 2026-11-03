@@ -36,6 +36,9 @@ Adapter protocol (duck-typed):
                                 pairs since the previous call, oldest
                                 first — the drafter's own cache is its
                                 business
+    draft_hidden(h, pos)        optional: what a pair carries for a stream
+                                (default its final hidden; a DSpark head
+                                wants several layers' outputs)
 
 Rollback: a shallow snapshot of every layer cache is taken right before
 each stream's begin() at that layer; rejecting streams >= a restores the
@@ -361,7 +364,8 @@ class PipelinedDecoder:
         mx.eval(*lg)
         outs = [int(mx.argmax(x[0, -1]).item()) for x in lg]
         self._last_logits = lg
-        return outs, [s.h for s in streams], snaps
+        dh = getattr(self.ad, "draft_hidden", None)
+        return outs, [dh(s.h, s.pos) if dh else s.h for s in streams], snaps
 
     def rollback(self, snaps, a: int) -> None:
         """Undo the cache writes of streams >= a (keep streams 0..a-1)."""
@@ -431,12 +435,15 @@ class PipelinedDecoder:
 
     # -- the decode loop -----------------------------------------------------
     def generate(self, first_tok: int, first_hidden, offset: int,
-                 n_tokens: int, on_token=None) -> list[int]:
+                 n_tokens: int, on_token=None, stop=()) -> list[int]:
         """Greedy pipelined decode. `first_tok` is the committed token whose
         forward has not run yet; `first_hidden` the hidden that produced
         it (the drafter's first pending pair). Returns the generated ids
-        starting with first_tok, exactly like a plain greedy loop."""
+        starting with first_tok, exactly like a plain greedy loop, ending
+        early after the first committed id in `stop`."""
         out = [first_tok]
+        if first_tok in stop:
+            return out
         cur = first_tok
         pairs = [(first_hidden, first_tok)]
         depth = self.k_max - 1
@@ -450,6 +457,8 @@ class PipelinedDecoder:
                 out.append(nxt)
                 if on_token is not None:
                     on_token(nxt)
+                if nxt in stop:
+                    return out[:n_tokens]
                 offset += 1
                 cur = nxt
                 continue
@@ -477,6 +486,9 @@ class PipelinedDecoder:
                 out.append(outs[i])
                 if on_token is not None:
                     on_token(outs[i])
+                if outs[i] in stop:          # the cache ends at the stop id
+                    self.rollback(snaps, i + 1)
+                    return out[:n_tokens]
             offset += a
             cur = outs[a - 1]
             if pairs and depth == 0:
