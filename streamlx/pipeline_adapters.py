@@ -62,6 +62,10 @@ class _SwitchStub:
 
 
 class StandardMoEAdapter:
+    # begin() routes with the block's own code (the switch stub), so the
+    # pipeline may hand that routing to the block's switch call in finish()
+    exact_routing = True
+
     def __init__(self, model, drafter=None):
         self.model = model
         inner = model.model if hasattr(model, "model") and hasattr(model.model, "layers") else model

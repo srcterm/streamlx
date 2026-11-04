@@ -139,6 +139,10 @@ class StreamingSwitchMLP:
         self.act = None       # non-default activation, set at wrap time
         self.escales = None   # optional (gate_vec, out_vec), set at wrap time
         self._pf_suspend = False  # a pipelined step is running: no lookahead
+        # the pipeline's hint for the NEXT switch call (one stream's layer):
+        # .rows = the experts the stream read itself, .idx = its routing when
+        # the caller already synced it (None: the switch syncs as usual)
+        self.call_hint = None
 
         import numpy as np  # local: only for dtype mapping at alloc
 

@@ -6,7 +6,9 @@ head, or any host drafter). Each layer is split at the routing boundary:
 
     begin  = attention half -> gate -> routing indices (the sync)
              -> the pool's missing experts are read asynchronously
-    finish = wait -> adopt into the pool -> expert gather -> rest of layer
+    finish = wait -> expert gather (resident slots + the rows the stream
+             read) -> rest of layer; the pool is updated once every stream
+             has finished the layer
 
 and the per-layer order S0.begin, [S_i.finish(l-1), S_i.begin]_{i>=1},
 S0.finish keeps every stream's read in flight across the other K-1
@@ -56,6 +58,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import mlx.core as mx
 import numpy as np
@@ -165,7 +168,8 @@ class Stream:
     pos: object
     ctx: object = None
     st: object = None
-    missing: list = field(default_factory=list)
+    missing: list = field(default_factory=list)   # experts it reads
+    need: list = field(default_factory=list)      # + those an earlier one reads
     fut: object = None
 
 
@@ -266,17 +270,29 @@ class PipelinedDecoder:
         self._draft_q = None
         # Experts a lower stream is already reading at a layer are not read
         # again by a later stream: every stream's begin() runs before any
-        # stream's finish() adopts its rows, so a shared miss would
-        # otherwise be read once per stream. finish() runs in stream order
-        # per layer, so the first reader's rows are in the pool before the
-        # later stream's compute; the wrapper's ensure() is the safety net.
+        # stream's finish(), so a shared miss would otherwise be read once
+        # per stream. finish() runs in stream order per layer, so the first
+        # reader's rows are there before the later stream's compute.
         self._inflight: dict = {}          # layer -> {expert: True}
         self.n_dup = self.n_read = 0       # duplicates avoided / reads issued
+        # The pools do not change during a step: a stream computes its
+        # resident experts from their slots and its misses from the rows read
+        # in this step (handed to the streaming switch as pool.call_hint), so
+        # streams in flight never evict each other's experts, whatever the
+        # budget. Once every stream has computed a layer, its pool takes what
+        # the tokens would have left there one after another (_settle).
+        self._rows: dict = {}              # layer -> {expert: rows} this step
+        self._used: dict = {}              # layer -> [stream's experts, ...]
+        self._fin: dict = {}               # layer -> streams finished
+        self._k_cur = 0
+        # an adapter whose begin() routes with the block's own code lets the
+        # switch reuse that routing instead of syncing on it a second time
+        self._exact_routing = bool(getattr(adapter, "exact_routing", False))
 
     # -- layer halves over the pools ---------------------------------------
     def _begin(self, l: int, s: Stream) -> None:
         st = self.ad.begin(l, s.h, s.ids, s.ctx, self.cache, s.pos)
-        s.st, s.missing, s.fut = st, [], None
+        s.st, s.missing, s.need, s.fut = st, [], [], None
         t0 = time.perf_counter()
         mx.eval(st.inds)                                   # routing sync
         self.t_sync += time.perf_counter() - t0
@@ -284,18 +300,16 @@ class PipelinedDecoder:
         if pool is None:
             return
         uniq = list(dict.fromkeys(np.array(st.inds).reshape(-1).tolist()))
+        self._used.setdefault(l, []).append(uniq)
         self.n_lookups += len(uniq)
         missing = [e for e in uniq if e not in pool.id2slot]
         self.n_miss += len(missing)
+        s.need = missing
         infl = self._inflight.setdefault(l, {})
         if infl:
             dup = [e for e in missing if e in infl]
             self.n_dup += len(dup)
             missing = [e for e in missing if e not in infl]
-        # touch this step's hits before any adopt() evicts the LRU head
-        for e in uniq:
-            if e in pool.id2slot:
-                pool._policy_hit(e)
         if missing:
             self.n_read += len(missing)
             for e in missing:
@@ -305,8 +319,8 @@ class PipelinedDecoder:
                                    pool.triples_loc, missing)
 
     def _finish(self, l: int, s: Stream) -> None:
+        pool = self.pools.get(l)
         if s.fut is not None:
-            pool = self.pools[l]
             t0 = time.perf_counter()
             if KEEPALIVE:
                 keepalive_wait([s.fut])                     # GPU kept busy
@@ -314,8 +328,7 @@ class PipelinedDecoder:
             t1 = time.perf_counter()
             rows = self.reader.experts_from_raw(pool.triples_loc, s.missing,
                                                 raw)
-            for e in s.missing:
-                pool.adopt(e, rows[e])
+            self._rows.setdefault(l, {}).update(rows)
             infl = self._inflight.get(l)
             if infl:
                 for e in s.missing:
@@ -323,8 +336,53 @@ class PipelinedDecoder:
             self.t_io += t1 - t0
             self.t_adopt += time.perf_counter() - t1
             s.fut = None
-        s.h = self.ad.finish(l, s.st)
+        if pool is None:
+            s.h = self.ad.finish(l, s.st)
+            s.st = None
+            return
+        got = self._rows.get(l, {})
+        pool.call_hint = SimpleNamespace(
+            rows={e: got[e] for e in s.need},
+            idx=np.array(s.st.inds) if self._exact_routing else None)
+        try:
+            s.h = self.ad.finish(l, s.st)
+        finally:
+            pool.call_hint = None
         s.st = None
+        self._fin[l] = self._fin.get(l, 0) + 1
+        if self._fin[l] == self._k_cur:
+            self._settle(l)
+
+    def _settle(self, l: int) -> None:
+        """Every stream has computed layer l: leave in its pool what the
+        step's tokens would have left there one after another (the last
+        n_slots experts they used, the last stream's most recent) and drop
+        the step's rows."""
+        pool = self.pools[l]
+        seq = [e for uniq in self._used.pop(l, ()) for e in uniq]
+        rows = self._rows.pop(l, {})
+        keep: list = []
+        for e in reversed(seq):
+            if e not in keep:
+                keep.append(e)
+                if len(keep) == pool.n_slots:
+                    break
+        keep.reverse()                                  # oldest first
+        t0 = time.perf_counter()
+        # residents first (made recent, so no adopt below evicts them),
+        # then the new rows into the least recent slots
+        for e in keep:
+            if e in pool.id2slot:
+                pool._policy_hit(e)
+        new = [e for e in keep if e not in pool.id2slot and e in rows]
+        for e in new:
+            pool.adopt(e, rows[e])
+        if new:
+            # run the slot writes now: left lazy until the layer's next use,
+            # every layer would hold its old slabs and the new rows (GiBs)
+            mx.async_eval([a for part in pool.pool.values()
+                           for a in part.values()])
+        self.t_adopt += time.perf_counter() - t0
 
     # -- one step: K tokens in flight ----------------------------------------
     def step(self, toks: list[int], offset: int, pos_base=None):
@@ -339,6 +397,8 @@ class PipelinedDecoder:
         for p in self.pools.values():
             p._pf_suspend = True
         self._inflight.clear()
+        self._rows, self._used, self._fin = {}, {}, {}
+        self._k_cur = len(toks)
         try:
             return self._step(toks, offset, pos_base)
         finally:

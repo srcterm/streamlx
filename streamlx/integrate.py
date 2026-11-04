@@ -189,6 +189,45 @@ class StreamingSwitchGLU(nn.Module):
         inv = np.argsort(np.array(hit_pos + miss_pos, dtype=np.uint32))
         return mx.take(y, mx.array(inv.astype(np.uint32)), axis=-2)
 
+    def _stream_forward(self, x: mx.array, idx: np.ndarray,
+                        rows: dict) -> mx.array:
+        """One pipelined stream's layer: experts resident in the pool (which
+        the pipeline leaves unchanged during its step) from their slots, the
+        rest from `rows`, the experts the stream read itself, stacked into a
+        small slab of their own. Two subsets permuted back, as in
+        _overlapped: bitwise identical to one call over the pool."""
+        pool = self.pool
+        flat = idx.reshape(-1).tolist()
+        lost = [e for e in dict.fromkeys(flat)
+                if e not in rows and not pool.resident(e)]
+        if lost:
+            pool.ensure(lost)        # a host changed the pool mid-step
+        res = [i for i, e in enumerate(flat) if e not in rows]
+        own = [i for i, e in enumerate(flat) if e in rows]
+        outs = []
+        if res:
+            slots = [pool.id2slot[flat[i]] for i in res]
+            outs.append(switch_forward(
+                x, mx.array([[slots]], dtype=mx.uint32), pool.pool,
+                pool.qparams, pool.act,
+                escales=self._esc([[[flat[i] for i in res]]])))
+        if own:
+            order = list(dict.fromkeys(flat[i] for i in own))
+            at = {e: j for j, e in enumerate(order)}
+            slab = {p: {q: mx.stack([rows[e][p][q] for e in order])
+                        for q in pool.parts} for p in PROJS}
+            outs.append(switch_forward(
+                x, mx.array([[[at[flat[i]] for i in own]]], dtype=mx.uint32),
+                slab, pool.qparams, pool.act,
+                escales=self._esc([[[flat[i] for i in own]]])))
+        y = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=-2)
+        if res and own:
+            inv = np.argsort(np.array(res + own, dtype=np.uint32))
+            y = mx.take(y, mx.array(inv.astype(np.uint32)), axis=-2)
+        if KEEPALIVE:
+            mx.async_eval(y)         # as the decode path: GPU starts now
+        return y
+
     def _pooled(self, x: mx.array, idx: np.ndarray,
                 slots: np.ndarray) -> mx.array:
         """A non-decode call over pool slots on the kernel stock's call
@@ -408,6 +447,13 @@ class StreamingSwitchGLU(nn.Module):
         # per-expert outputs (ndim == scores.ndim + 1) makes the caller
         # apply the weighted sum itself.
         decode = indices.shape[0] * indices.shape[1] == 1  # shape is metadata
+        hint, self.pool.call_hint = self.pool.call_hint, None
+        if hint is not None and decode:
+            idx = (np.array(indices) if hint.idx is None
+                   else hint.idx.reshape(indices.shape))
+            if self.record_sink is not None:
+                self.record_sink.append((self.pool.layer, idx.copy()))
+            return self._stream_forward(x, idx, hint.rows)
         pred = None
         if decode and not self.pool._pf_suspend:
             pred = self._pf_pred_lazy(x, indices.shape[-1])
