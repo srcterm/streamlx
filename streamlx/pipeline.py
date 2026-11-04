@@ -196,7 +196,9 @@ class PipelinedDecoder:
         # other arm afterwards. Needs plain_fn; a decoder without one
         # always drafts. It starts on the plain arm and ends a probe early
         # once its arm is clearly the slower: a losing drafter costs seconds
-        # per token on a slow model, a winning one gives up little.
+        # per token on a slow model, a winning one gives up little. Steps
+        # that pay for learning rather than reflect an arm's rate are not
+        # charged: the first after a switch and the K controller's exploring.
         self.self_gate = bool(self_gate) and plain_fn is not None
         self.gate_probe = 24          # steps (on) / tokens (off) per probe
         self.gate_min = 8             # samples before a probe may end early,
@@ -214,6 +216,7 @@ class PipelinedDecoder:
         self._g_spt = {"on": None, "off": None}   # sec/token per arm
         self._g_decisions: list = []  # (spt_on, spt_off, chosen)
         self._g_settle = False        # skip the first step after a switch
+        self._g_explore = False       # the step in flight is K exploration
         self._g_draft = 0.0           # draft seconds of the step in flight
         if self.self_gate:
             self._g_begin("off")
@@ -464,6 +467,7 @@ class PipelinedDecoder:
             return
         dt += self._g_draft
         self._g_draft = 0.0
+        explore, self._g_explore = self._g_explore, False
         self._warm_gate = getattr(self, "_warm_gate", 0) + 1
         if self._warm_gate <= 2:
             return                        # a sequence's cold steps
@@ -477,6 +481,10 @@ class PipelinedDecoder:
             # an arm's first step pays the switch (the drafter catching up
             # on the context it skipped, the pool turning over), not its rate
             self._g_settle = False
+            return
+        if explore:
+            # the K controller trying a K to learn its cost (a fresh time
+            # model tries every K, deep ones included): not the arm's rate
             return
         self._g_t += dt
         self._g_tok += tokens
@@ -664,6 +672,7 @@ class PipelinedDecoder:
                 continue
             if (self._t_n.get(K, 0) < 3
                     or self._t_clock - self._t_last.get(K, 0) > self._explore_every):
+                self._g_explore = True
                 return K
         return best_k
 
