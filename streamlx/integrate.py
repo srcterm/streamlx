@@ -193,9 +193,9 @@ class StreamingSwitchGLU(nn.Module):
                         rows: dict) -> mx.array:
         """One pipelined stream's layer: experts resident in the pool (which
         the pipeline leaves unchanged during its step) from their slots, the
-        rest from `rows`, the experts the stream read itself, stacked into a
-        small slab of their own. Two subsets permuted back, as in
-        _overlapped: bitwise identical to one call over the pool."""
+        rest one by one from `rows`, the experts the stream read itself;
+        subsets permuted back as in _overlapped, so bitwise identical to one
+        call over the pool."""
         pool = self.pool
         flat = idx.reshape(-1).tolist()
         lost = [e for e in dict.fromkeys(flat)
@@ -212,17 +212,20 @@ class StreamingSwitchGLU(nn.Module):
                 pool.qparams, pool.act,
                 escales=self._esc([[[flat[i] for i in res]]])))
         if own:
-            order = list(dict.fromkeys(flat[i] for i in own))
-            at = {e: j for j, e in enumerate(order)}
-            slab = {p: {q: mx.stack([rows[e][p][q] for e in order])
-                        for q in pool.parts} for p in PROJS}
-            outs.append(switch_forward(
-                x, mx.array([[[at[flat[i]] for i in own]]], dtype=mx.uint32),
-                slab, pool.qparams, pool.act,
-                escales=self._esc([[[flat[i] for i in own]]])))
+            # each of the stream's own experts straight from its rows (a
+            # one-expert slab is a view): no copy into a shared slab
+            zero = mx.zeros((1, 1, 1), dtype=mx.uint32)
+            for i in own:
+                e = flat[i]
+                one = {p: {q: rows[e][p][q][None] for q in pool.parts}
+                       for p in PROJS}
+                outs.append(switch_forward(x, zero, one, pool.qparams,
+                                           pool.act,
+                                           escales=self._esc([[[e]]])))
         y = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=-2)
-        if res and own:
-            inv = np.argsort(np.array(res + own, dtype=np.uint32))
+        order = res + own
+        if order != sorted(order):
+            inv = np.argsort(np.array(order, dtype=np.uint32))
             y = mx.take(y, mx.array(inv.astype(np.uint32)), axis=-2)
         if KEEPALIVE:
             mx.async_eval(y)         # as the decode path: GPU starts now
