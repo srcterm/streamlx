@@ -266,12 +266,11 @@ def main() -> None:
             _CFG["tokenizer_config"][key] = val  # bare strings are fine
 
     if not any(a.startswith("--prefill-step-size") for a in rest):
-        # Expert-major sweeps read each chunk's expert union once, so bytes
-        # scale ~1/chunk: 8k prefill = 455 GB at the stock 512 default vs
-        # 124 GB at 2048, wall-clock identical (F20). 4096 halves bytes
-        # again but widens attention transients at long contexts; 2048 is
-        # the safe default.
-        rest += ["--prefill-step-size", "2048"]
+        # Each chunk's expert sweep reads ~every expert once, so prefill
+        # bytes scale ~1/chunk. 4096 halves 2048's reads (Qwen3.6, 2.5K
+        # prompt: 10.3 -> 7.4 s) for +1.4 GiB peak on an 8K prompt; 8192
+        # costs 3 GiB more there and gains little more.
+        rest += ["--prefill-step-size", "4096"]
     srv.ModelProvider = StreamingModelProvider
     sys.argv = [sys.argv[0]] + rest
     srv.main()
