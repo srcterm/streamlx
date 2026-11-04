@@ -72,6 +72,9 @@ class StreamingSwitchMLP:
                                 for loc in parts.values())
         if n_slots < 1:
             raise ValueError("n_slots must be >= 1")
+        # never more slots than experts: gather_qmm's kernel choice depends
+        # on the slab's size, and stock's holds exactly the layer's experts
+        n_slots = min(n_slots, self.n_experts)
         self.n_slots = n_slots
 
         import numpy as np  # local: only for dtype mapping at alloc

@@ -576,7 +576,6 @@ def load_streaming_model(model_dir: str, budget_bytes: int, k: int = 8,
     pools: dict[int, StreamingSwitchMLP] = {}
     for i in streamed:
         slots = max(k, int(budget_left / len(streamed) / bpe[i]))
-        slots = min(slots, n_exp[i])   # never more slots than experts
         pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
                                   reader=reader)
         model.layers[i].mlp.switch_mlp = StreamingSwitchGLU(pool)
