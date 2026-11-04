@@ -280,10 +280,10 @@ class StreamingSwitchGLU(nn.Module):
         its most-routed in recent sweeps (its lowest ids before it has
         swept), in id order, so the reads coalesce and its sweep, which also
         goes in id order, takes them first. One batch per task on the shared
-        prefetch thread (raw bytes only, no mx arrays off the compute
-        thread). Skipped below _NEXT_MIN_COVERAGE, while the next layer
-        still holds earlier reads, and when its pool would hold the whole
-        call (no sweep)."""
+        prefetch thread (data-only arrays; their dtype views, which are ops,
+        are made on the compute thread). Skipped below _NEXT_MIN_COVERAGE,
+        while the next layer still holds earlier reads, and when its pool
+        would hold the whole call (no sweep)."""
         nxt = self._next
         if (nxt is None or nxt._early is not None
                 or n_routed < _NEXT_MIN_COVERAGE * self.pool.n_experts
@@ -299,7 +299,7 @@ class StreamingSwitchGLU(nn.Module):
         early = {}
         for i0 in range(0, n, bs):
             ids = top[i0:i0 + bs]
-            fut = _pf_ex().submit(p.reader.read_experts_raw, p.triples_loc,
+            fut = _pf_ex().submit(p.reader.read_experts_arrays, p.triples_loc,
                                   ids)
             early.update(dict.fromkeys(ids, fut))
         p.next_layer_reads += n
@@ -386,7 +386,7 @@ class StreamingSwitchGLU(nn.Module):
             need = [e for e in ids if e not in early]
             if not need:
                 return None
-            return self._sweep_ex.submit(pool.reader.read_experts_raw,
+            return self._sweep_ex.submit(pool.reader.read_experts_arrays,
                                          pool.triples_loc, need)
 
         fut = read(batches[0])
@@ -403,8 +403,8 @@ class StreamingSwitchGLU(nn.Module):
                 fut = read(batches[bi + 1])
             else:
                 self._read_next_layer(len(uniq))   # the drive is free now
-            # mx arrays must be created on this (compute) thread
-            rows = pool.reader.experts_from_raw(pool.triples_loc, ids, raw)
+            # built on the reading threads; the dtype views (ops) here
+            rows = pool.reader.experts_from_arrays(pool.triples_loc, ids, raw)
             pool.sweep_experts += len(ids)
             mini = {p: {q: mx.stack([rows[e][p][q] for e in ids])
                         for q in pool.parts} for p in PROJS}

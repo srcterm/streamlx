@@ -78,10 +78,13 @@ class ExpertReader:
             spans.append((path, off, n, [(key, 0, n)]))
         return spans
 
-    def read_ranges(self, requests, wait=None) -> dict:
+    def read_ranges(self, requests, wait=None, convert=None) -> dict:
         """[(key, path, off, n)] -> {key: memoryview of exactly n bytes}.
         `wait`, when given, is called with the read futures before they are
-        harvested (it must return only once all of them are done)."""
+        harvested (it must return only once all of them are done).
+        `convert(key, view)`, when given, runs on the reading thread right
+        after its span arrives and its result is returned instead of the
+        view (the expert arrays are built off the compute thread)."""
         spans = self._plan(requests)
 
         def read_span(span):
@@ -89,7 +92,11 @@ class ExpertReader:
             buf = os.pread(self._fd(path), n, off)
             if len(buf) != n:
                 raise IOError(f"short read {len(buf)}/{n} at {off} of {path}")
-            return buf, members
+            if convert is not None:            # the bytes go once converted
+                view = memoryview(buf)
+                return n, members, {key: convert(key, view[rel:rel + m])
+                                    for key, rel, m in members}
+            return buf, members, None
 
         def read_bucket(bucket):
             return [read_span(s) for s in bucket]
@@ -97,12 +104,12 @@ class ExpertReader:
         out: dict = {}
 
         def harvest(results):
-            for buf, members in results:
-                view = memoryview(buf)
-                self.bytes_read += len(buf)
+            for buf, members, conv in results:
+                self.bytes_read += buf if conv is not None else len(buf)
                 self.reads += 1
+                view = None if conv is not None else memoryview(buf)
                 for key, rel, n in members:
-                    out[key] = view[rel:rel + n]
+                    out[key] = conv[key] if conv is not None else view[rel:rel + n]
                     self.useful_bytes += n
 
         if len(spans) > self._workers:
@@ -133,12 +140,20 @@ class ExpertReader:
     # -- expert-level API ----------------------------------------------------
 
     def _to_mx(self, raw: memoryview, loc: TensorLoc) -> mx.array:
-        arr = np.frombuffer(raw, dtype=_NP_VIEW[loc.dtype]).reshape(
-            loc.shape[1:])
-        out = mx.array(arr)
-        if loc.dtype in _MX_VIEW:
-            out = out.view(_MX_VIEW[loc.dtype])
-        return out
+        return self._viewed(self._stored(raw, loc), loc)
+
+    @staticmethod
+    def _stored(raw: memoryview, loc: TensorLoc) -> mx.array:
+        """The bytes as an mx array of their stored dtype: a data-only array
+        (no op), safe to build on any thread."""
+        return mx.array(np.frombuffer(raw, dtype=_NP_VIEW[loc.dtype])
+                        .reshape(loc.shape[1:]))
+
+    @staticmethod
+    def _viewed(arr: mx.array, loc: TensorLoc) -> mx.array:
+        """The model dtype view (bf16 is stored as uint16): a lazy op, so it
+        is made on the thread that builds the compute graph."""
+        return arr.view(_MX_VIEW[loc.dtype]) if loc.dtype in _MX_VIEW else arr
 
     def read_experts_raw(self, layer_triples: dict, ids: list[int],
                          wait=None) -> dict:
@@ -164,12 +179,40 @@ class ExpertReader:
                     for proj in PROJS}
                 for e in ids}
 
+    def read_experts_arrays(self, layer_triples: dict, ids: list[int],
+                            wait=None) -> dict:
+        """{(e, proj, part): mx.array of the stored dtype} — one coalesced
+        batch, each tensor built from its bytes on the thread that read them,
+        so the copy overlaps the other reads instead of following them on the
+        compute thread. Safe from any thread (no ops are created)."""
+        requests, locs = [], {}
+        for e in ids:
+            for proj in PROJS:
+                for part in layer_triples[proj]:
+                    loc = layer_triples[proj][part]
+                    path, off, n = loc.expert_range(e)
+                    requests.append(((e, proj, part), path, off, n))
+                    locs[(e, proj, part)] = loc
+        return self.read_ranges(
+            requests, wait=wait,
+            convert=lambda key, view: self._stored(view, locs[key]))
+
+    def experts_from_arrays(self, layer_triples: dict, ids: list[int],
+                            arrays: dict) -> dict:
+        """{e: {proj: {part: mx.array}}} from read_experts_arrays: the dtype
+        views only. Must run on the thread that will build the compute graph."""
+        return {e: {proj: {part: self._viewed(arrays[(e, proj, part)],
+                                              layer_triples[proj][part])
+                           for part in layer_triples[proj]}
+                    for proj in PROJS}
+                for e in ids}
+
     def read_experts(self, layer_triples: dict, ids: list[int],
                      wait=None) -> dict:
         """{expert_id: {proj: {part: mx.array}}} — one coalesced batch."""
-        return self.experts_from_raw(
+        return self.experts_from_arrays(
             layer_triples, ids,
-            self.read_experts_raw(layer_triples, ids, wait=wait))
+            self.read_experts_arrays(layer_triples, ids, wait=wait))
 
     def read_expert(self, layer_triples: dict, e: int) -> dict:
         return self.read_experts(layer_triples, [e])[e]
