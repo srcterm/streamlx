@@ -17,6 +17,7 @@ from pathlib import Path
 
 DTYPE_SIZE = {"U32": 4, "BF16": 2, "F16": 2, "F32": 4, "U16": 2, "U8": 1}
 PROJS = ("gate_proj", "up_proj", "down_proj")
+_DS_PROJ = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
 PARTS = ("weight", "scales", "biases")
 
 
@@ -93,8 +94,19 @@ class SafetensorsIndex:
         # block off `ffn`, not `mlp`.
         anchored = re.compile(r"^(?:model\.)?" + re.escape(base)
                               + r"\.(?:mlp|ffn)\.switch_mlp\.")
+        # DeepSeek's own names for the stacked experts (V4.1 oQ exports):
+        # `ffn.experts.w1/w3/w2` = gate / up / down
+        ds_names = re.compile(r"^(?:model\.)?" + re.escape(base)
+                              + r"\.(?:mlp|ffn)\.experts\.(w[123])\."
+                              + r"(weight|scales|biases)$")
         for name, loc in self.tensors.items():
-            if anchored.match(self._norm(name)) is None:
+            norm = self._norm(name)
+            ds = ds_names.match(norm)
+            if ds is not None:
+                proj = _DS_PROJ[ds.group(1)]
+                out.setdefault(proj, {})[ds.group(2)] = loc
+                continue
+            if anchored.match(norm) is None:
                 continue
             for proj in PROJS:
                 for part in PARTS:
