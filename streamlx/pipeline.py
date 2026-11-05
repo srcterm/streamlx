@@ -562,13 +562,15 @@ class PipelinedDecoder:
             self._gate_account(dt, a)
             self.rollback(snaps, a)
             for i in range(a):
+                if len(out) == n_tokens:     # a step can overshoot the limit
+                    return out
                 pairs.append((hiddens[i], outs[i]))
                 out.append(outs[i])
                 if on_token is not None:
                     on_token(outs[i])
-                if outs[i] in stop:          # the cache ends at the stop id
+                if outs[i] in stop:          # the cache ends before the stop id
                     self.rollback(snaps, i + 1)
-                    return out[:n_tokens]
+                    return out
             offset += a
             cur = outs[a - 1]
             if pairs and depth == 0:

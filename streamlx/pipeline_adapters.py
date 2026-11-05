@@ -19,7 +19,7 @@ whatever routing op is installed on the block class is the one used.
 Drafting: an mlx-vlm block drafter (DSpark / DFlash heads, ``pip install
 mlx-vlm``; ``load_drafter``), or the ``mtp_forward`` / ``make_mtp_cache``
 protocol a host puts on models with an attached MTP head
-(``_omlx_mtp_head_prenorm`` decides whether the head wants the pre-norm
+(``mtp_head_prenorm`` decides whether the head wants the pre-norm
 hidden). Models without a head get no drafter: the core then runs K=1 (or
 teacher-forced tests).
 
@@ -118,7 +118,7 @@ class StandardMoEAdapter:
         return self.embed_tokens.as_linear(out)
 
     def hidden_for_draft(self, h):
-        prenorm = getattr(self.model, "_omlx_mtp_head_prenorm", False)
+        prenorm = getattr(self.model, "mtp_head_prenorm", False)
         return h if (prenorm or self.final_norm is None) else self.final_norm(h)
 
     # -- the layer split -------------------------------------------------------
