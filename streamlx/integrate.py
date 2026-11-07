@@ -741,6 +741,27 @@ def _routed_topk(model_dir: str, default: int = 8) -> int:
     return default
 
 
+def _checkpoint_loader(model_dir: str):
+    """The loader for a checkpoint mlx-lm can't run: DeepSeek-V4.1 with Engram
+    layers (mlx-lm refuses them, mlx-vlm has the model)."""
+    import json
+    from pathlib import Path
+
+    try:
+        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if (cfg.get("model_type") == "deepseek_v41"
+            and (cfg.get("text_config") or cfg).get("engram_layer_ids")):
+        try:
+            from .deepseek_v41 import load_v41
+        except ImportError as e:
+            raise ImportError("DeepSeek-V4.1 with Engram layers needs mlx-vlm: "
+                              "pip install mlx-vlm") from e
+        return load_v41
+    return None
+
+
 def load_streaming_model(model_dir: str, budget_bytes: int,
                          k: int | None = None,
                          trust_remote_code: bool = False,
@@ -773,6 +794,8 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
     tok_cfg = dict(tokenizer_config or {})
     if trust_remote_code:
         tok_cfg["trust_remote_code"] = True
+    if loader is None:
+        loader = _checkpoint_loader(model_dir)
     if loader is not None:
         model, tokenizer = loader(model_dir, tokenizer_config=tok_cfg or None,
                                   model_config=model_config)

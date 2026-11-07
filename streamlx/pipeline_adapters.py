@@ -251,6 +251,10 @@ def adapter_for(model, drafter=None):
     mt = getattr(getattr(model, "args", None), "model_type", None)
     if mt == "mistral_large4":
         return MistralLarge4Adapter(model, drafter)
+    if mt == "deepseek_v41":
+        from .deepseek_v41 import V41Adapter
+
+        return V41Adapter(model, drafter)
     return StandardMoEAdapter(model, drafter)
 
 
