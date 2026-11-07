@@ -231,8 +231,17 @@ class V41DSpark:
         self.pos += taps.shape[1]
 
     def prime_pairs(self, hidden, next_ids=None):
-        if hidden is not None and hidden.shape[1]:
-            self.pending.append(hidden)
+        if hidden is None or not hidden.shape[1]:
+            return
+        self.pending.append(hidden)
+        n = sum(h.shape[1] for h in self.pending)
+        if n >= 2 * self.window:
+            # only the last window reaches the context; the rows before it
+            # just advance the position
+            tail = mx.concatenate(self.pending, axis=1)[:, -self.window:]
+            mx.eval(tail)
+            self.pending = [tail]
+            self.pos += n - self.window
 
     def draft(self, pairs, depth, spec=None):
         if not pairs or depth <= 0:

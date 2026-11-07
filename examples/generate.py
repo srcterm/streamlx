@@ -101,7 +101,7 @@ def main() -> int:
             else:
                 logits, h = ad.forward_taps(chunk, cache)
                 context.append(h)
-            mx.eval(logits)
+            mx.eval(logits, context)
         first = int(mx.argmax(logits[0, -1]).item())
 
         eos = set(tokenizer.eos_token_ids or ())
@@ -122,6 +122,7 @@ def main() -> int:
             from streamlx.pipeline import PipelinedDecoder
 
             hidden = mx.concatenate(context, axis=1)
+            del context
             drafter.reset()
             drafter.prime_pairs(hidden[:, :-1], None)
             # plain_fn arms the self-gate: drafting only while it is faster
