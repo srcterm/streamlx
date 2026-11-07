@@ -90,6 +90,10 @@ class StandardMoEAdapter:
         self.tap_layers = tuple(getattr(drafter, "tap_layers", None) or ())
         self.taps = frozenset(self.tap_layers)
 
+    def views(self, cache):
+        """The core's per-layer cache list for the model's prompt cache."""
+        return cache
+
     # -- token entry / exit ----------------------------------------------------
     def prep(self, tok: int, offset: int, pos_base=None, i: int = 0):
         ids = mx.array([[tok]])
@@ -171,6 +175,16 @@ class StandardMoEAdapter:
             return logits, got[want[0]][-1]
         return logits, mx.concatenate([got[i][-1] for i in self.tap_layers],
                                       axis=-1)
+
+    def forward_taps(self, ids, cache):
+        """The model's forward plus the draft head's context for every
+        position: the tap layers' outputs, concatenated (a prefill's)."""
+        with capture_layer_outputs(self.model, self.tap_layers) as got:
+            logits = self.model(ids, cache=cache)
+        if not self.taps:
+            return logits, None
+        return logits, mx.concatenate(
+            [mx.concatenate(got[i], axis=1) for i in self.tap_layers], axis=-1)
 
     # -- drafting ----------------------------------------------------------------
     @property
