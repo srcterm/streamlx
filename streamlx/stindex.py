@@ -21,6 +21,11 @@ _DS_PROJ = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
 PARTS = ("weight", "scales", "biases")
 
 
+def default_group_size(mode: str) -> int:
+    """mlx.nn's group size for a quantization mode that doesn't state one."""
+    return {"mxfp4": 32, "mxfp8": 32, "nvfp4": 16}.get(mode, 64)
+
+
 @dataclass(frozen=True)
 class TensorLoc:
     path: str
@@ -63,10 +68,14 @@ class SafetensorsIndex:
         # Quantization table: bits/group_size come from here (mixed-precision
         # checkpoints override per path), shapes only cross-check. Keys are
         # normalized so mlx-vlm's "language_model." prefix matches either way.
+        # An oQ DeepSeek-V4.1 export keeps its table under its own key.
         quant = {}
         cfg = Path(self.model_dir) / "config.json"
         if cfg.exists():
-            quant = json.loads(cfg.read_text()).get("quantization") or {}
+            raw = json.loads(cfg.read_text())
+            quant = (raw.get("quantization")
+                     or (raw.get("omlx_deepseek_v41") or {}).get("quantized_modules")
+                     or {})
         self._quant_default = {k: v for k, v in quant.items()
                                if not isinstance(v, dict)}
         self._quant_by_path = {self._norm(k): v for k, v in quant.items()
@@ -130,7 +139,8 @@ class SafetensorsIndex:
         """(in_features, out_features, bits, group_size, mode) for one
         projection: bits/group_size/mode from the config's quantization
         table (per-path override, else top-level, else shape inference at
-        gs=64 affine), verified against the packed weight/scales shapes."""
+        the mode's group size, affine by default), verified against the
+        packed weight/scales shapes."""
         w, s = triple["weight"], triple["scales"]
         n_groups, packed = s.shape[-1], w.shape[-1]
         ov = self._quant_by_path.get(self._norm(w.name)[: -len(".weight")], {})
@@ -138,7 +148,7 @@ class SafetensorsIndex:
         gs = ov.get("group_size", self._quant_default.get("group_size"))
         mode = ov.get("mode", self._quant_default.get("mode", "affine"))
         if gs is None:
-            gs = 64
+            gs = default_group_size(mode)
         in_features = n_groups * gs
         if bits is None:
             bits = packed * 32 // in_features

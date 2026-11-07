@@ -57,6 +57,7 @@ from mlx_vlm.models.deepseek_v41.language import (DeepseekV41Block, hc_expand,
                                                   make_identity_pre_mix)
 
 from .pipeline_adapters import capture_layer_outputs
+from .stindex import default_group_size
 
 _W = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 _ROUTED = re.compile(r"\.experts\.(w[123])\.")
@@ -84,7 +85,7 @@ def oq_quantization(cfg: dict) -> dict | None:
         elif len(parts) > 2 and parts[-2] == "shared_experts" and parts[-1] in _W:
             parts[-1] = _W[parts[-1]]
         mode = q.get("mode", "affine")
-        gs = q.get("group_size") or (32 if mode.startswith(("mx", "nv")) else 64)
+        gs = q.get("group_size") or default_group_size(mode)
         out[".".join(parts)] = {"group_size": int(gs), "bits": int(q["bits"]),
                                 "mode": mode}
     return out

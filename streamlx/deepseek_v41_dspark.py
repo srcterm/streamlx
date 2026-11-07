@@ -37,14 +37,14 @@ from mlx_vlm.models.deepseek_v41.language import (DeepseekV41Block,
 
 from .integrate import _wrap
 from .pool import StreamingSwitchMLP
+from .stindex import default_group_size
 
 _W = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 _HEADS = ("main_proj", "main_norm", "norm", "markov_head", "confidence_head")
 
 
 def _group(q: dict) -> int:
-    return int(q.get("group_size")
-               or (32 if q.get("mode", "affine").startswith("mx") else 64))
+    return int(q.get("group_size") or default_group_size(q.get("mode", "affine")))
 
 
 def _shared(name: str) -> str:
@@ -153,20 +153,12 @@ class V41DSpark:
         self.stages = [DSparkStage(cfg, s, n, len(self.tap_layers)) for s in range(n)]
         self._load(root, spec)
         # routed experts: pools keyed past the trunk, like MTP stages in
-        # load_streaming_model. The index can't infer their mode (no
-        # config["quantization"]): the record gives it
+        # load_streaming_model
         self.pools = {}
         for s, st in enumerate(self.stages):
             key = cfg.num_hidden_layers + s
             pool = StreamingSwitchMLP(model_dir, key, expert_slots, index=index,
                                       reader=reader, tag=f"mtp.{s}")
-            for proj, wn in (("gate_proj", "w1"), ("up_proj", "w3"),
-                             ("down_proj", "w2")):
-                q = spec[f"language_model.mtp.{s}.ffn.experts.{wn}"]
-                gs = _group(q)
-                t = pool.triples_loc[proj]
-                pool.qparams[proj] = (t["scales"].shape[-1] * gs, t["weight"].shape[1],
-                                      int(q["bits"]), gs, q.get("mode", "affine"))
             _wrap(st.blk, st.blk.ffn, pool)
             self.pools[key] = pool
         mx.eval([st.parameters() for st in self.stages])
