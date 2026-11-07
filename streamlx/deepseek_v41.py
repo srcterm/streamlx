@@ -201,18 +201,19 @@ def load_v41(model_dir, tokenizer_config=None, model_config=None):
         vu.load_config, dsm.Model.sanitize = orig, sanitize
     lm = vlm.language_model
     # mlx-vlm also puts the whole lazy tables back into the parameter tree,
-    # where evaluating the trunk would read all of them: drop them
-    offloaded = set()
-    for i, layer in enumerate(lm.layers):
+    # where evaluating the trunk would read all of them: drop them. Lookups
+    # are scattered rows: no read-ahead on the maps
+    for layer in lm.layers:
         emb = getattr(getattr(layer, "engram", None), "embed", None)
         if isinstance(emb, OffloadedEngramEmbedding):
             for name in ("weight", "scales", "biases"):
                 if name in emb:
                     del emb[name]
-                    offloaded.add(f"language_model.layers.{i}.engram.embed.{name}")
+            for arr in emb._arrays.values():
+                arr._mmap.madvise(mmap.MADV_RANDOM)
     _embedding_from_disk(lm, model_dir)
     want = {f"language_model.{k}" for k, _ in tree_flatten(lm.parameters())}
-    missing = sorted(want - loaded - offloaded)
+    missing = sorted(want - loaded)
     if missing:
         raise ValueError(f"{len(missing)} language-model parameters not in "
                          f"the checkpoint: {missing[:8]}")
@@ -279,9 +280,6 @@ class V41Adapter:
         self._eg_pool = None
         if self.engram_layers:
             self._eg_pool = ThreadPoolExecutor(2, thread_name_prefix="engram")
-        for _, eg in self.engram_layers:
-            for arr in eg.embed._arrays.values():
-                arr._mmap.madvise(mmap.MADV_RANDOM)
 
     # -- cache handles -----------------------------------------------------
     def views(self, cache):
