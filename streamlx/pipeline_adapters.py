@@ -435,10 +435,16 @@ def _vlm_target(model, cfg):
         args=vlm_args, model=model.model, lm_head=model.lm_head))
 
 
-def load_drafter(path: str, model) -> VlmDrafter:
+def load_drafter(path: str, model, reader=None):
     """A pipeline drafter for `model` from an mlx-vlm drafter directory, e.g.
     `python -m mlx_vlm.split_mtp --model <checkpoint with its draft head>
-    --output <dir> --q-bits 4` (Mistral Large 4's DSpark head)."""
+    --output <dir> --q-bits 4` (Mistral Large 4's DSpark head). DeepSeek-V4.1
+    reads its head from the checkpoint itself: `path` is the model directory,
+    `reader` the model's expert reader."""
+    if getattr(getattr(model, "args", None), "model_type", None) == "deepseek_v41":
+        from .deepseek_v41_dspark import V41DSpark
+
+        return V41DSpark(model, path, reader.index, reader)
     try:
         from mlx_vlm.speculative.drafters import load_drafter as _load
     except ImportError as e:

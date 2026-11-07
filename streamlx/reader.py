@@ -26,8 +26,8 @@ from .stindex import PROJS, SafetensorsIndex, TensorLoc
 F_NOCACHE = getattr(fcntl, "F_NOCACHE", 48)
 F_RDAHEAD = getattr(fcntl, "F_RDAHEAD", 45)
 
-_NP_VIEW = {"U32": np.uint32, "BF16": np.uint16, "F16": np.float16,
-            "F32": np.float32}
+_NP_VIEW = {"U8": np.uint8, "U32": np.uint32, "BF16": np.uint16,
+            "F16": np.float16, "F32": np.float32}
 _MX_VIEW = {"BF16": mx.bfloat16}
 
 
