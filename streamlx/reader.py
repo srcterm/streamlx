@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 import mlx.core as mx
 import numpy as np
 
-from .stindex import PARTS, PROJS, SafetensorsIndex, TensorLoc
+from .stindex import PROJS, SafetensorsIndex, TensorLoc
 
 F_NOCACHE = getattr(fcntl, "F_NOCACHE", 48)
 F_RDAHEAD = getattr(fcntl, "F_RDAHEAD", 45)
@@ -41,6 +41,7 @@ class ExpertReader:
         self.max_span = max_span
         self._fds: dict[str, int] = {}
         self._fd_lock = threading.Lock()
+        self._workers = workers
         self._ex = ThreadPoolExecutor(max_workers=workers)
         self.bytes_read = 0      # actual bytes off the device (incl. gap waste)
         self.useful_bytes = 0    # bytes delivered to the pool
@@ -77,8 +78,10 @@ class ExpertReader:
             spans.append((path, off, n, [(key, 0, n)]))
         return spans
 
-    def read_ranges(self, requests) -> dict:
-        """[(key, path, off, n)] -> {key: memoryview of exactly n bytes}."""
+    def read_ranges(self, requests, wait=None) -> dict:
+        """[(key, path, off, n)] -> {key: memoryview of exactly n bytes}.
+        `wait`, when given, is called with the read futures before they are
+        harvested (it must return only once all of them are done)."""
         spans = self._plan(requests)
 
         def read_span(span):
@@ -88,15 +91,43 @@ class ExpertReader:
                 raise IOError(f"short read {len(buf)}/{n} at {off} of {path}")
             return buf, members
 
+        def read_bucket(bucket):
+            return [read_span(s) for s in bucket]
+
         out: dict = {}
-        for fut in [self._ex.submit(read_span, s) for s in spans]:
-            buf, members = fut.result()
-            view = memoryview(buf)
-            self.bytes_read += len(buf)
-            self.reads += 1
-            for key, rel, n in members:
-                out[key] = view[rel:rel + n]
-                self.useful_bytes += n
+
+        def harvest(results):
+            for buf, members in results:
+                view = memoryview(buf)
+                self.bytes_read += len(buf)
+                self.reads += 1
+                for key, rel, n in members:
+                    out[key] = view[rel:rel + n]
+                    self.useful_bytes += n
+
+        if len(spans) > self._workers:
+            # One task per worker, not per span: a decode run makes tens of
+            # thousands of small batched reads, and per-future executor
+            # overhead was a few milliseconds per batch. Greedy longest-first
+            # balancing keeps the buckets even; the device sees the same
+            # spans at the same depth.
+            buckets: list = [[] for _ in range(self._workers)]
+            loads = [0] * self._workers
+            for sp in sorted(spans, key=lambda sp: -sp[2]):
+                i = loads.index(min(loads))
+                buckets[i].append(sp)
+                loads[i] += sp[2]
+            futs = [self._ex.submit(read_bucket, b) for b in buckets if b]
+            if wait is not None:
+                wait(futs)
+            for fut in futs:
+                harvest(fut.result())
+            return out
+        futs = [self._ex.submit(read_span, s) for s in spans]
+        if wait is not None:
+            wait(futs)
+        for fut in futs:
+            harvest([fut.result()])
         return out
 
     # -- expert-level API ----------------------------------------------------
@@ -109,18 +140,19 @@ class ExpertReader:
             out = out.view(_MX_VIEW[loc.dtype])
         return out
 
-    def read_experts_raw(self, layer_triples: dict, ids: list[int]) -> dict:
+    def read_experts_raw(self, layer_triples: dict, ids: list[int],
+                         wait=None) -> dict:
         """{(e, proj, part): memoryview} — raw bytes only, one coalesced
         batch. Safe from any thread: no mx arrays are created (mx arrays are
         stream-bound to the creating thread)."""
         requests = []
         for e in ids:
             for proj in PROJS:
-                for part in PARTS:
+                for part in layer_triples[proj]:
                     loc = layer_triples[proj][part]
                     path, off, n = loc.expert_range(e)
                     requests.append(((e, proj, part), path, off, n))
-        return self.read_ranges(requests)
+        return self.read_ranges(requests, wait=wait)
 
     def experts_from_raw(self, layer_triples: dict, ids: list[int],
                          raw: dict) -> dict:
@@ -128,14 +160,16 @@ class ExpertReader:
         Must run on the thread that will build the compute graph."""
         return {e: {proj: {part: self._to_mx(raw[(e, proj, part)],
                                              layer_triples[proj][part])
-                           for part in PARTS}
+                           for part in layer_triples[proj]}
                     for proj in PROJS}
                 for e in ids}
 
-    def read_experts(self, layer_triples: dict, ids: list[int]) -> dict:
+    def read_experts(self, layer_triples: dict, ids: list[int],
+                     wait=None) -> dict:
         """{expert_id: {proj: {part: mx.array}}} — one coalesced batch."""
         return self.experts_from_raw(
-            layer_triples, ids, self.read_experts_raw(layer_triples, ids))
+            layer_triples, ids,
+            self.read_experts_raw(layer_triples, ids, wait=wait))
 
     def read_expert(self, layer_triples: dict, e: int) -> dict:
         return self.read_experts(layer_triples, [e])[e]

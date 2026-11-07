@@ -51,7 +51,26 @@ Models must be local directories in MLX format with the standard stacked `switch
 
 All `mlx_lm.server` flags pass through (`--port`, `--host`, `--temp`, ...). Requests run one at a time by design (batching collapses the expert hit rate); `--draft-model` and `--adapter-path` are unsupported.
 
-Tuning env vars: `STREAMLX_PREFETCH=0` disables the routing-lookahead prefetch, `STREAMLX_PF_TOPM` (default 7) caps how many predicted experts are read per layer, `STREAMLX_EVICT=s3fifo` switches the pool eviction policy (default LRU).
+Tuning env vars: `STREAMLX_PREFETCH=0` disables the routing-lookahead prefetch, `STREAMLX_PF_TOPM` (default 7) caps how many predicted experts are read per layer, `STREAMLX_EVICT=s3fifo` switches the pool eviction policy (default LRU), `STREAMLX_KEEPALIVE=0` stops keeping the GPU busy while a decode step waits on its expert reads (Apple GPUs lower their clock after a few milliseconds idle, which slows the next layer's work).
+
+## Pipelined expert fetching (models with an MTP head)
+
+On an SSD-streamed MoE each decode layer is a serial chain: route the token, read the experts the pool is missing, compute. The routing-lookahead prefetch can only see one layer ahead of a token whose successor nobody knows yet. Checkpoints that ship a multi-token-prediction (MTP) head — Qwen3.8-Flash-Next, DeepSeek-V4-Flash, GLM-5.3-Flash, Inkling — make the next tokens knowable early, and streamlx uses that knowledge for IO rather than for a batched verify:
+
+- The head drafts the next `k−1` tokens (default `k=3`). The decoder runs the `k` tokens as single-token forwards staggered one layer apart on the shared cache: every layer is split at the routing boundary (`begin` = attention half → gate → routing sync → asynchronous read of the missing experts; `finish` = wait → adopt into the pool → expert compute), and the schedule keeps each stream's read in flight while the other streams' GPU work fills the gap. Each stream is routed on its own hidden state, so the pipeline adds no bytes beyond what a rejected draft fetched, and an expert two streams both miss is read once.
+- **Acceptance is exact**: draft *i+1* is kept only if it equals stream *i*'s argmax; on a mismatch the later streams' cache writes are undone through generic snapshots (attention KV, recurrent state, sparse-attention indexers), and the emitted sequence is byte-identical to plain greedy decode, run after run. Sampled requests use speculative-sampling acceptance against the host's own sampling parameters, which is lossless in distribution. Anything the host does other than "next token" (a new prompt, a cache swap, a rewind) discards the speculation — it can only be slower, never wrong.
+- **Plain fallback and self-gate**: a step with no draft above the confidence gate runs the host's own forward, routing prefetch included, and its hidden still feeds the drafter. On top of that the decoder measures seconds per committed token with drafting on and off, keeps the faster arm, and re-probes the other with a hold that doubles on repeated verdicts, so a model whose head does not pay converges to plain speed within a few dozen tokens.
+
+Measured on Qwen3.8-Flash-Next-oQ4e-mtp served through oMLX at a 12 GiB expert budget (M4 MacBook Air, USB4 SSD, 480-token greedy completions): plain 4.6–4.9 tok/s, pipelined 6.0–6.3, output byte-identical to plain. The head's stock batched verify is a wash against plain on the same setup (4.9–5.2): a verify batch reads the union of its positions' experts, the same bytes without the overlap. Where fetch already saturates the drive (GLM-5.3 at 8 GiB), or the head streams its own experts and is rarely confident (DeepSeek-V4's DSpark), the pipeline loses and the gate turns it off; those models are better served plain.
+
+`streamlx.pipeline` is model-agnostic (scheduling, pool IO, acceptance, snapshot/rollback, stats) and takes a host adapter. `streamlx.pipeline_adapters.StandardMoEAdapter` covers the common mlx-lm layer shape and captures routing by running the block itself with the expert call stubbed, so a host's fused router is honoured; hyper-connected architectures need a small host adapter. Drafting follows the `mtp_forward` / `make_mtp_cache` protocol of an attached head. The oMLX expert-streaming fork wires it per model:
+
+```json
+"expert_stream": {"budget_gb": 12, "pipeline": {"k": 3, "tau": 0.6}},
+"mtp_enabled": true
+```
+
+`tau` is the draft-confidence gate (a draft below it is not launched); `k=3, tau=0.6` is within 1% of the best fixed setting on both reasoning and code, so the adaptive controller (`"adaptive": true`) is opt-in. `"gate": false` disables the self-gate. Three streams add about 2.5–3 GB of peak memory over plain decode; on a 32 GB machine raise oMLX's `memory.soft_threshold` to 0.9 or more so a queued request does not throttle the pipelined one.
 
 ## Performance
 
