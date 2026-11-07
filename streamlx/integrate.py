@@ -57,6 +57,15 @@ def _stock_sorted(n_routes: int, n_experts: int) -> bool:
     return n_routes >= 64 and n_routes // n_experts >= 4
 
 
+def _pick(w, pos, flat_shape: bool = False):
+    """Routing weights of the (token, pick) pairs at flat positions `pos`,
+    nested [1, 1, n] like a decode call's slot ids (flat_shape: [n])."""
+    if w is None:
+        return None
+    sel = mx.take(w.reshape(-1), mx.array(np.asarray(pos, dtype=np.uint32)))
+    return sel if flat_shape else sel[None, None]
+
+
 class StreamingSwitchGLU(nn.Module):
     def __init__(self, pool: StreamingSwitchMLP):
         super().__init__()
@@ -138,7 +147,7 @@ class StreamingSwitchGLU(nn.Module):
         return (es[0], es[1], eidx)
 
     def _overlapped(self, x: mx.array, idx: np.ndarray,
-                    wait=None) -> mx.array | None:
+                    wait=None, w=None) -> mx.array | None:
         """Compute resident experts on the GPU while missing ones are read.
 
         Baseline order per layer is strictly serial — gate sync, then a
@@ -173,7 +182,8 @@ class StreamingSwitchGLU(nn.Module):
                                self.pool.pool, self.pool.qparams,
                                self.pool.act,
                                escales=self._esc(
-                                   [[[flat[i] for i in hit_pos]]]))
+                                   [[[flat[i] for i in hit_pos]]]),
+                               weights=_pick(w, hit_pos))
         mx.async_eval(y_hit)              # GPU starts; CPU proceeds to fetch
 
         self.pool.ensure(miss_ids, wait=wait)
@@ -183,14 +193,15 @@ class StreamingSwitchGLU(nn.Module):
                                 self.pool.pool, self.pool.qparams,
                                 self.pool.act,
                                 escales=self._esc(
-                                    [[[flat[i] for i in miss_pos]]]))
+                                    [[[flat[i] for i in miss_pos]]]),
+                                weights=_pick(w, miss_pos))
 
         y = mx.concatenate([y_hit, y_miss], axis=-2)
         inv = np.argsort(np.array(hit_pos + miss_pos, dtype=np.uint32))
         return mx.take(y, mx.array(inv.astype(np.uint32)), axis=-2)
 
     def _stream_forward(self, x: mx.array, idx: np.ndarray,
-                        rows: dict) -> mx.array:
+                        rows: dict, w=None) -> mx.array:
         """One pipelined stream's layer: experts resident in the pool (which
         the pipeline leaves unchanged during its step) from their slots, the
         rest one by one from `rows`, the experts the stream read itself;
@@ -210,7 +221,8 @@ class StreamingSwitchGLU(nn.Module):
             outs.append(switch_forward(
                 x, mx.array([[slots]], dtype=mx.uint32), pool.pool,
                 pool.qparams, pool.act,
-                escales=self._esc([[[flat[i] for i in res]]])))
+                escales=self._esc([[[flat[i] for i in res]]]),
+                weights=_pick(w, res)))
         if own:
             # each of the stream's own experts straight from its rows (a
             # one-expert slab is a view): no copy into a shared slab
@@ -221,7 +233,8 @@ class StreamingSwitchGLU(nn.Module):
                        for p in PROJS}
                 outs.append(switch_forward(x, zero, one, pool.qparams,
                                            pool.act,
-                                           escales=self._esc([[[e]]])))
+                                           escales=self._esc([[[e]]]),
+                                           weights=_pick(w, [i])))
         y = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=-2)
         order = res + own
         if order != sorted(order):
@@ -232,7 +245,7 @@ class StreamingSwitchGLU(nn.Module):
         return y
 
     def _pooled(self, x: mx.array, idx: np.ndarray,
-                slots: np.ndarray) -> mx.array:
+                slots: np.ndarray, w=None) -> mx.array:
         """A non-decode call over pool slots on the kernel stock's call
         uses (_stock_sorted): sorted by slot where stock sorts and takes the
         sorted kernel (a pool holds at most the layer's experts, so
@@ -241,7 +254,8 @@ class StreamingSwitchGLU(nn.Module):
         if not _stock_sorted(slots.size, pool.n_experts):
             return switch_forward(x, mx.array(slots), pool.pool, pool.qparams,
                                   pool.act,
-                                  escales=self._esc(idx.astype(np.uint32)))
+                                  escales=self._esc(idx.astype(np.uint32)),
+                                  weights=w)
         b, t, k = slots.shape
         flat = slots.reshape(-1)
         order = np.argsort(flat, kind="stable")
@@ -251,7 +265,8 @@ class StreamingSwitchGLU(nn.Module):
         y = switch_forward(xs, mx.array(flat[order]), pool.pool,
                            pool.qparams, pool.act,
                            escales=self._esc(mx.array(eidx)),
-                           sorted_indices=True)
+                           sorted_indices=True,
+                           weights=_pick(w, order, flat_shape=True))
         inv = np.empty_like(order)
         inv[order] = np.arange(order.size)
         y = mx.take(y, mx.array(inv.astype(np.uint32)), axis=0)
@@ -265,10 +280,10 @@ class StreamingSwitchGLU(nn.Module):
         its most-routed in recent sweeps (its lowest ids before it has
         swept), in id order, so the reads coalesce and its sweep, which also
         goes in id order, takes them first. One batch per task on the shared
-        prefetch thread (raw bytes only, no mx arrays off the compute
-        thread). Skipped below _NEXT_MIN_COVERAGE, while the next layer
-        still holds earlier reads, and when its pool would hold the whole
-        call (no sweep)."""
+        prefetch thread (data-only arrays; their dtype views, which are ops,
+        are made on the compute thread). Skipped below _NEXT_MIN_COVERAGE,
+        while the next layer still holds earlier reads, and when its pool
+        would hold the whole call (no sweep)."""
         nxt = self._next
         if (nxt is None or nxt._early is not None
                 or n_routed < _NEXT_MIN_COVERAGE * self.pool.n_experts
@@ -284,7 +299,7 @@ class StreamingSwitchGLU(nn.Module):
         early = {}
         for i0 in range(0, n, bs):
             ids = top[i0:i0 + bs]
-            fut = _pf_ex().submit(p.reader.read_experts_raw, p.triples_loc,
+            fut = _pf_ex().submit(p.reader.read_experts_arrays, p.triples_loc,
                                   ids)
             early.update(dict.fromkeys(ids, fut))
         p.next_layer_reads += n
@@ -302,7 +317,8 @@ class StreamingSwitchGLU(nn.Module):
         self.pool.next_layer_used += len(keep)
         return keep
 
-    def _expert_sweep(self, x: mx.array, idx: np.ndarray) -> mx.array:
+    def _expert_sweep(self, x: mx.array, idx: np.ndarray,
+                      w=None) -> mx.array:
         """Expert-major prefill: read each routed expert once, in id order.
 
         When a chunk's expert union exceeds the pool, the token-slicing path
@@ -370,7 +386,7 @@ class StreamingSwitchGLU(nn.Module):
             need = [e for e in ids if e not in early]
             if not need:
                 return None
-            return self._sweep_ex.submit(pool.reader.read_experts_raw,
+            return self._sweep_ex.submit(pool.reader.read_experts_arrays,
                                          pool.triples_loc, need)
 
         fut = read(batches[0])
@@ -387,8 +403,8 @@ class StreamingSwitchGLU(nn.Module):
                 fut = read(batches[bi + 1])
             else:
                 self._read_next_layer(len(uniq))   # the drive is free now
-            # mx arrays must be created on this (compute) thread
-            rows = pool.reader.experts_from_raw(pool.triples_loc, ids, raw)
+            # built on the reading threads; the dtype views (ops) here
+            rows = pool.reader.experts_from_arrays(pool.triples_loc, ids, raw)
             pool.sweep_experts += len(ids)
             mini = {p: {q: mx.stack([rows[e][p][q] for e in ids])
                         for q in pool.parts} for p in PROJS}
@@ -400,6 +416,7 @@ class StreamingSwitchGLU(nn.Module):
             xb = mx.take(x_rows, mx.array(row_of_pair[sel]), axis=0)
             inds = slot.astype(np.uint32)
             eb = sorted_e[bounds[i0]:bounds[i1]].astype(np.uint32)
+            wb = _pick(w, sel, flat_shape=True)
             if srt:
                 # a batch too sparse for the sorted kernel gets zero rows on
                 # its last expert (outputs dropped), so it runs stock's kernel
@@ -410,16 +427,20 @@ class StreamingSwitchGLU(nn.Module):
                     inds = np.append(inds, np.full(pad, len(ids) - 1,
                                                    np.uint32))
                     eb = np.append(eb, np.full(pad, ids[-1], np.uint32))
+                    if wb is not None:
+                        wb = mx.concatenate([wb, mx.zeros((pad,), wb.dtype)])
                 y = switch_forward(xb, mx.array(inds), mini, pool.qparams,
                                    pool.act, escales=self._esc(mx.array(eb)),
-                                   sorted_indices=True)          # [Nb, D]
+                                   sorted_indices=True, weights=wb)  # [Nb, D]
                 if pad > 0:
                     y = y[:-pad]
             else:
                 y = switch_forward(xb[None], mx.array(inds)[None, :, None],
                                    mini, pool.qparams, pool.act,
                                    escales=self._esc(
-                                       mx.array(eb)[None, :, None]))[0, :, 0]
+                                       mx.array(eb)[None, :, None]),
+                                   weights=None if wb is None
+                                   else wb[None, :, None])[0, :, 0]
             mx.async_eval(y)       # GPU busy while the next batch is read
             outs.append(y)
             for e in ids:
@@ -444,11 +465,14 @@ class StreamingSwitchGLU(nn.Module):
                  scores: mx.array | None = None, **_kw) -> mx.array:
         if x.ndim == 2:
             # hosts that flatten [B, T, D] -> [P, D] before the switch call
-            return self.__call__(x[None], indices[None], scores,
+            return self.__call__(x[None], indices[None],
+                                 None if scores is None else scores[None],
                                  **_kw).squeeze(0)
         # `scores` / extra kwargs are fusion hints some hosts pass; returning
         # per-expert outputs (ndim == scores.ndim + 1) makes the caller
-        # apply the weighted sum itself.
+        # apply the weighted sum itself. An activation that takes the
+        # routing weights (deepseek_v41) gets them, pair by pair (w).
+        w = scores if self.pool.act_weights else None
         decode = indices.shape[0] * indices.shape[1] == 1  # shape is metadata
         hint, self.pool.call_hint = self.pool.call_hint, None
         if hint is not None and decode:
@@ -456,7 +480,7 @@ class StreamingSwitchGLU(nn.Module):
                    else hint.idx.reshape(indices.shape))
             if self.record_sink is not None:
                 self.record_sink.append((self.pool.layer, idx.copy()))
-            return self._stream_forward(x, idx, hint.rows)
+            return self._stream_forward(x, idx, hint.rows, w)
         pred = None
         if decode and not self.pool._pf_suspend:
             pred = self._pf_pred_lazy(x, indices.shape[-1])
@@ -476,14 +500,14 @@ class StreamingSwitchGLU(nn.Module):
         if len(uniq) <= self.pool.n_slots:
             # fast path: whole call fits the pool (always true for decode)
             if decode:
-                y = self._overlapped(x, idx, wait=ka)
+                y = self._overlapped(x, idx, wait=ka, w=w)
                 if y is None:
                     self.pool.ensure(uniq, wait=ka)
                     y = switch_forward(x, mx.array(self._remap(idx)),
                                        self.pool.pool, self.pool.qparams,
                                        self.pool.act,
                                        escales=self._esc(
-                                           idx.astype(np.uint32)))
+                                           idx.astype(np.uint32)), weights=w)
                 if ka is not None:
                     # Dispatch the layer's experts now, so the GPU starts on
                     # them while the host builds the rest of the layer.
@@ -496,10 +520,10 @@ class StreamingSwitchGLU(nn.Module):
                     self._pf_next[0].prefetch_start(ordered, _pf_ex())
                 return y
             self.pool.ensure(uniq)
-            return self._pooled(x, idx, self._remap(idx))
+            return self._pooled(x, idx, self._remap(idx), w)
 
         if sweep:
-            return self._expert_sweep(x, idx)
+            return self._expert_sweep(x, idx, w)
 
         # Legacy chunked prefill: process position slices whose expert union
         # fits. Each slice's output MUST be materialized before the next
@@ -528,7 +552,9 @@ class StreamingSwitchGLU(nn.Module):
                                self.pool.pool, self.pool.qparams,
                                self.pool.act,
                                escales=self._esc(flat[s:e][None]
-                                                 .astype(np.uint32)))
+                                                 .astype(np.uint32)),
+                               weights=None if w is None
+                               else w.reshape(-1, k)[s:e][None])
             mx.eval(y)
             outs.append(y)
             s = e
@@ -560,6 +586,15 @@ def _uncompile_ffn(layer) -> None:
         _uncompile_ffn(inner)
 
 
+def _n_args(fn) -> int:
+    import inspect
+
+    try:
+        return len(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _wrap(layer, mlp, pool) -> None:
     """Swap a block's switch_mlp for the streaming wrapper, carrying over
     what the stock module computed besides the gathers."""
@@ -568,6 +603,9 @@ def _wrap(layer, mlp, pool) -> None:
     act = getattr(mlp.switch_mlp, "activation", None)
     if type(act).__name__ != "SwiGLU":
         pool.act = act
+        # deepseek_v41 weights each expert's activation before its down
+        # projection: act(up, gate, weights)
+        pool.act_weights = act is not None and _n_args(act) >= 3
     # Per-expert output scales are tiny [E] vectors riding the module being
     # dropped: materialize them now (expert tensors stay lazy). Trivial
     # all-ones stays None so models without them pay nothing.
@@ -703,6 +741,27 @@ def _routed_topk(model_dir: str, default: int = 8) -> int:
     return default
 
 
+def _checkpoint_loader(model_dir: str):
+    """The loader for a checkpoint mlx-lm can't run: DeepSeek-V4.1 with Engram
+    layers (mlx-lm refuses them, mlx-vlm has the model)."""
+    import json
+    from pathlib import Path
+
+    try:
+        cfg = json.loads((Path(model_dir) / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if (cfg.get("model_type") == "deepseek_v41"
+            and (cfg.get("text_config") or cfg).get("engram_layer_ids")):
+        try:
+            from .deepseek_v41 import load_v41
+        except ImportError as e:
+            raise ImportError("DeepSeek-V4.1 with Engram layers needs mlx-vlm: "
+                              "pip install mlx-vlm") from e
+        return load_v41
+    return None
+
+
 def load_streaming_model(model_dir: str, budget_bytes: int,
                          k: int | None = None,
                          trust_remote_code: bool = False,
@@ -735,6 +794,8 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
     tok_cfg = dict(tokenizer_config or {})
     if trust_remote_code:
         tok_cfg["trust_remote_code"] = True
+    if loader is None:
+        loader = _checkpoint_loader(model_dir)
     if loader is not None:
         model, tokenizer = loader(model_dir, tokenizer_config=tok_cfg or None,
                                   model_config=model_config)

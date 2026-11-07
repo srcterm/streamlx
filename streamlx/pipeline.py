@@ -318,7 +318,7 @@ class PipelinedDecoder:
             for e in missing:
                 infl[e] = True
             s.missing = missing
-            s.fut = self.ex.submit(self.reader.read_experts_raw,
+            s.fut = self.ex.submit(self.reader.read_experts_arrays,
                                    pool.triples_loc, missing)
 
     def _finish(self, l: int, s: Stream) -> None:
@@ -329,8 +329,8 @@ class PipelinedDecoder:
                 keepalive_wait([s.fut])                     # GPU kept busy
             raw = s.fut.result()                            # IO residual
             t1 = time.perf_counter()
-            rows = self.reader.experts_from_raw(pool.triples_loc, s.missing,
-                                                raw)
+            rows = self.reader.experts_from_arrays(pool.triples_loc,
+                                                   s.missing, raw)
             self._rows.setdefault(l, {}).update(rows)
             infl = self._inflight.get(l)
             if infl:
