@@ -17,7 +17,13 @@ from pathlib import Path
 
 DTYPE_SIZE = {"U32": 4, "BF16": 2, "F16": 2, "F32": 4, "U16": 2, "U8": 1}
 PROJS = ("gate_proj", "up_proj", "down_proj")
+_DS_PROJ = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
 PARTS = ("weight", "scales", "biases")
+
+
+def default_group_size(mode: str) -> int:
+    """mlx.nn's group size for a quantization mode that doesn't state one."""
+    return {"mxfp4": 32, "mxfp8": 32, "nvfp4": 16}.get(mode, 64)
 
 
 @dataclass(frozen=True)
@@ -62,10 +68,14 @@ class SafetensorsIndex:
         # Quantization table: bits/group_size come from here (mixed-precision
         # checkpoints override per path), shapes only cross-check. Keys are
         # normalized so mlx-vlm's "language_model." prefix matches either way.
+        # An oQ DeepSeek-V4.1 export keeps its table under its own key.
         quant = {}
         cfg = Path(self.model_dir) / "config.json"
         if cfg.exists():
-            quant = json.loads(cfg.read_text()).get("quantization") or {}
+            raw = json.loads(cfg.read_text())
+            quant = (raw.get("quantization")
+                     or (raw.get("omlx_deepseek_v41") or {}).get("quantized_modules")
+                     or {})
         self._quant_default = {k: v for k, v in quant.items()
                                if not isinstance(v, dict)}
         self._quant_by_path = {self._norm(k): v for k, v in quant.items()
@@ -93,8 +103,19 @@ class SafetensorsIndex:
         # block off `ffn`, not `mlp`.
         anchored = re.compile(r"^(?:model\.)?" + re.escape(base)
                               + r"\.(?:mlp|ffn)\.switch_mlp\.")
+        # DeepSeek's own names for the stacked experts (V4.1 oQ exports):
+        # `ffn.experts.w1/w3/w2` = gate / up / down
+        ds_names = re.compile(r"^(?:model\.)?" + re.escape(base)
+                              + r"\.(?:mlp|ffn)\.experts\.(w[123])\."
+                              + r"(weight|scales|biases)$")
         for name, loc in self.tensors.items():
-            if anchored.match(self._norm(name)) is None:
+            norm = self._norm(name)
+            ds = ds_names.match(norm)
+            if ds is not None:
+                proj = _DS_PROJ[ds.group(1)]
+                out.setdefault(proj, {})[ds.group(2)] = loc
+                continue
+            if anchored.match(norm) is None:
                 continue
             for proj in PROJS:
                 for part in PARTS:
@@ -118,7 +139,8 @@ class SafetensorsIndex:
         """(in_features, out_features, bits, group_size, mode) for one
         projection: bits/group_size/mode from the config's quantization
         table (per-path override, else top-level, else shape inference at
-        gs=64 affine), verified against the packed weight/scales shapes."""
+        the mode's group size, affine by default), verified against the
+        packed weight/scales shapes."""
         w, s = triple["weight"], triple["scales"]
         n_groups, packed = s.shape[-1], w.shape[-1]
         ov = self._quant_by_path.get(self._norm(w.name)[: -len(".weight")], {})
@@ -126,7 +148,7 @@ class SafetensorsIndex:
         gs = ov.get("group_size", self._quant_default.get("group_size"))
         mode = ov.get("mode", self._quant_default.get("mode", "affine"))
         if gs is None:
-            gs = 64
+            gs = default_group_size(mode)
         in_features = n_groups * gs
         if bits is None:
             bits = packed * 32 // in_features

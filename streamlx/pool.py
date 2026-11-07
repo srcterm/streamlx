@@ -72,7 +72,7 @@ def keepalive_wait(futures) -> None:
 
 def switch_forward(x: mx.array, indices: mx.array, triples: dict,
                    qparams: dict, act=None, escales=None,
-                   sorted_indices: bool = False) -> mx.array:
+                   sorted_indices: bool = False, weights=None) -> mx.array:
     """Mirror of SwitchGLU.__call__ decode path (indices.size < 64, no bias).
 
     x: [B, T, D]; indices: [B, T, k] (expert ids for the full tensors, or
@@ -83,7 +83,9 @@ def switch_forward(x: mx.array, indices: mx.array, triples: dict,
     order. escales: optional (gate_vec[E], out_vec[E], eidx) per-expert
     output scales applied exactly as the stock module does; eidx indexes
     the vectors by EXPERT id with the same nesting as `indices` (which may
-    hold pool slot ids, a different numbering).
+    hold pool slot ids, a different numbering). weights: routing weights
+    shaped like `indices`, for an activation that applies them itself
+    before the down projection (deepseek_v41), called act(up, gate, w).
     """
     x = mx.expand_dims(x, -2 if sorted_indices else (-2, -3))
 
@@ -103,7 +105,12 @@ def switch_forward(x: mx.array, indices: mx.array, triples: dict,
     x_gate = qmm(x, "gate_proj")
     if escales is not None:
         x_gate = x_gate * esc(escales[0], escales[2], x_gate)
-    h = swiglu(x_gate, x_up) if act is None else act(x_up, x_gate)
+    if act is None:
+        h = swiglu(x_gate, x_up)
+    elif weights is None:
+        h = act(x_up, x_gate)
+    else:
+        h = act(x_up, x_gate, weights[..., None, None])
     x = qmm(h, "down_proj")
     if escales is not None:
         x = x * esc(escales[1], escales[2], x)
@@ -137,6 +144,7 @@ class StreamingSwitchMLP:
         n_slots = min(n_slots, self.n_experts)
         self.n_slots = n_slots
         self.act = None       # non-default activation, set at wrap time
+        self.act_weights = False  # act takes the routing weights (v4.1)
         self.escales = None   # optional (gate_vec, out_vec), set at wrap time
         self._pf_suspend = False  # a pipelined step is running: no lookahead
         # the pipeline's hint for the NEXT switch call (one stream's layer):

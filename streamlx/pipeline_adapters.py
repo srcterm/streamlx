@@ -90,6 +90,10 @@ class StandardMoEAdapter:
         self.tap_layers = tuple(getattr(drafter, "tap_layers", None) or ())
         self.taps = frozenset(self.tap_layers)
 
+    def views(self, cache):
+        """The core's per-layer cache list for the model's prompt cache."""
+        return cache
+
     # -- token entry / exit ----------------------------------------------------
     def prep(self, tok: int, offset: int, pos_base=None, i: int = 0):
         ids = mx.array([[tok]])
@@ -172,6 +176,16 @@ class StandardMoEAdapter:
         return logits, mx.concatenate([got[i][-1] for i in self.tap_layers],
                                       axis=-1)
 
+    def forward_taps(self, ids, cache):
+        """The model's forward plus the draft head's context for every
+        position: the tap layers' outputs, concatenated (a prefill's)."""
+        with capture_layer_outputs(self.model, self.tap_layers) as got:
+            logits = self.model(ids, cache=cache)
+        if not self.taps:
+            return logits, None
+        return logits, mx.concatenate(
+            [mx.concatenate(got[i], axis=1) for i in self.tap_layers], axis=-1)
+
     # -- drafting ----------------------------------------------------------------
     @property
     def can_draft(self) -> bool:
@@ -251,6 +265,10 @@ def adapter_for(model, drafter=None):
     mt = getattr(getattr(model, "args", None), "model_type", None)
     if mt == "mistral_large4":
         return MistralLarge4Adapter(model, drafter)
+    if mt == "deepseek_v41":
+        from .deepseek_v41 import V41Adapter
+
+        return V41Adapter(model, drafter)
     return StandardMoEAdapter(model, drafter)
 
 
@@ -431,10 +449,16 @@ def _vlm_target(model, cfg):
         args=vlm_args, model=model.model, lm_head=model.lm_head))
 
 
-def load_drafter(path: str, model) -> VlmDrafter:
+def load_drafter(path: str, model, reader=None):
     """A pipeline drafter for `model` from an mlx-vlm drafter directory, e.g.
     `python -m mlx_vlm.split_mtp --model <checkpoint with its draft head>
-    --output <dir> --q-bits 4` (Mistral Large 4's DSpark head)."""
+    --output <dir> --q-bits 4` (Mistral Large 4's DSpark head). DeepSeek-V4.1
+    reads its head from the checkpoint itself: `path` is the model directory,
+    `reader` the model's expert reader."""
+    if getattr(getattr(model, "args", None), "model_type", None) == "deepseek_v41":
+        from .deepseek_v41_dspark import V41DSpark
+
+        return V41DSpark(model, path, reader.index, reader)
     try:
         from mlx_vlm.speculative.drafters import load_drafter as _load
     except ImportError as e:

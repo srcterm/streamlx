@@ -13,7 +13,8 @@ split out once with `python -m mlx_vlm.split_mtp --model <checkpoint>
 --output <dir> --q-bits 4`: K tokens in flight, one layer apart, so each
 token's expert reads overlap the others' compute; greedy output identical
 to plain decoding. A self-gate times drafting against plain decoding and
-keeps whichever is faster.
+keeps whichever is faster. DeepSeek-V4.1 reads its head from the checkpoint:
+--draft-head is the model directory, with --draft-k 6.
 """
 
 from __future__ import annotations
@@ -30,7 +31,6 @@ from mlx_lm.models.cache import make_prompt_cache
 
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
                                 preload_popular)
-from streamlx.pipeline_adapters import capture_layer_outputs
 
 PREFILL_STEP = 4096
 
@@ -79,12 +79,13 @@ def main() -> int:
         print(f"[load] warm-start in {time.time()-t0:.1f}s "
               f"({reader.bytes_read/1e9:.1f} GB)", file=sys.stderr)
 
-    drafter = None
+    drafter = ad = None
     if args.draft_head:
-        from streamlx.pipeline_adapters import load_drafter
+        from streamlx.pipeline_adapters import adapter_for, load_drafter
 
         t0 = time.time()
-        drafter = load_drafter(args.draft_head, model)
+        drafter = load_drafter(args.draft_head, model, reader)
+        ad = adapter_for(model, drafter)
         print(f"[load] draft head in {time.time()-t0:.1f}s", file=sys.stderr)
 
     # what stream_generate holds while it runs: MLX's buffers stay wired
@@ -92,12 +93,15 @@ def main() -> int:
     with wired_limit(model, [generation_stream]):
         ids = tokenizer.encode(args.prompt)
         cache = make_prompt_cache(model)
-        taps = list(drafter.tap_layers) if drafter is not None else []
-        with capture_layer_outputs(model, taps) as got:
-            for i in range(0, len(ids), PREFILL_STEP):
-                chunk = mx.array([ids[i:i + PREFILL_STEP]])
+        context = []
+        for i in range(0, len(ids), PREFILL_STEP):
+            chunk = mx.array([ids[i:i + PREFILL_STEP]])
+            if ad is None:
                 logits = model(chunk, cache=cache)
-                mx.eval(logits)
+            else:
+                logits, h = ad.forward_taps(chunk, cache)
+                context.append(h)
+            mx.eval(logits, context)
         first = int(mx.argmax(logits[0, -1]).item())
 
         eos = set(tokenizer.eos_token_ids or ())
@@ -116,16 +120,14 @@ def main() -> int:
         dec = None
         if drafter is not None:
             from streamlx.pipeline import PipelinedDecoder
-            from streamlx.pipeline_adapters import adapter_for
 
-            hidden = mx.concatenate([mx.concatenate(got[i], axis=1)
-                                     for i in taps], axis=-1)
+            hidden = mx.concatenate(context, axis=1)
+            del context
             drafter.reset()
             drafter.prime_pairs(hidden[:, :-1], None)
-            ad = adapter_for(model, drafter)
             # plain_fn arms the self-gate: drafting only while it is faster
-            dec = PipelinedDecoder(ad, pools, cache, k_max=args.draft_k,
-                                   plain_fn=ad.plain)
+            dec = PipelinedDecoder(ad, pools, ad.views(cache),
+                                   k_max=args.draft_k, plain_fn=ad.plain)
             emit(first)
             out = dec.generate(first, hidden[:, -1:], len(ids),
                                args.max_tokens, on_token=emit, stop=eos)
