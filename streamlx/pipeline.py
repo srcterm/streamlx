@@ -547,23 +547,36 @@ class PipelinedDecoder:
         starting with first_tok, exactly like a plain greedy loop, ending
         early after the first committed id in `stop`."""
         out = [first_tok]
+        for tok in self.decode(first_tok, first_hidden, offset, n_tokens, stop):
+            out.append(tok)
+            if on_token is not None:
+                on_token(tok)
+        return out
+
+    def decode(self, first_tok: int, first_hidden, offset: int, n_tokens: int,
+               stop=()):
+        """generate() one token at a time: yields the ids after first_tok. A
+        server stops reading wherever a request ends, so however this ends,
+        closed early included, the cache ends just after the last id out when
+        a later stream of its step ran it, else just before it."""
+        self._warm = self._warm_gate = 0           # a sequence's cold steps
         if first_tok in stop:
-            return out
+            return
+        n = 1
         cur = first_tok
         pairs = [(first_hidden, first_tok)]
         depth = self.k_max - 1
-        while len(out) < n_tokens:
+        while n < n_tokens:
             drafts, conf = self._draft_for(pairs, depth)
             pairs = []
             if not drafts and self.plain_fn is not None:
                 nxt, _lg, h = self.plain_step(cur)
                 self.steps += 1
                 pairs.append((h, nxt))
-                out.append(nxt)
-                if on_token is not None:
-                    on_token(nxt)
+                n += 1
+                yield nxt
                 if nxt in stop:
-                    return out[:n_tokens]
+                    return
                 offset += 1
                 cur = nxt
                 continue
@@ -587,20 +600,22 @@ class PipelinedDecoder:
             self._gate_account(dt, a)
             self.rollback(snaps, a)
             for i in range(a):
-                if len(out) == n_tokens:     # a step can overshoot the limit
-                    return out
                 pairs.append((hiddens[i], outs[i]))
-                out.append(outs[i])
-                if on_token is not None:
-                    on_token(outs[i])
-                if outs[i] in stop:          # the cache ends before the stop id
-                    self.rollback(snaps, i + 1)
-                    return out
+                n += 1
+                ending = True                # also if closed at this yield
+                try:
+                    yield outs[i]
+                    ending = outs[i] in stop or n == n_tokens
+                finally:
+                    if ending:               # a step can overshoot the end;
+                        # stream i+1 ran outs[i] if it was kept
+                        self.rollback(snaps, min(i + 2, a))
+                if ending:
+                    return
             offset += a
             cur = outs[a - 1]
             if pairs and depth == 0:
                 pairs = []
-        return out[:n_tokens]
 
     @staticmethod
     def _accepted(drafts, outs) -> int:
