@@ -3,9 +3,11 @@ the checkpoint loader, its draft head and the pipeline adapter. Needs mlx-vlm.
 
 Loader. mlx-vlm builds the model; `load_qwen4_exp` only
   - keeps the PLE table (30 GiB) out of the parameter tree: mlx-vlm's external
-    PLE storage reads the rows a token needs from the checkpoint's byte ranges.
-    An oQ export stores those rows unscaled, with one `weight_scale` for the
-    table, which that storage doesn't know about: applied here,
+    PLE storage reads the rows a token needs from the checkpoint's byte ranges
+    (here with parallel preads of exactly their bytes, not its memmap's page
+    faults one at a time). An oQ export stores those rows unscaled, with one
+    `weight_scale` for the table, which that storage doesn't know about:
+    applied here,
   - turns off mlx-vlm's single-token decode path, which inlines the expert
     gather and so can't stream: decode runs the blocks prefill runs,
   - wraps the language model as a text model: `layers`, `make_cache`, logits.
@@ -21,13 +23,17 @@ finish() runs the MoE and the inject, both with the block's own modules.
 """
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx_vlm.models.qwen3_5_moe.language import \
     Qwen3_5MoeSparseMoeBlock as _MoeBlock
 from mlx_vlm.models.qwen4_exp.language import (
@@ -36,6 +42,7 @@ from mlx_vlm.models.qwen4_exp.ple_storage import (PLE_MARKER,
                                                   build_quantized_ple_manifest)
 
 from .pipeline_adapters import StandardMoEAdapter, _find_switch
+from .reader import F_NOCACHE, F_RDAHEAD
 
 
 def _route(blk, x):
@@ -49,6 +56,61 @@ def _route(blk, x):
     return inds, scores
 
 
+class _PreadRows:
+    """A PLE store's row reads (its _read_rows, no row cache) as one pread per
+    row and tensor, of exactly its bytes, on a thread pool. A row is 160
+    values at Q4: 80 B of weight, 10 B of scales and 10 B of biases in three
+    tensors, so the store's memmap faults three 16 KB pages a row, one at a
+    time (16 rows a token); the same bytes, read in parallel."""
+
+    _ex = None
+
+    def __init__(self, store, workers: int = 32):
+        if _PreadRows._ex is None:
+            _PreadRows._ex = ThreadPoolExecutor(max_workers=workers,
+                                                thread_name_prefix="ple-rows")
+        self.workers = workers
+        fds, self.starts, self.parts = {}, [], []
+        for start, _end, arrays in store._shards:
+            parts = []
+            for name in store._tensor_names:
+                a = arrays[name]
+                fd = fds.get(a.filename)
+                if fd is None:
+                    fd = fds[a.filename] = os.open(a.filename, os.O_RDONLY)
+                    try:
+                        fcntl.fcntl(fd, F_NOCACHE, 1)
+                        fcntl.fcntl(fd, F_RDAHEAD, 0)
+                    except OSError:
+                        pass
+                parts.append((fd, a.offset, a.shape[1] * a.dtype.itemsize,
+                              a.dtype))
+            self.starts.append(start)
+            self.parts.append(parts)
+        self.starts = np.array(self.starts)
+        self.cols = [arrays[name].shape[1] for name in store._tensor_names]
+
+    def __call__(self, row_ids):
+        ids = np.asarray(row_ids, dtype=np.int64).reshape(-1)
+        shard = np.searchsorted(self.starts, ids, side="right") - 1
+        local = (ids - self.starts[shard]).tolist()
+        shard = shard.tolist()
+        outs = [np.empty((ids.size, c), p[3])
+                for c, p in zip(self.cols, self.parts[0])]
+
+        def read(lo, hi):
+            for i in range(lo, hi):
+                for out, (fd, off, n, dt) in zip(outs, self.parts[shard[i]]):
+                    out[i] = np.frombuffer(os.pread(fd, n, off + local[i] * n),
+                                           dt)
+
+        step = max(1, -(-ids.size // (4 * self.workers)))
+        for f in [self._ex.submit(read, lo, min(ids.size, lo + step))
+                  for lo in range(0, ids.size, step)]:
+            f.result()
+        return tuple(outs)
+
+
 class _ScaledRows:
     """A PLE table's rows times its checkpoint's weight_scale."""
 
@@ -59,17 +121,24 @@ class _ScaledRows:
         return self.table(row_ids).astype(mx.bfloat16) * self.scale
 
 
-def _scale_ple_rows(lm, root: Path) -> None:
+def _ple_rows(lm, root: Path) -> None:
+    """The PLE stores' row reads (_PreadRows) and the oQ table scale."""
     wmap = json.loads((root / "model.safetensors.index.json").read_text())[
         "weight_map"]
     for i, layer in enumerate(lm.model.layers):
+        if "ple" not in layer:
+            continue
+        emb = layer.ple.ple_embedding
+        store = emb.ngram_embedding
+        if (getattr(store, "cache_rows", None) == 0
+                and getattr(store, "_interleaved", 0) is None):
+            store._read_rows = _PreadRows(store)
         key = (f"language_model.model.layers.{i}.ple.ple_embedding."
                "ngram_embedding.weight_scale")
-        if "ple" in layer and key in wmap:
-            emb = layer.ple.ple_embedding
+        if key in wmap:
             scale = mx.load(str(root / wmap[key]))[key]
             mx.eval(scale)
-            emb.ngram_embedding = _ScaledRows(emb.ngram_embedding, scale)
+            emb.ngram_embedding = _ScaledRows(store, scale)
 
 
 class Qwen4ExpText(nn.Module):
@@ -123,7 +192,7 @@ def load_qwen4_exp(model_dir, tokenizer_config=None, model_config=None):
             vu.load_config = orig
     lm = vlm.language_model
     lm._supports_batch_invariant_decode = lambda: False
-    _scale_ple_rows(lm, root)
+    _ple_rows(lm, root)
     tok = load_tokenizer(root, tokenizer_config_extra=tokenizer_config or {},
                          eos_token_ids=cfg.get("eos_token_id"))
     return Qwen4ExpText(lm), tok
