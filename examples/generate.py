@@ -13,8 +13,9 @@ split out once with `python -m mlx_vlm.split_mtp --model <checkpoint>
 --output <dir> --q-bits 4`: K tokens in flight, one layer apart, so each
 token's expert reads overlap the others' compute; greedy output identical
 to plain decoding. A self-gate times drafting against plain decoding and
-keeps whichever is faster. DeepSeek-V4.1 reads its head from the checkpoint:
---draft-head is the model directory, with --draft-k 6.
+keeps whichever is faster. DeepSeek-V4.1 and Qwen3.8 read their heads from
+the checkpoint: --draft-head is the model directory, with --draft-k 6 for
+V4.1 and 3 for Qwen3.8.
 """
 
 from __future__ import annotations
@@ -124,7 +125,8 @@ def main() -> int:
             hidden = mx.concatenate(context, axis=1)
             del context
             drafter.reset()
-            drafter.prime_pairs(hidden[:, :-1], None)
+            drafter.prime_pairs(hidden[:, :-1],
+                                mx.array([ids[1:]], dtype=mx.int32))
             # plain_fn arms the self-gate: drafting only while it is faster
             dec = PipelinedDecoder(ad, pools, ad.views(cache),
                                    k_max=args.draft_k, plain_fn=ad.plain)
