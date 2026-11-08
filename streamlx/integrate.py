@@ -682,10 +682,11 @@ def _vlm_export_shim(model_dir: str) -> dict | None:
     per-path quantization override with "language_model.", which stock
     mlx-lm text impls don't expect (strict load fails on the extra keys,
     and the override table would silently never match a module). Detected
-    via the safetensors index; returns a model_config overlay with the
-    prefixes stripped from the quantization table and installs a sanitize
-    wrapper that strips them from the weights. None/no-op for native
-    exports."""
+    via the safetensors index; returns a model_config overlay whose
+    quantization table has both spellings, and installs a sanitize wrapper
+    that strips the prefix from the weights unless the mlx-lm class wraps a
+    language_model itself (the qwen3_5 family), which takes them as they
+    are. None/no-op for native exports."""
     import json
     from pathlib import Path
 
@@ -712,7 +713,8 @@ def _vlm_export_shim(model_dir: str) -> dict | None:
         def sanitize(self, weights):
             if prev is not None:
                 weights = prev(self, weights)
-            if any(k.startswith("language_model.") for k in weights):
+            if "language_model" not in self and any(
+                    k.startswith("language_model.") for k in weights):
                 weights = {_remap(k): v for k, v in weights.items()}
             return weights
 
@@ -722,7 +724,8 @@ def _vlm_export_shim(model_dir: str) -> dict | None:
     quant = cfg.get("quantization")
     if not quant:
         return None
-    return {"quantization": {_remap(k): v for k, v in quant.items()}}
+    return {"quantization": {**quant,
+                             **{_remap(k): v for k, v in quant.items()}}}
 
 
 def _routed_topk(model_dir: str, default: int = 8) -> int:
