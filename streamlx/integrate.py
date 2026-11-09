@@ -17,6 +17,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -46,6 +47,28 @@ def _pf_ex():
 # prompt-cache hit), too many of those reads would go unused.
 _NEXT_MIN_COVERAGE = 0.7
 _NEXT_BYTES = 512 * 2**20   # read at most this much ahead per layer boundary
+
+# The cache of the prefill chunk in flight (prefill_cache), and the last layer
+# whose entry its streamed layers have evaluated.
+_PREFILL = {"cache": None, "done": -1}
+
+
+@contextmanager
+def prefill_cache(cache):
+    """Run a prefill chunk's forward in this: each streamed layer's MoE call
+    then evaluates the cache entries of the layers up to it, so what they
+    store is computed as the chunk passes. Left lazy until the host evaluates
+    the cache after the forward, a stored state keeps the arrays it is made
+    from: a linear-attention layer's conv window is three rows of its whole
+    conv input (Qwen3.8: ~1.3 GiB over 36 layers for 1.6K tokens, ~3 GiB for
+    4K), a rotating cache's window its chunk's keys. Evaluation order only:
+    the values are the same."""
+    prev = _PREFILL["cache"], _PREFILL["done"]
+    _PREFILL["cache"], _PREFILL["done"] = cache, -1
+    try:
+        yield
+    finally:
+        _PREFILL["cache"], _PREFILL["done"] = prev
 
 
 def _stock_sorted(n_routes: int, n_experts: int) -> bool:
@@ -127,6 +150,31 @@ class StreamingSwitchGLU(nn.Module):
         except Exception:
             self._pf_next = None   # arch surprise: disable for this link
             return None
+
+    def _own_cache_states(self) -> None:
+        """prefill_cache's per-layer step: evaluate the entries of the layers
+        up to this one that this forward has not (a layer at or below the
+        last one seen starts a new forward)."""
+        cache, done = _PREFILL["cache"], _PREFILL["done"]
+        upto = min(self.pool.layer, len(cache) - 1)
+        if upto <= done:
+            done = -1
+        states = []
+        for c in cache[done + 1:upto + 1]:
+            try:
+                st = c.state
+            except Exception:    # an entry with nothing stored yet
+                continue
+            todo = [st]
+            while todo:
+                x = todo.pop()
+                if isinstance(x, mx.array):
+                    states.append(x)
+                elif isinstance(x, (list, tuple)):
+                    todo.extend(x)
+        if states:
+            mx.async_eval(states)
+        _PREFILL["done"] = upto
 
     def _remap(self, idx: np.ndarray) -> np.ndarray:
         slots = self.pool.slot_table[idx]
@@ -511,6 +559,8 @@ class StreamingSwitchGLU(nn.Module):
             if pred is not None:
                 mx.eval(indices, *pred)  # one sync covers all three graphs
         idx = np.array(indices)  # materializes the gate's selection (sync)
+        if not decode and _PREFILL["cache"] is not None:
+            self._own_cache_states()
         if self.record_sink is not None:
             self.record_sink.append((self.pool.layer, idx.copy()))
         uniq = list(dict.fromkeys(idx.reshape(-1).tolist()))

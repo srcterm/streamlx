@@ -8,7 +8,8 @@ with streamlx: trunk resident, experts streamed from SSD on demand.
       [--warmstart-trace trace.npz] [--tokenizer-config key=json ...] \
       [--resident] [--prompt-cache-gib N] [--mlx-cache-gib N] \
       [--kv-cache-dir DIR [--kv-cache-gib N]] \
-      [--draft-head DIR [--draft-k 4]]
+      [--draft-head DIR [--draft-k 4]] \
+      [--prefill-memory-gib N]
 
 --model must be a LOCAL directory (the byte-range reader needs the shards on
 disk). Requests are handled sequentially: concurrent batching multiplies the
@@ -21,6 +22,10 @@ With most of that wired for Metal, a long agent session runs the machine out
 of unpageable memory. Both get hard byte caps here: --prompt-cache-gib
 (default: RAM - budget - 12 GiB, clamped to [1, 8]) and --mlx-cache-gib
 (default 2).
+
+--prefill-memory-gib caps what a prefill holds beyond the arrays it uses:
+MLX's freed buffers (a third, at most 0.25 GiB) and the next layer's reads in
+flight (the rest, at most 0.5 GiB).
 
 Long prefills of models whose attention head size MLX does not fuse by
 default (256 in Qwen3.5/3.6) would build heads x queries x keys of scores per
@@ -55,6 +60,7 @@ verified, so that can only cost acceptance, not change the text.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import itertools
 import json
@@ -69,13 +75,15 @@ from mlx_lm.generate import (GenerationResponse, generation_stream,
 from mlx_lm.models.cache import can_trim_prompt_cache
 
 from streamlx import attention
+from streamlx import integrate as _integrate
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
-                                preload_popular)
+                                prefill_cache, preload_popular)
 from streamlx.kvcache import PagedPromptCache
 
 _CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
         "tokenizer_config": {}, "resident": None,
-        "prompt_cache_bytes": 4 * 2**30, "draft_head": None, "draft_k": 4}
+        "prompt_cache_bytes": 4 * 2**30, "draft_head": None, "draft_k": 4,
+        "mlx_cache_bytes": 2 * 2**30, "prefill_cache_bytes": 0}
 _STATE = {"pools": None, "reader": None}
 
 
@@ -167,6 +175,19 @@ def _snapshot(fetch, n: int, cache) -> None:
           f"({time.perf_counter() - t0:.2f}s)", file=sys.stderr)
 
 
+@contextlib.contextmanager
+def _prefill_buffers():
+    """--prefill-memory-gib: MLX's freed-buffer cap while prefilling."""
+    lim = _CFG["prefill_cache_bytes"]
+    if lim:
+        mx.set_cache_limit(lim)
+    try:
+        yield
+    finally:
+        if lim:
+            mx.set_cache_limit(_CFG["mlx_cache_bytes"])
+
+
 def _prefill_history(kwargs: dict, adapter=None) -> int:
     """Prefill the request's uncached prompt up to where its history ends,
     store the cache there and leave the rest to stream_generate (updates
@@ -200,14 +221,15 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
     stream = kwargs.get("stream", generation_stream)
     tokens, done = mx.array(prompt[:cut]), 0
     cb(0, len(prompt))
-    with wired_limit(model, [stream]), mx.stream(stream):
+    with wired_limit(model, [stream]), mx.stream(stream), _prefill_buffers():
         for n in _chunks(cut, kwargs.get("prefill_step_size", 2048)):
             chunk = tokens[None, done:done + n]
-            if adapter is None:
-                model(chunk, cache=cache)
-                rows = None
-            else:
-                _, rows = adapter.forward_taps(chunk, cache)
+            with prefill_cache(cache):
+                if adapter is None:
+                    model(chunk, cache=cache)
+                    rows = None
+                else:
+                    _, rows = adapter.forward_taps(chunk, cache)
             maybe_quantize_kv_cache(
                 cache, kwargs.get("quantized_kv_start", 0),
                 kwargs.get("kv_group_size", 64), kwargs.get("kv_bits"))
@@ -269,17 +291,22 @@ def _pipelined(dec, kwargs: dict):
         # in prefill-size chunks, then the last alone (a model can compute a
         # token differently in a chunk than alone, so this keeps plain's text)
         step, done = kwargs.get("prefill_step_size", 2048), 0
-        while len(prompt) - done > 1:
-            k = min(step, len(prompt) - done - 1)
-            _, rows = ad.forward_taps(mx.array([prompt[done:done + k]]), cache)
-            mx.eval(rows, [c.state for c in cache])
-            ad.prime_pairs(rows, mx.array([prompt[done + 1:done + k + 1]],
-                                          dtype=mx.int32))
-            done += k
-            cb(done, len(prompt))
-            mx.clear_cache()
-        logits, rows = ad.forward_taps(mx.array([prompt[done:]]), cache)
-        mx.eval(logits, rows, [c.state for c in cache])
+        with _prefill_buffers():
+            while len(prompt) - done > 1:
+                k = min(step, len(prompt) - done - 1)
+                with prefill_cache(cache):
+                    _, rows = ad.forward_taps(
+                        mx.array([prompt[done:done + k]]), cache)
+                mx.eval(rows, [c.state for c in cache])
+                ad.prime_pairs(rows, mx.array(
+                    [prompt[done + 1:done + k + 1]], dtype=mx.int32))
+                done += k
+                cb(done, len(prompt))
+                mx.clear_cache()
+            with prefill_cache(cache):
+                logits, rows = ad.forward_taps(mx.array([prompt[done:]]),
+                                               cache)
+            mx.eval(logits, rows, [c.state for c in cache])
         cb(len(prompt), len(prompt))
         token = first = int(mx.argmax(logits[0, -1]).item())
         dec.cache = ad.views(cache)
@@ -488,6 +515,12 @@ def main() -> None:
                          "decoding of greedy requests")
     ap.add_argument("--draft-k", type=int, default=4,
                     help="tokens in flight with --draft-head (default 4)")
+    ap.add_argument("--prefill-memory-gib", type=float, default=None,
+                    help="cap what prefill holds beyond the arrays it uses: "
+                         "MLX's freed-buffer cache while prefilling (a third, "
+                         "at most 0.25 GiB) and the next layer's reads in "
+                         "flight (the rest, at most 0.5 GiB). Default: "
+                         "--mlx-cache-gib and 0.5 GiB")
     ours, rest = ap.parse_known_args()
     _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
     _CFG["warmstart_trace"] = ours.warmstart_trace
@@ -504,7 +537,14 @@ def main() -> None:
     else:
         _CFG["prompt_cache_bytes"] = _auto_prompt_cache_bytes(
             ram, _CFG["budget_bytes"])
-    mx.set_cache_limit(int(ours.mlx_cache_gib * 2**30))
+    _CFG["mlx_cache_bytes"] = int(ours.mlx_cache_gib * 2**30)
+    mx.set_cache_limit(_CFG["mlx_cache_bytes"])
+    if ours.prefill_memory_gib:
+        cap = int(ours.prefill_memory_gib * 2**30)
+        _CFG["prefill_cache_bytes"] = min(_CFG["mlx_cache_bytes"],
+                                          max(2**26, min(2**28, cap // 3)))
+        reads = cap - _CFG["prefill_cache_bytes"]
+        _integrate._NEXT_BYTES = max(2**26, min(_integrate._NEXT_BYTES, reads))
     attention.install()
     if ours.kv_cache_dir:
         def paged(*_args, **_kwargs):

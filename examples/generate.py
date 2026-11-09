@@ -31,7 +31,7 @@ from mlx_lm.generate import generation_stream, wired_limit
 from mlx_lm.models.cache import make_prompt_cache
 
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
-                                preload_popular)
+                                prefill_cache, preload_popular)
 
 PREFILL_STEP = 4096
 
@@ -97,11 +97,12 @@ def main() -> int:
         context = []
         for i in range(0, len(ids), PREFILL_STEP):
             chunk = mx.array([ids[i:i + PREFILL_STEP]])
-            if ad is None:
-                logits = model(chunk, cache=cache)
-            else:
-                logits, h = ad.forward_taps(chunk, cache)
-                context.append(h)
+            with prefill_cache(cache):
+                if ad is None:
+                    logits = model(chunk, cache=cache)
+                else:
+                    logits, h = ad.forward_taps(chunk, cache)
+                    context.append(h)
             mx.eval(logits, context)
         first = int(mx.argmax(logits[0, -1]).item())
 
