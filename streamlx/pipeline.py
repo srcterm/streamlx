@@ -283,10 +283,15 @@ class PipelinedDecoder:
         # in this step (handed to the streaming switch as pool.call_hint), so
         # streams in flight never evict each other's experts, whatever the
         # budget. Once every stream has computed a layer, its pool takes what
-        # the tokens would have left there one after another (_settle).
+        # the tokens would have left there one after another (_settle), but
+        # only after a later routing sync: a slot write into a slab that a
+        # gather still in flight reads cannot reuse the slab's buffer (MLX
+        # holds a command buffer's inputs until it completes), so it would
+        # copy the whole slab, every layer, every step.
         self._rows: dict = {}              # layer -> {expert: rows} this step
         self._used: dict = {}              # layer -> [stream's experts, ...]
         self._fin: dict = {}               # layer -> streams finished
+        self._unsettled: list = []         # layers computed, pool not updated
         self._k_cur = 0
         # an adapter whose begin() routes with the block's own code lets the
         # switch reuse that routing instead of syncing on it a second time
@@ -354,7 +359,13 @@ class PipelinedDecoder:
         s.st = None
         self._fin[l] = self._fin.get(l, 0) + 1
         if self._fin[l] == self._k_cur:
-            self._settle(l)
+            self._unsettled.append(l)
+
+    def _settle_before(self, l: int) -> None:
+        """Settle the computed layers below l (their gathers have completed:
+        a routing sync came after their last stream's)."""
+        while self._unsettled and self._unsettled[0] < l:
+            self._settle(self._unsettled.pop(0))
 
     def _settle(self, l: int) -> None:
         """Every stream has computed layer l: leave in its pool what the
@@ -401,6 +412,7 @@ class PipelinedDecoder:
             p._pf_suspend = True
         self._inflight.clear()
         self._rows, self._used, self._fin = {}, {}, {}
+        self._unsettled = []
         self._k_cur = len(toks)
         try:
             return self._step(toks, offset, pos_base)
@@ -428,11 +440,16 @@ class PipelinedDecoder:
                     snaps[l][i] = self._snap(self.cache[l])
                     self.t_snap += time.perf_counter() - t0
                 self._begin(l, streams[i])
+                if i == 0:
+                    # every stream's layer l-2 gather finished before the
+                    # routing syncs since its last stream's
+                    self._settle_before(l - 1)
             self._finish(l, streams[0])
         for i in range(1, K):
             self._finish(n - 1, streams[i])
         lg = [self.ad.logits(s.h) for s in streams]
         mx.eval(*lg)
+        self._settle_before(n)
         outs = [int(mx.argmax(x[0, -1]).item()) for x in lg]
         self._last_logits = lg
         dh = getattr(self.ad, "draft_hidden", None)
@@ -530,23 +547,36 @@ class PipelinedDecoder:
         starting with first_tok, exactly like a plain greedy loop, ending
         early after the first committed id in `stop`."""
         out = [first_tok]
+        for tok in self.decode(first_tok, first_hidden, offset, n_tokens, stop):
+            out.append(tok)
+            if on_token is not None:
+                on_token(tok)
+        return out
+
+    def decode(self, first_tok: int, first_hidden, offset: int, n_tokens: int,
+               stop=()):
+        """generate() one token at a time: yields the ids after first_tok. A
+        server stops reading wherever a request ends, so however this ends,
+        closed early included, the cache ends just after the last id out when
+        a later stream of its step ran it, else just before it."""
+        self._warm = self._warm_gate = 0           # a sequence's cold steps
         if first_tok in stop:
-            return out
+            return
+        n = 1
         cur = first_tok
         pairs = [(first_hidden, first_tok)]
         depth = self.k_max - 1
-        while len(out) < n_tokens:
+        while n < n_tokens:
             drafts, conf = self._draft_for(pairs, depth)
             pairs = []
             if not drafts and self.plain_fn is not None:
                 nxt, _lg, h = self.plain_step(cur)
                 self.steps += 1
                 pairs.append((h, nxt))
-                out.append(nxt)
-                if on_token is not None:
-                    on_token(nxt)
+                n += 1
+                yield nxt
                 if nxt in stop:
-                    return out[:n_tokens]
+                    return
                 offset += 1
                 cur = nxt
                 continue
@@ -570,20 +600,22 @@ class PipelinedDecoder:
             self._gate_account(dt, a)
             self.rollback(snaps, a)
             for i in range(a):
-                if len(out) == n_tokens:     # a step can overshoot the limit
-                    return out
                 pairs.append((hiddens[i], outs[i]))
-                out.append(outs[i])
-                if on_token is not None:
-                    on_token(outs[i])
-                if outs[i] in stop:          # the cache ends before the stop id
-                    self.rollback(snaps, i + 1)
-                    return out
+                n += 1
+                ending = True                # also if closed at this yield
+                try:
+                    yield outs[i]
+                    ending = outs[i] in stop or n == n_tokens
+                finally:
+                    if ending:               # a step can overshoot the end;
+                        # stream i+1 ran outs[i] if it was kept
+                        self.rollback(snaps, min(i + 2, a))
+                if ending:
+                    return
             offset += a
             cur = outs[a - 1]
             if pairs and depth == 0:
                 pairs = []
-        return out[:n_tokens]
 
     @staticmethod
     def _accepted(drafts, outs) -> int:

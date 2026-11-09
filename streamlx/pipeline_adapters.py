@@ -269,6 +269,10 @@ def adapter_for(model, drafter=None):
         from .deepseek_v41 import V41Adapter
 
         return V41Adapter(model, drafter)
+    if mt == "qwen4_exp":
+        from .qwen4_exp import Qwen4ExpAdapter
+
+        return Qwen4ExpAdapter(model, drafter)
     return StandardMoEAdapter(model, drafter)
 
 
@@ -438,6 +442,47 @@ class VlmDrafter:
                 None)
 
 
+class VlmMtpDrafter:
+    """The pipeline's drafter protocol over an mlx-vlm autoregressive MTP head
+    (Qwen3.8's): the head's cache holds committed (hidden, next token) pairs,
+    a draft chains on it and trims the chain back off."""
+
+    tap_layers = ()
+
+    def __init__(self, head, model):
+        self.head = head.bind(model)
+
+    def reset(self) -> None:
+        self.head._cache = self.head.make_cache()
+        self.head._next_position = 0
+
+    def prime_pairs(self, hidden, next_ids=None) -> None:
+        if hidden.shape[1]:
+            lg, h = self.head._forward_tokens(next_ids, hidden, mx.int32)
+            mx.eval(lg, h)
+
+    def draft(self, pairs, depth: int, spec=None):
+        if not pairs or depth <= 0:
+            return [], [], None
+        rows = mx.concatenate([h for h, _ in pairs], axis=1)
+        toks = mx.array([[t for _, t in pairs]], dtype=mx.int32)
+        out, h = self.head._forward_tokens(toks, rows, mx.int32)
+        h, drafts, probs = h[:, -1:], [], []
+        for j in range(depth):
+            logits = self.head._lm_head_fn(out[:, -1:])
+            probs.append(mx.max(mx.softmax(logits.astype(mx.float32), axis=-1),
+                                axis=-1))
+            drafts.append(mx.argmax(logits, axis=-1))
+            if j + 1 < depth:
+                out, h = self.head._forward_tokens(drafts[-1], h, mx.int32)
+        mx.eval(drafts, probs)
+        for c in self.head._cache:
+            c.trim(depth - 1)
+        self.head._next_position -= depth - 1
+        return ([int(d.item()) for d in drafts],
+                [float(p.item()) for p in probs], None)
+
+
 def _vlm_target(model, cfg):
     """What an mlx-vlm drafter's bind() reads off its target (its own
     model class), for an mlx-lm model: language_model.{args, model,
@@ -453,18 +498,25 @@ def load_drafter(path: str, model, reader=None):
     """A pipeline drafter for `model` from an mlx-vlm drafter directory, e.g.
     `python -m mlx_vlm.split_mtp --model <checkpoint with its draft head>
     --output <dir> --q-bits 4` (Mistral Large 4's DSpark head). DeepSeek-V4.1
-    reads its head from the checkpoint itself: `path` is the model directory,
-    `reader` the model's expert reader."""
-    if getattr(getattr(model, "args", None), "model_type", None) == "deepseek_v41":
+    and Qwen3.8 read their heads from the checkpoint itself: `path` is the model
+    directory (V4.1's streams through `reader`, the model's expert reader)."""
+    mt = getattr(getattr(model, "args", None), "model_type", None)
+    if mt == "deepseek_v41":
         from .deepseek_v41_dspark import V41DSpark
 
         return V41DSpark(model, path, reader.index, reader)
+    if mt == "qwen4_exp":
+        from .qwen4_exp import load_head
+
+        return VlmMtpDrafter(load_head(path, model), model)
     try:
         from mlx_vlm.speculative.drafters import load_drafter as _load
     except ImportError as e:
         raise ImportError("draft heads need mlx-vlm: pip install mlx-vlm") from e
     draft, kind = _load(path)
+    if kind == "mtp":
+        return VlmMtpDrafter(draft, model)
     if kind != "dflash":
         raise ValueError(f"{path}: an mlx-vlm {kind!r} drafter; the pipeline "
-                         f"takes block drafters (DSpark, DFlash)")
+                         f"takes DSpark, DFlash and MTP heads")
     return VlmDrafter(draft, model)

@@ -10,12 +10,12 @@ and after generation; a request restores the longest prefix it shares with
 anything stored, from any earlier turn or conversation, and RAM holds only
 the active request's cache.
 
-Layers whose cache grows along the sequence (KVCache, QuantizedKVCache,
-ConcatenateKVCache and CacheLists of them) store each segment's slice: a
-prefix restores from the chain of segments before it, cut at any token when
-every layer is such a cache. Other layers (recurrent ArraysCache, rotating
-windows) store their whole state at the segment's end, so models with them
-restore at segment ends only.
+Layers whose cache grows along the sequence (KVCache, QSAKVCache,
+QuantizedKVCache, ConcatenateKVCache and CacheLists of them) store each
+segment's slice: a prefix restores from the chain of segments before it,
+cut at any token when every layer is such a cache. Other layers (recurrent
+ArraysCache, rotating windows) store their whole state at the segment's end,
+so models with them restore at segment ends only.
 
 Drop-in for mlx_lm's LRUPromptCache in the sequential server (one request at
 a time): the same fetch_nearest_cache / insert_cache interface, plus
@@ -28,6 +28,7 @@ import bisect
 import hashlib
 import heapq
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -44,7 +45,10 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 FORMAT = 1
 _STEP = 256      # tokens per hash step
-_SLICED = ("KVCache", "QuantizedKVCache", "ConcatenateKVCache")
+_SLICED = ("KVCache", "QSAKVCache", "QuantizedKVCache", "ConcatenateKVCache")
+# state leaves of a sliced cache not along axis -2: their axis, or None for what
+# the cache rebuilds (Qwen3.8's indexer: positions, then its block summaries)
+_LEAF_AXIS = {"QSAKVCache": {"3": -1, "4": None, "5": None}}
 _TAGS = {mx.bfloat16: "BF16", mx.float16: "F16", mx.float32: "F32",
          mx.int32: "I32", mx.uint32: "U32", mx.int64: "I64",
          mx.uint8: "U8", mx.bool_: "BOOL"}
@@ -287,16 +291,24 @@ class PagedPromptCache:
         layers = []
         for i, c in enumerate(cache):
             sl = _sliced(c)
+            axes = _LEAF_AXIS.get(type(c).__name__, {}) if sl else {}
             scalars = {}
             for path, v in tree_flatten(c.state):
+                axis = axes.get(path, -2)
+                if axis is None:
+                    continue
                 if isinstance(v, mx.array):
-                    host[f"{i}.{path}"] = _host(v[..., start:end, :] if sl
-                                                else v)
+                    host[f"{i}.{path}"] = _host(
+                        v if not sl else v[..., start:end, :] if axis == -2
+                        else v[..., start:end])
                 else:
                     scalars[path] = v
+            meta = getattr(c, "meta_state", "")
             layers.append({"cls": f"{type(c).__module__}."
                                   f"{type(c).__qualname__}",
-                           "sliced": sl, "scalars": scalars})
+                           "sliced": sl, "scalars": scalars,
+                           "meta": list(meta) if isinstance(meta, tuple)
+                           else meta})
         if self._sliced_only is None:
             self._sliced_only = all(x["sliced"] for x in layers)
         meta = {"format": FORMAT, "key": key, "prev": prev, "start": start,
@@ -331,23 +343,33 @@ class PagedPromptCache:
             prefix = f"{i}."
             names = [k[len(prefix):] for k in loaded[-1][0]
                      if k.startswith(prefix)]
+            axes = _LEAF_AXIS.get(spec["cls"].rpartition(".")[2], {})
             leaves = []
             for name in names:
                 if spec["sliced"]:
+                    axis = axes.get(name, -2)
                     parts = [arrs[prefix + name] for arrs, _ in
                              loaded[:whole]]
                     if partial is not None:
-                        parts.append(loaded[-1][0][prefix + name]
-                                     [..., :partial[1], :])
+                        v = loaded[-1][0][prefix + name]
+                        parts.append(v[..., :partial[1], :] if axis == -2
+                                     else v[..., :partial[1]])
                     v = (parts[0] if len(parts) == 1
-                         else mx.concatenate(parts, axis=-2))
+                         else mx.concatenate(parts, axis=axis))
                 else:
                     v = loaded[whole - 1][0][prefix + name]
                 leaves.append((name, v))
             src = metas[-1] if spec["sliced"] else metas[whole - 1]
             leaves += list(src["layers"][i]["scalars"].items())
             state = tree_unflatten(leaves)
-            c = _cls(spec["cls"]).from_state(state)
+            cls = _cls(spec["cls"])
+            # mlx-vlm's caches (and mlx-lm's older ones) rebuild from both
+            if len(inspect.signature(cls.from_state).parameters) > 1:
+                meta = src["layers"][i].get("meta", "")
+                c = cls.from_state(state, tuple(meta) if isinstance(meta, list)
+                                   else meta)
+            else:
+                c = cls.from_state(state)
             if spec["sliced"]:
                 _set_offset(c, n)
             out.append(c)

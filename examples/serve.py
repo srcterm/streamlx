@@ -7,7 +7,8 @@ with streamlx: trunk resident, experts streamed from SSD on demand.
       --model <local-model-dir> --port 8080 [--trust-remote-code] \
       [--warmstart-trace trace.npz] [--tokenizer-config key=json ...] \
       [--resident] [--prompt-cache-gib N] [--mlx-cache-gib N] \
-      [--kv-cache-dir DIR [--kv-cache-gib N]]
+      [--kv-cache-dir DIR [--kv-cache-gib N]] \
+      [--draft-head DIR [--draft-k 4]]
 
 --model must be a LOCAL directory (the byte-range reader needs the shards on
 disk). Requests are handled sequentially: concurrent batching multiplies the
@@ -40,12 +41,22 @@ once as segments shared by every request with the same prefix, so RAM holds
 only the active request's cache. --kv-cache-gib bounds the disk use (default
 32; oldest segments go first). A drive other than the model's avoids sharing
 its bandwidth with expert reads.
+
+--draft-head decodes greedy requests through streamlx.pipeline (PEF): K tokens
+in flight, one layer apart, so each token's expert reads overlap the others'
+compute, with plain decoding's output. It takes what generate.py's does: the
+model directory for Qwen3.8 and DeepSeek-V4.1, an mlx-vlm drafter directory
+otherwise. The self-gate's verdict carries across requests. Requests that
+sample, process logits or ask for logprobs decode plainly. On a prompt-cache
+hit the head's context starts at the tokens this request prefills: drafts are
+verified, so that can only cost acceptance, not change the text.
 """
 
 from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import json
 import os
 import sys
@@ -53,8 +64,8 @@ import time
 
 import mlx.core as mx
 import mlx_lm.server as srv
-from mlx_lm.generate import (generation_stream, maybe_quantize_kv_cache,
-                             wired_limit)
+from mlx_lm.generate import (GenerationResponse, generation_stream,
+                             maybe_quantize_kv_cache, wired_limit)
 from mlx_lm.models.cache import can_trim_prompt_cache
 
 from streamlx import attention
@@ -64,7 +75,7 @@ from streamlx.kvcache import PagedPromptCache
 
 _CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
         "tokenizer_config": {}, "resident": None,
-        "prompt_cache_bytes": 4 * 2**30}
+        "prompt_cache_bytes": 4 * 2**30, "draft_head": None, "draft_k": 4}
 _STATE = {"pools": None, "reader": None}
 
 
@@ -92,6 +103,18 @@ def _bounded_lru_init(self, *args, **kwargs):
 
 
 srv.LRUPromptCache.__init__ = _bounded_lru_init
+
+
+_orig_sampler = srv._make_sampler
+
+
+def _recording_sampler(args, tokenizer):
+    # What the request asked for: stream_generate only gets the closures.
+    _STATE["args"] = args
+    return _orig_sampler(args, tokenizer)
+
+
+srv._make_sampler = _recording_sampler
 
 
 def _gen_suffix(tokenizer, template_args: dict) -> list[int]:
@@ -144,10 +167,11 @@ def _snapshot(fetch, n: int, cache) -> None:
           f"({time.perf_counter() - t0:.2f}s)", file=sys.stderr)
 
 
-def _prefill_history(kwargs: dict) -> int:
+def _prefill_history(kwargs: dict, adapter=None) -> int:
     """Prefill the request's uncached prompt up to where its history ends,
     store the cache there and leave the rest to stream_generate (updates
-    kwargs); returns the tokens prefilled here.
+    kwargs); returns the tokens prefilled here. With a pipeline adapter the
+    draft head gets each chunk's context.
 
     The history ends before the tokens the chat template appends to ask for
     an answer. The next turn's prompt repeats this one up to there but not
@@ -178,11 +202,19 @@ def _prefill_history(kwargs: dict) -> int:
     cb(0, len(prompt))
     with wired_limit(model, [stream]), mx.stream(stream):
         for n in _chunks(cut, kwargs.get("prefill_step_size", 2048)):
-            model(tokens[None, done:done + n], cache=cache)
+            chunk = tokens[None, done:done + n]
+            if adapter is None:
+                model(chunk, cache=cache)
+                rows = None
+            else:
+                _, rows = adapter.forward_taps(chunk, cache)
             maybe_quantize_kv_cache(
                 cache, kwargs.get("quantized_kv_start", 0),
                 kwargs.get("kv_group_size", 64), kwargs.get("kv_bits"))
-            mx.eval([c.state for c in cache])
+            mx.eval([c.state for c in cache], [] if rows is None else rows)
+            if rows is not None:
+                nxt = prompt[done + 1:done + n + 1]
+                adapter.prime_pairs(rows, mx.array([nxt], dtype=mx.int32))
             done += n
             if paged is not None:
                 paged.save_progress(base + done, cache)
@@ -195,6 +227,105 @@ def _prefill_history(kwargs: dict) -> int:
     return cut
 
 
+def _pipelined_decoder(kwargs: dict):
+    """The decoder if it can serve this request: greedy, nothing processing
+    the logits and no logprobs (its streams keep only the argmax)."""
+    args = _STATE.pop("args", None)
+    if (_STATE.get("decoder") is None or args is None
+            or args.sampling.temperature != 0 or args.logprobs
+            or args.top_logprobs > 0 or kwargs.get("logits_processors")
+            or kwargs.get("draft_model") is not None
+            or kwargs.get("input_embeddings") is not None
+            or kwargs.get("kv_bits") is not None
+            or not isinstance(kwargs.get("prompt"), list)):
+        return None
+    return _STATE["decoder"]
+
+
+class _NoLogprobs:
+    """A pipelined response's logprobs: no request that reads them gets here,
+    the server only looks up the token's."""
+
+    def __getitem__(self, _token):
+        return mx.array(0.0)
+
+
+def _pipelined(dec, kwargs: dict):
+    """stream_generate's responses from the pipelined decoder, for the prompt
+    tokens _prefill_history left."""
+    ad, model = dec.ad, kwargs["model"]
+    tokenizer, cache = kwargs["tokenizer"], kwargs["prompt_cache"]
+    prompt = kwargs["prompt"]
+    stream = kwargs.get("stream", generation_stream)
+    max_tokens = kwargs.get("max_tokens", 256)
+    cb = kwargs.get("prompt_progress_callback") or (lambda *_: None)
+    eos = set(tokenizer.eos_token_ids)
+    detok = tokenizer.detokenizer
+    detok.reset()
+    with wired_limit(model, [stream]), mx.stream(stream):
+        tic = time.perf_counter()
+        cb(0, len(prompt))
+        # the prompt as stock's generate_step runs it: all but the last token
+        # in prefill-size chunks, then the last alone (a model can compute a
+        # token differently in a chunk than alone, so this keeps plain's text)
+        step, done = kwargs.get("prefill_step_size", 2048), 0
+        while len(prompt) - done > 1:
+            k = min(step, len(prompt) - done - 1)
+            _, rows = ad.forward_taps(mx.array([prompt[done:done + k]]), cache)
+            mx.eval(rows, [c.state for c in cache])
+            ad.prime_pairs(rows, mx.array([prompt[done + 1:done + k + 1]],
+                                          dtype=mx.int32))
+            done += k
+            cb(done, len(prompt))
+            mx.clear_cache()
+        logits, rows = ad.forward_taps(mx.array([prompt[done:]]), cache)
+        mx.eval(logits, rows, [c.state for c in cache])
+        cb(len(prompt), len(prompt))
+        token = first = int(mx.argmax(logits[0, -1]).item())
+        dec.cache = ad.views(cache)
+        prompt_tps = len(prompt) / (time.perf_counter() - tic)
+        tic = time.perf_counter()
+        n = 0
+
+        def response(finish_reason=None):
+            return GenerationResponse(
+                text=detok.last_segment, token=token, logprobs=_NoLogprobs(),
+                from_draft=False, prompt_tokens=len(prompt),
+                prompt_tps=prompt_tps, generation_tokens=n,
+                generation_tps=n / (time.perf_counter() - tic),
+                peak_memory=mx.get_peak_memory() / 1e9,
+                finish_reason=finish_reason)
+
+        start = ad.offset(dec.cache)
+        later = dec.decode(first, rows[:, -1:], start,
+                           max_tokens if max_tokens > 0 else 2**62, stop=eos)
+
+        def end():
+            # Stock's cache ends after the last token: the next turn restores
+            # it there and prefills from the same token, so its text is
+            # plain's. If no stream ran that token, run it here.
+            later.close()
+            if ad.offset(dec.cache) < start + n:
+                ad.plain(token, dec.cache)
+                mx.eval([c.state for c in cache])
+
+        try:
+            for token in itertools.chain((first,), later):
+                n += 1
+                if token in eos:
+                    break
+                detok.add_token(token)
+                if n == max_tokens:
+                    break
+                yield response()
+        except GeneratorExit:
+            end()
+            raise
+        end()
+        detok.finalize()
+        yield response("stop" if token in eos else "length")
+
+
 def _instrumented(fn):
     """Run the request's history prefill (_prefill_history), then the
     wrapped stream_generate; log a summary line (prefill/decode tok/s, miss
@@ -205,12 +336,17 @@ def _instrumented(fn):
         r0 = reader.bytes_read if reader else 0
         mx.reset_peak_memory()
         paged = _STATE.get("paged")
+        dec = _pipelined_decoder(kwargs)
+        if dec is not None:
+            dec.ad.reset_drafter()
+            drafted = dec.draft_ok, dec.draft_tried
         t0 = time.perf_counter()
-        pre = _prefill_history(kwargs)
+        pre = _prefill_history(kwargs, dec.ad if dec is not None else None)
         t_pre = time.perf_counter() - t0
         last = None
         try:
-            for last in fn(*args, **kwargs):
+            for last in (_pipelined(dec, kwargs) if dec is not None
+                         else fn(*args, **kwargs)):
                 yield last
         finally:
             # The server breaks out of its loop on stop conditions, which
@@ -234,6 +370,10 @@ def _instrumented(fn):
                 if paged is not None:
                     msg += (f" | kv: {paged.last[0]} of {paged.last[1]} tok "
                             f"from SSD, {paged.nbytes / 1e9:.1f} GB stored")
+                if dec is not None:
+                    msg += (f" | drafts {dec.draft_ok - drafted[0]}/"
+                            f"{dec.draft_tried - drafted[1]}, gate "
+                            f"{'on' if dec.drafting else 'off'}")
                 msg += f" | peak {mx.get_peak_memory() / 2**30:.1f} GiB"
                 print(msg, file=sys.stderr)
     return gen
@@ -279,6 +419,19 @@ class StreamingModelProvider(srv.ModelProvider):
         self.pools = pools
         self.reader = reader
         _STATE["pools"], _STATE["reader"] = pools, reader
+        _STATE["decoder"] = None
+        if _CFG["draft_head"]:
+            from streamlx.pipeline import PipelinedDecoder
+            from streamlx.pipeline_adapters import adapter_for, load_drafter
+
+            t0 = time.time()
+            ad = adapter_for(model, load_drafter(_CFG["draft_head"], model,
+                                                 reader))
+            _STATE["decoder"] = PipelinedDecoder(ad, pools, [],
+                                                 k_max=_CFG["draft_k"],
+                                                 plain_fn=ad.plain)
+            print(f"[streamlx] draft head in {time.time()-t0:.1f}s, up to "
+                  f"{_CFG['draft_k']} tokens in flight", file=sys.stderr)
 
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
@@ -330,10 +483,16 @@ def main() -> None:
                          "(paged; replaces the RAM prompt cache)")
     ap.add_argument("--kv-cache-gib", type=float, default=32.0,
                     help="disk space for --kv-cache-dir (default 32)")
+    ap.add_argument("--draft-head", default=None,
+                    help="draft head (generate.py's --draft-head): pipelined "
+                         "decoding of greedy requests")
+    ap.add_argument("--draft-k", type=int, default=4,
+                    help="tokens in flight with --draft-head (default 4)")
     ours, rest = ap.parse_known_args()
     _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
     _CFG["warmstart_trace"] = ours.warmstart_trace
     _CFG["trust"] = ours.trust_remote_code
+    _CFG["draft_head"], _CFG["draft_k"] = ours.draft_head, ours.draft_k
     if ours.resident:
         _CFG["resident"] = "auto"
     try:

@@ -49,15 +49,20 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten
+from mlx_vlm.models.cache import cache_nbytes
 from mlx_vlm.models.deepseek_v41.engram import (OffloadedEngramEmbedding,
                                                 _engram_apply_gate,
                                                 _engram_gate_score)
 from mlx_vlm.models.deepseek_v41.fakequant import fake_quant_fp8_ue8m0
-from mlx_vlm.models.deepseek_v41.language import (DeepseekV41Block, hc_expand,
+from mlx_vlm.models.deepseek_v41.language import (DeepseekV41Block,
+                                                  DeepseekV41Cache, hc_expand,
                                                   make_identity_pre_mix)
 
 from .pipeline_adapters import capture_layer_outputs
 from .stindex import default_group_size
+
+# what the server's prompt cache bounds itself with
+DeepseekV41Cache.nbytes = property(lambda c: cache_nbytes(c.state))
 
 _W = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 _ROUTED = re.compile(r"\.experts\.(w[123])\.")
