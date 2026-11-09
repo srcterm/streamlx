@@ -9,7 +9,7 @@ with streamlx: trunk resident, experts streamed from SSD on demand.
       [--resident] [--prompt-cache-gib N] [--mlx-cache-gib N] \
       [--kv-cache-dir DIR [--kv-cache-gib N]] \
       [--draft-head DIR [--draft-k 4]] \
-      [--prefill-memory-gib N]
+      [--memory-gib N] [--prefill-memory-gib N]
 
 --model must be a LOCAL directory (the byte-range reader needs the shards on
 disk). Requests are handled sequentially: concurrent batching multiplies the
@@ -23,9 +23,16 @@ of unpageable memory. Both get hard byte caps here: --prompt-cache-gib
 (default: RAM - budget - 12 GiB, clamped to [1, 8]) and --mlx-cache-gib
 (default 2).
 
---prefill-memory-gib caps what a prefill holds beyond the arrays it uses:
-MLX's freed buffers (a third, at most 0.25 GiB) and the next layer's reads in
-flight (the rest, at most 0.5 GiB).
+--memory-gib keeps MLX's memory (active + buffer cache) under a limit by
+resizing the expert pools, never above --budget-gib: before each request,
+for the cache it starts from plus what its prompt and max_tokens will add
+(at the bytes a token has added so far), with the rest of the peak taken from
+earlier requests; between prefill chunks it shrinks them if the next chunk
+would pass the limit. A long conversation so gives slots back as its cache
+grows, and a short one takes them again. Resizing copies the kept slots (~1 s
+for 16 GiB); outputs don't change. --prefill-memory-gib caps what a prefill
+holds beyond the arrays it uses: MLX's freed buffers (a third, at most
+0.25 GiB) and the next layer's reads in flight (the rest, at most 0.5 GiB).
 
 Long prefills of models whose attention head size MLX does not fuse by
 default (256 in Qwen3.5/3.6) would build heads x queries x keys of scores per
@@ -77,14 +84,17 @@ from mlx_lm.models.cache import can_trim_prompt_cache
 from streamlx import attention
 from streamlx import integrate as _integrate
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
-                                prefill_cache, preload_popular)
+                                pool_bytes, prefill_cache, preload_popular,
+                                resize_pools)
 from streamlx.kvcache import PagedPromptCache
 
 _CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
         "tokenizer_config": {}, "resident": None,
         "prompt_cache_bytes": 4 * 2**30, "draft_head": None, "draft_k": 4,
-        "mlx_cache_bytes": 2 * 2**30, "prefill_cache_bytes": 0}
-_STATE = {"pools": None, "reader": None}
+        "memory_bytes": 0, "mlx_cache_bytes": 2 * 2**30,
+        "prefill_cache_bytes": 0}
+_STATE = {"pools": None, "reader": None, "all_pools": None,
+          "mem": {"F": None, "slope": None}}
 
 
 _orig_fetch = srv.LRUPromptCache.fetch_nearest_cache
@@ -175,6 +185,11 @@ def _snapshot(fetch, n: int, cache) -> None:
           f"({time.perf_counter() - t0:.2f}s)", file=sys.stderr)
 
 
+_MARGIN = 2**28   # --memory-gib keeps this much of its limit free,
+_HYST = 2**28     # shrinks the pools when they pass it by this much
+_GROW = 2**30     # and grows them back when this much is free
+
+
 @contextlib.contextmanager
 def _prefill_buffers():
     """--prefill-memory-gib: MLX's freed-buffer cap while prefilling."""
@@ -186,6 +201,104 @@ def _prefill_buffers():
     finally:
         if lim:
             mx.set_cache_limit(_CFG["mlx_cache_bytes"])
+
+
+def _buffer_reserve() -> int:
+    """The buffer cache a peak can hold: prefill's cap, where peaks are."""
+    return _CFG["prefill_cache_bytes"] or _CFG["mlx_cache_bytes"]
+
+
+def _cache_bytes(cache) -> int:
+    try:
+        return sum(c.nbytes for c in cache or ())
+    except Exception:  # noqa: BLE001 — a cache type without nbytes
+        return 0
+
+
+def _fit_pools(target: float, why: str) -> None:
+    """Resize the expert pools to `target` bytes in all, at most
+    --budget-gib: down by _HYST or more, up by _GROW or more (a resize
+    copies every kept slot, ~1 s for 16 GiB)."""
+    pools = _STATE["all_pools"] or {}
+    have = pool_bytes(pools)
+    target = min(target, _CFG["budget_bytes"])
+    if not pools or not (have - target >= _HYST or target - have >= _GROW):
+        return
+    t0 = time.perf_counter()
+    got = resize_pools(pools, max(target, 0))
+    print(f"[streamlx] memory: pools {have / 2**30:.1f} -> "
+          f"{got / 2**30:.1f} GiB ({why}; {time.perf_counter() - t0:.1f}s)",
+          file=sys.stderr)
+
+
+def _govern_request(kwargs: dict) -> None:
+    """--memory-gib, before a request: pools sized so its peak should stay
+    under the limit. The rest of a peak (trunk, draft head, working set) is
+    what earlier requests measured above their pools and caches; the cache is
+    the one the request starts from plus the bytes a token has added so far
+    times the tokens it will add (its prompt and max_tokens)."""
+    lim, m = _CFG["memory_bytes"], _STATE["mem"]
+    if not lim:
+        return
+    cache, prompt = kwargs.get("prompt_cache"), kwargs.get("prompt")
+    n_new = (len(prompt) if isinstance(prompt, list) else 0) + max(
+        0, kwargs.get("max_tokens", 256))
+    cb = _cache_bytes(cache)
+    pools = pool_bytes(_STATE["all_pools"] or {})
+    rest = m["F"]
+    if rest is None:   # first request: what is resident now, plus 2 GiB
+        rest = mx.get_active_memory() - pools - cb + 2 * 2**30
+    grow = (m["slope"] or 0) * n_new
+    _fit_pools(lim - _MARGIN - _buffer_reserve() - rest - cb - grow,
+               f"cache {cb / 2**30:.2f} + {grow / 2**30:.2f} GiB to come")
+    m["cb0"], m["peak_rest"] = cb, 0
+    mx.reset_peak_memory()
+
+
+def _govern_mark(cache) -> None:
+    """Record the request's peak above its pools and cache so far."""
+    m = _STATE["mem"]
+    rest = (mx.get_peak_memory() - pool_bytes(_STATE["all_pools"] or {})
+            - _cache_bytes(cache))
+    m["peak_rest"] = max(m.get("peak_rest", 0), rest)
+
+
+def _govern_chunk(cache, done: int, left: int) -> None:
+    """--memory-gib between prefill chunks: shrink the pools if the next
+    chunk's peak, at the peak so far plus its tokens' cache, would pass the
+    limit (the first request's estimate can be short)."""
+    lim, m = _CFG["memory_bytes"], _STATE["mem"]
+    if not lim or done <= 0:
+        return
+    cb = _cache_bytes(cache)
+    _measure_slope(cb, done)
+    _govern_mark(cache)
+    over = (mx.get_peak_memory() + _buffer_reserve()
+            + (m["slope"] or 0) * left - (lim - _MARGIN))
+    if over >= _HYST:
+        _fit_pools(pool_bytes(_STATE["all_pools"] or {}) - over,
+                   "prefill guard")
+        mx.reset_peak_memory()
+
+
+def _measure_slope(cb: int, n_tokens: int) -> None:
+    """The cache bytes a token adds, from a request that continued a cache
+    (one that starts empty also allocates fixed state, e.g. recurrent
+    layers') over at least 256 tokens."""
+    m = _STATE["mem"]
+    if m.get("cb0", 0) > 0 and n_tokens >= 256 and cb > m["cb0"]:
+        m["slope"] = max(m["slope"] or 0, (cb - m["cb0"]) / n_tokens)
+
+
+def _govern_done(cache, n_tokens: int) -> None:
+    """After a request: the bytes a token adds to the cache and the peak
+    above pools and cache (kept as the maximum over requests)."""
+    m = _STATE["mem"]
+    if not _CFG["memory_bytes"]:
+        return
+    _measure_slope(_cache_bytes(cache), n_tokens)
+    _govern_mark(cache)
+    m["F"] = max(m["F"] or 0, m["peak_rest"])
 
 
 def _prefill_history(kwargs: dict, adapter=None) -> int:
@@ -242,6 +355,7 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
                 paged.save_progress(base + done, cache)
             cb(done, len(prompt))
             mx.clear_cache()
+            _govern_chunk(cache, done, len(prompt) - done)
     if paged is None and fetch is not None:
         _snapshot(fetch, base + cut, cache)
     kwargs["prompt"] = prompt[cut:]
@@ -362,6 +476,7 @@ def _instrumented(fn):
         base = aggregate_stats(pools) if pools is not None else None
         r0 = reader.bytes_read if reader else 0
         mx.reset_peak_memory()
+        _govern_request(kwargs)
         paged = _STATE.get("paged")
         dec = _pipelined_decoder(kwargs)
         if dec is not None:
@@ -379,6 +494,8 @@ def _instrumented(fn):
             # The server breaks out of its loop on stop conditions, which
             # closes this generator instead of exhausting it — log either way.
             if last is not None:
+                _govern_done(kwargs.get("prompt_cache"),
+                             pre + last.prompt_tokens + last.generation_tokens)
                 n = pre + last.prompt_tokens
                 t = t_pre + last.prompt_tokens / last.prompt_tps
                 msg = (f"[streamlx] prefill {n} tok @ {n / t:.1f} tok/s | "
@@ -402,6 +519,9 @@ def _instrumented(fn):
                             f"{dec.draft_tried - drafted[1]}, gate "
                             f"{'on' if dec.drafting else 'off'}")
                 msg += f" | peak {mx.get_peak_memory() / 2**30:.1f} GiB"
+                if _CFG["memory_bytes"]:
+                    pb = pool_bytes(_STATE["all_pools"])
+                    msg += f", pools {pb / 2**30:.1f} GiB"
                 print(msg, file=sys.stderr)
     return gen
 
@@ -446,6 +566,7 @@ class StreamingModelProvider(srv.ModelProvider):
         self.pools = pools
         self.reader = reader
         _STATE["pools"], _STATE["reader"] = pools, reader
+        _STATE["all_pools"] = dict(pools)
         _STATE["decoder"] = None
         if _CFG["draft_head"]:
             from streamlx.pipeline import PipelinedDecoder
@@ -521,6 +642,11 @@ def main() -> None:
                          "at most 0.25 GiB) and the next layer's reads in "
                          "flight (the rest, at most 0.5 GiB). Default: "
                          "--mlx-cache-gib and 0.5 GiB")
+    ap.add_argument("--memory-gib", type=float, default=None,
+                    help="keep MLX's memory (active + buffer cache) under "
+                         "this: before each request the expert pools are "
+                         "resized (at most --budget-gib) for the cache it "
+                         "will grow to, from earlier requests' peaks")
     ours, rest = ap.parse_known_args()
     _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
     _CFG["warmstart_trace"] = ours.warmstart_trace
@@ -539,6 +665,8 @@ def main() -> None:
             ram, _CFG["budget_bytes"])
     _CFG["mlx_cache_bytes"] = int(ours.mlx_cache_gib * 2**30)
     mx.set_cache_limit(_CFG["mlx_cache_bytes"])
+    if ours.memory_gib:
+        _CFG["memory_bytes"] = int(ours.memory_gib * 2**30)
     if ours.prefill_memory_gib:
         cap = int(ours.prefill_memory_gib * 2**30)
         _CFG["prefill_cache_bytes"] = min(_CFG["mlx_cache_bytes"],

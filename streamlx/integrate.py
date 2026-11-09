@@ -940,6 +940,7 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
             pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
                                       reader=reader)
             _wrap(model.layers[i], _moe_block(model.layers[i]), pool)
+        pool.min_slots = min(k, pool.n_experts)
         pools[i] = pool
     _link_next_layers(model, pools)
     if os.environ.get("STREAMLX_PREFETCH", "1") != "0":
@@ -988,6 +989,27 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
     mx.eval([t for p in pools.values()
              for proj in p.pool.values() for t in proj.values()])
     return model, tokenizer, pools, reader
+
+
+def pool_bytes(pools: dict) -> int:
+    """The bytes the pools' slots hold."""
+    return sum(p.n_slots * p.expert_bytes for p in pools.values())
+
+
+def resize_pools(pools: dict, budget_bytes: float) -> int:
+    """Split `budget_bytes` over `pools` the way load_streaming_model splits
+    its budget (equal bytes a pool, at least its min_slots, at most its
+    experts) and resize each pool to its share (StreamingSwitchMLP.resize:
+    exact), shrinking ones first so the copies' transient stays one pool
+    array. Returns the bytes the pools then hold."""
+    n = len(pools)
+    want = {i: max(p.min_slots, min(p.n_experts,
+                                    int(budget_bytes / n / p.expert_bytes)))
+            for i, p in pools.items()}
+    for i in sorted(pools, key=lambda i: want[i] - pools[i].n_slots):
+        pools[i].resize(want[i])
+    mx.clear_cache()
+    return pool_bytes(pools)
 
 
 def preload_popular(pools: dict, trace_npz: str) -> int:
