@@ -403,6 +403,7 @@ class VlmDrafter:
     def __init__(self, draft, model):
         cfg = draft.config
         self.head = draft
+        self.budget_pools = {}      # its experts are resident
         self.tap_layers = tuple(cfg.target_layer_ids)
         self.depth = int(getattr(cfg, "runtime_block_size", None)
                          or cfg.block_size) - 1
@@ -451,6 +452,9 @@ class VlmMtpDrafter:
 
     def __init__(self, head, model):
         self.head = head.bind(model)
+        # the head's streamed MoE layers (qwen4_exp.load_head with a reader):
+        # hosts share the expert budget with them (integrate.resize_pools)
+        self.budget_pools = getattr(head, "streamlx_pools", None) or {}
 
     def reset(self) -> None:
         self.head._cache = self.head.make_cache()
@@ -494,12 +498,15 @@ def _vlm_target(model, cfg):
         args=vlm_args, model=model.model, lm_head=model.lm_head))
 
 
-def load_drafter(path: str, model, reader=None):
+def load_drafter(path: str, model, reader=None, stream_head: bool = False):
     """A pipeline drafter for `model` from an mlx-vlm drafter directory, e.g.
     `python -m mlx_vlm.split_mtp --model <checkpoint with its draft head>
     --output <dir> --q-bits 4` (Mistral Large 4's DSpark head). DeepSeek-V4.1
     and Qwen3.8 read their heads from the checkpoint itself: `path` is the model
-    directory (V4.1's streams through `reader`, the model's expert reader)."""
+    directory (V4.1's streams through `reader`, the model's expert reader).
+    stream_head: Qwen3.8's head streams its MoE layer through a pool too
+    (1.3 GiB less RAM; its drafts then sync on routing and wait on misses,
+    ~15% slower PEF decode at equal trunk pools)."""
     mt = getattr(getattr(model, "args", None), "model_type", None)
     if mt == "deepseek_v41":
         from .deepseek_v41_dspark import V41DSpark
@@ -508,7 +515,8 @@ def load_drafter(path: str, model, reader=None):
     if mt == "qwen4_exp":
         from .qwen4_exp import load_head
 
-        return VlmMtpDrafter(load_head(path, model), model)
+        return VlmMtpDrafter(
+            load_head(path, model, reader if stream_head else None), model)
     try:
         from mlx_vlm.speculative.drafters import load_drafter as _load
     except ImportError as e:

@@ -17,6 +17,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -47,6 +48,28 @@ def _pf_ex():
 _NEXT_MIN_COVERAGE = 0.7
 _NEXT_BYTES = 512 * 2**20   # read at most this much ahead per layer boundary
 
+# The cache of the prefill chunk in flight (prefill_cache), and the last layer
+# whose entry its streamed layers have evaluated.
+_PREFILL = {"cache": None, "done": -1}
+
+
+@contextmanager
+def prefill_cache(cache):
+    """Run a prefill chunk's forward in this: each streamed layer's MoE call
+    then evaluates the cache entries of the layers up to it, so what they
+    store is computed as the chunk passes. Left lazy until the host evaluates
+    the cache after the forward, a stored state keeps the arrays it is made
+    from: a linear-attention layer's conv window is three rows of its whole
+    conv input (Qwen3.8: ~1.3 GiB over 36 layers for 1.6K tokens, ~3 GiB for
+    4K), a rotating cache's window its chunk's keys. Evaluation order only:
+    the values are the same."""
+    prev = _PREFILL["cache"], _PREFILL["done"]
+    _PREFILL["cache"], _PREFILL["done"] = cache, -1
+    try:
+        yield
+    finally:
+        _PREFILL["cache"], _PREFILL["done"] = prev
+
 
 def _stock_sorted(n_routes: int, n_experts: int) -> bool:
     """Whether the stock module's call runs gather_qmm's sorted matmul
@@ -76,6 +99,11 @@ class StreamingSwitchGLU(nn.Module):
         self.prefill_mode = os.environ.get("STREAMLX_PREFILL", "sweep")
         self.sweep_batch = int(os.environ.get("STREAMLX_SWEEP_BATCH", "16"))
         self.sweep_warm = os.environ.get("STREAMLX_SWEEP_WARM", "1") != "0"
+        # What a sweep adopts: "fill" (its most-routed experts into the free
+        # slots only, the experts the pool holds left where decoding put
+        # them) or "count" (its n_slots most-routed, evicting and retouching:
+        # decode after a prefill then misses a third more).
+        self.warm_policy = os.environ.get("STREAMLX_WARM_POLICY", "fill")
         self._sweep_ex = None   # lazy 1-thread executor: batch read-ahead
         # Next-layer reads: the next streamed layer's wrapper (linked at
         # load), the reads the previous layer started for this layer's next
@@ -127,6 +155,31 @@ class StreamingSwitchGLU(nn.Module):
         except Exception:
             self._pf_next = None   # arch surprise: disable for this link
             return None
+
+    def _own_cache_states(self) -> None:
+        """prefill_cache's per-layer step: evaluate the entries of the layers
+        up to this one that this forward has not (a layer at or below the
+        last one seen starts a new forward)."""
+        cache, done = _PREFILL["cache"], _PREFILL["done"]
+        upto = min(self.pool.layer, len(cache) - 1)
+        if upto <= done:
+            done = -1
+        states = []
+        for c in cache[done + 1:upto + 1]:
+            try:
+                st = c.state
+            except Exception:    # an entry with nothing stored yet
+                continue
+            todo = [st]
+            while todo:
+                x = todo.pop()
+                if isinstance(x, mx.array):
+                    states.append(x)
+                elif isinstance(x, (list, tuple)):
+                    todo.extend(x)
+        if states:
+            mx.async_eval(states)
+        _PREFILL["done"] = upto
 
     def _remap(self, idx: np.ndarray) -> np.ndarray:
         slots = self.pool.slot_table[idx]
@@ -346,9 +399,11 @@ class StreamingSwitchGLU(nn.Module):
 
         Reads run one batch ahead on a dedicated thread (sweep_fetch_s counts
         only time actually blocked on IO). With sweep_warm (default on), the
-        chunk's most-routed experts are adopted into the LRU pool as their
-        batch streams by — no extra IO — so decode after prefill starts warm;
-        a final retouch leaves the most-frequent experts most-recently-used.
+        chunk's most-routed experts are adopted into the pool's free slots as
+        their batch streams by (no extra IO), most-frequent most-recently-used;
+        the experts the pool holds stay as decoding left them, since decode
+        after the prefill routes more like the decode before it than like the
+        prompt (warm_policy "count" fills the whole pool from the chunk).
 
         Next-layer reads: once the last batch is read, a sweep that routed
         most of its layer's experts starts reading the experts the next layer
@@ -375,7 +430,13 @@ class StreamingSwitchGLU(nn.Module):
         self._hist[uniq] += counts
         warm_ids: set = set()
         if self.sweep_warm:
-            top = np.argsort(counts, kind="stable")[::-1][:pool.n_slots]
+            top = np.argsort(counts, kind="stable")[::-1]
+            if self.warm_policy == "fill":
+                room = pool.n_slots - len(pool.id2slot)
+                top = [i for i in top.tolist()
+                       if not pool.resident(int(uniq[i]))][:max(0, room)]
+            else:
+                top = top[:pool.n_slots]
             warm_ids = {int(uniq[i]) for i in top}
         # the routed experts the pool holds: copies of their slots (a gather
         # into new buffers, no view of a slab), made before an adoption can
@@ -511,6 +572,8 @@ class StreamingSwitchGLU(nn.Module):
             if pred is not None:
                 mx.eval(indices, *pred)  # one sync covers all three graphs
         idx = np.array(indices)  # materializes the gate's selection (sync)
+        if not decode and _PREFILL["cache"] is not None:
+            self._own_cache_states()
         if self.record_sink is not None:
             self.record_sink.append((self.pool.layer, idx.copy()))
         uniq = list(dict.fromkeys(idx.reshape(-1).tolist()))
@@ -890,6 +953,7 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
             pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
                                       reader=reader)
             _wrap(model.layers[i], _moe_block(model.layers[i]), pool)
+        pool.min_slots = min(k, pool.n_experts)
         pools[i] = pool
     _link_next_layers(model, pools)
     if os.environ.get("STREAMLX_PREFETCH", "1") != "0":
@@ -938,6 +1002,55 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
     mx.eval([t for p in pools.values()
              for proj in p.pool.values() for t in proj.values()])
     return model, tokenizer, pools, reader
+
+
+def pool_bytes(pools: dict) -> int:
+    """The bytes the pools' slots hold."""
+    return sum(p.n_slots * p.expert_bytes for p in pools.values())
+
+
+def resize_pools(pools: dict, budget_bytes: float) -> int:
+    """Split `budget_bytes` over `pools` the way load_streaming_model splits
+    its budget (equal bytes a pool, at least its min_slots, at most its
+    experts) and resize each pool to its share (StreamingSwitchMLP.resize:
+    exact), shrinking ones first so the copies' transient stays one pool
+    array. Returns the bytes the pools then hold."""
+    n = len(pools)
+    want = {i: max(p.min_slots, min(p.n_experts,
+                                    int(budget_bytes / n / p.expert_bytes)))
+            for i, p in pools.items()}
+    for i in sorted(pools, key=lambda i: want[i] - pools[i].n_slots):
+        pools[i].resize(want[i])
+    mx.clear_cache()
+    return pool_bytes(pools)
+
+
+def stream_moe_blocks(module, index: SafetensorsIndex, reader: ExpertReader,
+                      key0: int, prefix: str = "", slots: int = 1,
+                      k: int | None = None) -> dict:
+    """Pools for the MoE blocks of a module outside the trunk (a draft head):
+    block i of module.layers, whose switch tensors are at
+    `{prefix}layers.{i}` in the index's checkpoint, streams through a pool
+    keyed key0 + i, as a trunk layer does. Call it before the module's
+    parameters are evaluated: the replaced switch weights then never load.
+    Returns {key: pool}; size them with resize_pools."""
+    pools = {}
+    for i, layer in enumerate(getattr(module, "layers", None) or []):
+        mlp = _moe_block(layer)
+        if mlp is None:
+            continue
+        tag = f"{prefix}layers.{i}"
+        try:
+            index.layer_expert_bytes(key0 + i, tag=tag)
+        except KeyError:
+            continue                # no streamable switch tensors there
+        pool = StreamingSwitchMLP(index.model_dir, key0 + i,
+                                  max(slots, k or 1), index=index,
+                                  reader=reader, tag=tag)
+        pool.min_slots = min(k or 1, pool.n_experts)
+        _wrap(layer, mlp, pool)
+        pools[key0 + i] = pool
+    return pools
 
 
 def preload_popular(pools: dict, trace_npz: str) -> int:

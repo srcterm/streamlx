@@ -198,8 +198,12 @@ def load_qwen4_exp(model_dir, tokenizer_config=None, model_config=None):
     return Qwen4ExpText(lm), tok
 
 
-def load_head(model_dir, model):
-    """mlx-vlm's drafter on the checkpoint's `mtp.*` tensors."""
+def load_head(model_dir, model, reader=None):
+    """mlx-vlm's drafter on the checkpoint's `mtp.*` tensors. With `reader`
+    (the model's expert reader) its MoE layer streams through a pool like a
+    trunk layer's (head.streamlx_pools, sized with integrate.resize_pools)
+    instead of loading its 512 experts (1.3 GiB), at a decode cost
+    (pipeline_adapters.load_drafter's stream_head)."""
     from mlx_vlm.models.qwen4_exp.fp8 import convert_qwen4_exp_fp8_weights
     from mlx_vlm.speculative.drafters.qwen4_exp_mtp.config import \
         Qwen4ExpMTPConfig
@@ -228,6 +232,14 @@ def load_head(model_dir, model):
 
     nn.quantize(head, class_predicate=predicate)
     head.load_weights(list(weights.items()))
+    head.streamlx_pools = {}
+    if reader is not None:
+        from .integrate import stream_moe_blocks
+
+        head.streamlx_pools = stream_moe_blocks(
+            head, reader.index, reader, key0=len(model.layers), prefix="mtp.",
+            k=cfg["text_config"].get("num_experts_per_tok"))
+    del weights
     mx.eval(head.parameters())
     head.eval()
     return head

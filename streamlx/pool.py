@@ -143,6 +143,7 @@ class StreamingSwitchMLP:
         # on the slab's size, and stock's holds exactly the layer's experts
         n_slots = min(n_slots, self.n_experts)
         self.n_slots = n_slots
+        self.min_slots = 1    # resize() floor: the host sets the routed top-k
         self.act = None       # non-default activation, set at wrap time
         self.act_weights = False  # act takes the routing weights (v4.1)
         self.escales = None   # optional (gate_vec, out_vec), set at wrap time
@@ -295,6 +296,63 @@ class StreamingSwitchMLP:
 
     def resident(self, e: int) -> bool:
         return e in self.id2slot
+
+    def _coldest(self, n: int) -> list[int]:
+        """The n experts the policy would evict first: the LRU order, or
+        s3fifo's small queue then its main queue, each oldest first."""
+        if n <= 0:
+            return []
+        if self.policy == "s3fifo":
+            return (list(self.q_small) + list(self.q_main))[:n]
+        return list(self.id2slot)[:n]
+
+    def resize(self, n_slots: int) -> int:
+        """Change the slot count, within [min_slots, the layer's experts].
+        Fewer slots: the experts the policy would evict first lose theirs and
+        the rest move into the first slots; more: free slots are added. Kept
+        experts' bytes are copied unchanged and only which experts are
+        resident changes, so outputs don't. Call it with nothing in flight
+        on the pool (between requests). Returns the new count."""
+        n = max(self.min_slots, min(int(n_slots), self.n_experts))
+        if n == self.n_slots:
+            return n
+        if n < self.n_slots:
+            for e in self._coldest(len(self.id2slot) - n):
+                self.id2slot.pop(e)
+                self.slot_table[e] = self.SENTINEL
+                self.q_small.pop(e, None)
+                self.q_main.pop(e, None)
+                self.evictions += 1
+            used = {slot: e for e, slot in self.id2slot.items()}
+            free = [t for t in range(n) if t not in used]
+            src = list(range(n))
+            for slot, e in used.items():
+                if slot >= n:              # into a free slot below n
+                    t = free.pop()
+                    src[t] = slot
+                    self.id2slot[e] = t    # keeps its place in the LRU order
+                    self.slot_table[e] = t
+            idx = mx.array(src, dtype=mx.uint32)
+            for proj in PROJS:
+                for part in self.parts:
+                    a = mx.take(self.pool[proj][part], idx, axis=0)
+                    mx.eval(a)
+                    self.pool[proj][part] = a
+            self.free = free
+        else:
+            for proj in PROJS:
+                for part in self.parts:
+                    old = self.pool[proj][part]
+                    a = mx.concatenate(
+                        [old, mx.zeros((n - self.n_slots,) + old.shape[1:],
+                                       dtype=old.dtype)])
+                    mx.eval(a)
+                    self.pool[proj][part] = a
+            self.free.extend(range(self.n_slots, n))
+        self.n_slots = n
+        self.n_small = max(1, int(n * 0.1))
+        self.n_main = max(1, n - self.n_small)
+        return n
 
     def touch(self, ids: list[int]) -> None:
         """Mark resident experts most-recently-used (hit accounting only).
