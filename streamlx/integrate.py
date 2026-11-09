@@ -99,6 +99,11 @@ class StreamingSwitchGLU(nn.Module):
         self.prefill_mode = os.environ.get("STREAMLX_PREFILL", "sweep")
         self.sweep_batch = int(os.environ.get("STREAMLX_SWEEP_BATCH", "16"))
         self.sweep_warm = os.environ.get("STREAMLX_SWEEP_WARM", "1") != "0"
+        # What a sweep adopts: "fill" (its most-routed experts into the free
+        # slots only, the experts the pool holds left where decoding put
+        # them) or "count" (its n_slots most-routed, evicting and retouching:
+        # decode after a prefill then misses a third more).
+        self.warm_policy = os.environ.get("STREAMLX_WARM_POLICY", "fill")
         self._sweep_ex = None   # lazy 1-thread executor: batch read-ahead
         # Next-layer reads: the next streamed layer's wrapper (linked at
         # load), the reads the previous layer started for this layer's next
@@ -394,9 +399,11 @@ class StreamingSwitchGLU(nn.Module):
 
         Reads run one batch ahead on a dedicated thread (sweep_fetch_s counts
         only time actually blocked on IO). With sweep_warm (default on), the
-        chunk's most-routed experts are adopted into the LRU pool as their
-        batch streams by — no extra IO — so decode after prefill starts warm;
-        a final retouch leaves the most-frequent experts most-recently-used.
+        chunk's most-routed experts are adopted into the pool's free slots as
+        their batch streams by (no extra IO), most-frequent most-recently-used;
+        the experts the pool holds stay as decoding left them, since decode
+        after the prefill routes more like the decode before it than like the
+        prompt (warm_policy "count" fills the whole pool from the chunk).
 
         Next-layer reads: once the last batch is read, a sweep that routed
         most of its layer's experts starts reading the experts the next layer
@@ -423,7 +430,13 @@ class StreamingSwitchGLU(nn.Module):
         self._hist[uniq] += counts
         warm_ids: set = set()
         if self.sweep_warm:
-            top = np.argsort(counts, kind="stable")[::-1][:pool.n_slots]
+            top = np.argsort(counts, kind="stable")[::-1]
+            if self.warm_policy == "fill":
+                room = pool.n_slots - len(pool.id2slot)
+                top = [i for i in top.tolist()
+                       if not pool.resident(int(uniq[i]))][:max(0, room)]
+            else:
+                top = top[:pool.n_slots]
             warm_ids = {int(uniq[i]) for i in top}
         # the routed experts the pool holds: copies of their slots (a gather
         # into new buffers, no view of a slab), made before an adoption can
