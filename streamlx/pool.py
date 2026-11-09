@@ -184,6 +184,7 @@ class StreamingSwitchMLP:
         self.evictions = 0
         self.fetch_s = 0.0
         self.sweep_experts = 0   # expert-rows streamed by prefill sweeps
+        self.sweep_resident = 0  # routed by a sweep, taken from the pool
         self.sweep_fetch_s = 0.0
         self.adopted = 0         # experts placed by prefill sweeps (no IO)
         self.next_layer_reads = 0   # read for this layer's next sweep early
@@ -404,6 +405,7 @@ class StreamingSwitchMLP:
         self.hits = self.misses = self.evictions = 0
         self.fetch_s = 0.0
         self.sweep_experts = 0
+        self.sweep_resident = 0
         self.sweep_fetch_s = 0.0
         self.adopted = 0
         self.next_layer_reads = self.next_layer_used = 0

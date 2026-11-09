@@ -278,8 +278,9 @@ class StreamingSwitchGLU(nn.Module):
         On these tokens the next layer routes most of its experts too: up to
         _NEXT_BYTES of them, and no more than this layer routed, are read --
         its most-routed in recent sweeps (its lowest ids before it has
-        swept), in id order, so the reads coalesce and its sweep, which also
-        goes in id order, takes them first. One batch per task on the shared
+        swept) that its pool does not hold, in id order, so the reads
+        coalesce and its sweep, which also goes in id order, takes them
+        first. One batch per task on the shared
         prefetch thread (data-only arrays; their dtype views, which are ops,
         are made on the compute thread). Skipped below _NEXT_MIN_COVERAGE,
         while the next layer still holds earlier reads, and when its pool
@@ -293,16 +294,17 @@ class StreamingSwitchGLU(nn.Module):
         # no more than this layer routed: the next one routes about as many
         n = min(n_routed, p.n_experts, max(bs, _NEXT_BYTES // p.expert_bytes))
         h = nxt._hist
-        top = (np.argsort(-h, kind="stable")[:n] if h is not None
-               else np.arange(n))
-        top = np.sort(top).tolist()
+        rank = (np.argsort(-h, kind="stable") if h is not None
+                else np.arange(p.n_experts))
+        # not the ones its pool holds: its sweep takes those from their slots
+        top = sorted([int(e) for e in rank if not p.resident(int(e))][:n])
         early = {}
-        for i0 in range(0, n, bs):
+        for i0 in range(0, len(top), bs):
             ids = top[i0:i0 + bs]
             fut = _pf_ex().submit(p.reader.read_experts_arrays, p.triples_loc,
                                   ids)
             early.update(dict.fromkeys(ids, fut))
-        p.next_layer_reads += n
+        p.next_layer_reads += len(top)
         nxt._early = early
 
     def _take_early(self, routed: set) -> dict:
@@ -326,8 +328,8 @@ class StreamingSwitchGLU(nn.Module):
         bandwidth. Here (position, pick) pairs are grouped by expert instead:
         experts stream through throwaway mini-pools in ascending id order
         (adjacent rows coalesce into long sequential spans), each read exactly
-        once per chunk, and the LRU pool — decode's working set — is never
-        touched.
+        once per chunk. Experts the pool holds are not read: their rows are
+        copies of their slots, taken before any adoption below can move one.
 
         Bitwise-exact vs the stock module: where stock's call runs the
         sorted matmul kernel (_stock_sorted), each batch here is a run of
@@ -375,6 +377,19 @@ class StreamingSwitchGLU(nn.Module):
         if self.sweep_warm:
             top = np.argsort(counts, kind="stable")[::-1][:pool.n_slots]
             warm_ids = {int(uniq[i]) for i in top}
+        # the routed experts the pool holds: copies of their slots (a gather
+        # into new buffers, no view of a slab), made before an adoption can
+        # evict one and rewrite its slot
+        resident = {int(e): pool.id2slot[int(e)] for e in uniq
+                    if pool.resident(int(e))}
+        taken, res_pos = None, {}
+        if resident:
+            res_pos = {e: j for j, e in enumerate(resident)}
+            sl = mx.array(list(resident.values()), dtype=mx.uint32)
+            taken = {p: {q: mx.take(pool.pool[p][q], sl, axis=0)
+                         for q in pool.parts} for p in PROJS}
+            mx.eval(*(taken[p][q] for p in PROJS for q in pool.parts))
+            pool.sweep_resident += len(resident)
 
         if self._sweep_ex is None:
             self._sweep_ex = ThreadPoolExecutor(max_workers=1)
@@ -382,8 +397,8 @@ class StreamingSwitchGLU(nn.Module):
                    for i0 in range(0, len(uniq), self.sweep_batch)]
         early = self._take_early(set(uniq.tolist()))
 
-        def read(ids):  # what the previous layer did not already start
-            need = [e for e in ids if e not in early]
+        def read(ids):  # what the previous layer did not start nor the pool has
+            need = [e for e in ids if e not in early and e not in resident]
             if not need:
                 return None
             return self._sweep_ex.submit(pool.reader.read_experts_arrays,
@@ -404,8 +419,13 @@ class StreamingSwitchGLU(nn.Module):
             else:
                 self._read_next_layer(len(uniq))   # the drive is free now
             # built on the reading threads; the dtype views (ops) here
-            rows = pool.reader.experts_from_arrays(pool.triples_loc, ids, raw)
-            pool.sweep_experts += len(ids)
+            got = [e for e in ids if e not in resident]
+            rows = pool.reader.experts_from_arrays(pool.triples_loc, got, raw)
+            for e in ids:
+                if e in resident:
+                    rows[e] = {p: {q: taken[p][q][res_pos[e]]
+                                   for q in pool.parts} for p in PROJS}
+            pool.sweep_experts += len(got)
             mini = {p: {q: mx.stack([rows[e][p][q] for e in ids])
                         for q in pool.parts} for p in PROJS}
             i0 = bi * self.sweep_batch
@@ -445,12 +465,16 @@ class StreamingSwitchGLU(nn.Module):
             outs.append(y)
             for e in ids:
                 if e in warm_ids:
-                    pool.adopt(e, rows[e])
+                    if e in pool.id2slot:   # adopt() would rewrite its bytes
+                        pool._policy_hit(e)
+                    else:
+                        pool.adopt(e, rows[e])
         if warm_ids:
             for i in np.argsort(counts, kind="stable"):  # ascending count
                 e = int(uniq[i])
                 if e in warm_ids and e in pool.id2slot:
                     pool.id2slot.move_to_end(e)          # most-frequent = MRU
+        del taken
         y = mx.concatenate(outs, axis=0)           # rows in sorted-pair order
         inv = np.empty_like(order)
         inv[order] = np.arange(order.size)
