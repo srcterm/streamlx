@@ -1012,6 +1012,34 @@ def resize_pools(pools: dict, budget_bytes: float) -> int:
     return pool_bytes(pools)
 
 
+def stream_moe_blocks(module, index: SafetensorsIndex, reader: ExpertReader,
+                      key0: int, prefix: str = "", slots: int = 1,
+                      k: int | None = None) -> dict:
+    """Pools for the MoE blocks of a module outside the trunk (a draft head):
+    block i of module.layers, whose switch tensors are at
+    `{prefix}layers.{i}` in the index's checkpoint, streams through a pool
+    keyed key0 + i, as a trunk layer does. Call it before the module's
+    parameters are evaluated: the replaced switch weights then never load.
+    Returns {key: pool}; size them with resize_pools."""
+    pools = {}
+    for i, layer in enumerate(getattr(module, "layers", None) or []):
+        mlp = _moe_block(layer)
+        if mlp is None:
+            continue
+        tag = f"{prefix}layers.{i}"
+        try:
+            index.layer_expert_bytes(key0 + i, tag=tag)
+        except KeyError:
+            continue                # no streamable switch tensors there
+        pool = StreamingSwitchMLP(index.model_dir, key0 + i,
+                                  max(slots, k or 1), index=index,
+                                  reader=reader, tag=tag)
+        pool.min_slots = min(k or 1, pool.n_experts)
+        _wrap(layer, mlp, pool)
+        pools[key0 + i] = pool
+    return pools
+
+
 def preload_popular(pools: dict, trace_npz: str) -> int:
     """Warm-start each pool with its layer's most-popular experts (measured
     skew); sorted id order => semi-sequential reads.

@@ -8,7 +8,7 @@ with streamlx: trunk resident, experts streamed from SSD on demand.
       [--warmstart-trace trace.npz] [--tokenizer-config key=json ...] \
       [--resident] [--prompt-cache-gib N] [--mlx-cache-gib N] \
       [--kv-cache-dir DIR [--kv-cache-gib N]] \
-      [--draft-head DIR [--draft-k 4]] \
+      [--draft-head DIR [--draft-k 4] [--stream-draft-head]] \
       [--memory-gib N] [--prefill-memory-gib N]
 
 --model must be a LOCAL directory (the byte-range reader needs the shards on
@@ -58,10 +58,13 @@ its bandwidth with expert reads.
 in flight, one layer apart, so each token's expert reads overlap the others'
 compute, with plain decoding's output. It takes what generate.py's does: the
 model directory for Qwen3.8 and DeepSeek-V4.1, an mlx-vlm drafter directory
-otherwise. The self-gate's verdict carries across requests. Requests that
-sample, process logits or ask for logprobs decode plainly. On a prompt-cache
-hit the head's context starts at the tokens this request prefills: drafts are
-verified, so that can only cost acceptance, not change the text.
+otherwise. With --stream-draft-head, Qwen3.8's head streams its MoE layer
+through a pool taken out of --budget-gib (V4.1's stages always stream, in
+pools of their own). The self-gate's verdict carries across requests.
+Requests that sample, process logits or ask for logprobs decode plainly. On a
+prompt-cache hit the head's context starts at the tokens this request
+prefills: drafts are verified, so that can only cost acceptance, not change
+the text.
 """
 
 from __future__ import annotations
@@ -92,7 +95,7 @@ _CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
         "tokenizer_config": {}, "resident": None,
         "prompt_cache_bytes": 4 * 2**30, "draft_head": None, "draft_k": 4,
         "memory_bytes": 0, "mlx_cache_bytes": 2 * 2**30,
-        "prefill_cache_bytes": 0}
+        "prefill_cache_bytes": 0, "stream_head": False}
 _STATE = {"pools": None, "reader": None, "all_pools": None,
           "mem": {"F": None, "slope": None}}
 
@@ -216,9 +219,9 @@ def _cache_bytes(cache) -> int:
 
 
 def _fit_pools(target: float, why: str) -> None:
-    """Resize the expert pools to `target` bytes in all, at most
-    --budget-gib: down by _HYST or more, up by _GROW or more (a resize
-    copies every kept slot, ~1 s for 16 GiB)."""
+    """Resize every expert pool (trunk and draft head) to `target` bytes in
+    all, at most --budget-gib: down by _HYST or more, up by _GROW or more
+    (a resize copies every kept slot, ~1 s for 16 GiB)."""
     pools = _STATE["all_pools"] or {}
     have = pool_bytes(pools)
     target = min(target, _CFG["budget_bytes"])
@@ -573,13 +576,21 @@ class StreamingModelProvider(srv.ModelProvider):
             from streamlx.pipeline_adapters import adapter_for, load_drafter
 
             t0 = time.time()
-            ad = adapter_for(model, load_drafter(_CFG["draft_head"], model,
-                                                 reader))
+            drafter = load_drafter(_CFG["draft_head"], model, reader,
+                                   stream_head=_CFG["stream_head"])
+            ad = adapter_for(model, drafter)
             _STATE["decoder"] = PipelinedDecoder(ad, pools, [],
                                                  k_max=_CFG["draft_k"],
                                                  plain_fn=ad.plain)
+            head_pools = getattr(drafter, "budget_pools", None) or {}
+            if head_pools:
+                # the head's experts share the budget with the trunk's
+                _STATE["all_pools"] = {**pools, **head_pools}
+                resize_pools(_STATE["all_pools"], _CFG["budget_bytes"])
             print(f"[streamlx] draft head in {time.time()-t0:.1f}s, up to "
-                  f"{_CFG['draft_k']} tokens in flight", file=sys.stderr)
+                  f"{_CFG['draft_k']} tokens in flight"
+                  + (f", {len(head_pools)} streamed MoE layer(s) in the "
+                     f"budget" if head_pools else ""), file=sys.stderr)
 
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
@@ -636,6 +647,10 @@ def main() -> None:
                          "decoding of greedy requests")
     ap.add_argument("--draft-k", type=int, default=4,
                     help="tokens in flight with --draft-head (default 4)")
+    ap.add_argument("--stream-draft-head", action="store_true",
+                    help="stream the draft head's MoE experts through a pool "
+                         "in --budget-gib instead of loading them (Qwen3.8: "
+                         "1.3 GiB less RAM, ~15%% slower pipelined decode)")
     ap.add_argument("--prefill-memory-gib", type=float, default=None,
                     help="cap what prefill holds beyond the arrays it uses: "
                          "MLX's freed-buffer cache while prefilling (a third, "
@@ -652,6 +667,7 @@ def main() -> None:
     _CFG["warmstart_trace"] = ours.warmstart_trace
     _CFG["trust"] = ours.trust_remote_code
     _CFG["draft_head"], _CFG["draft_k"] = ours.draft_head, ours.draft_k
+    _CFG["stream_head"] = ours.stream_draft_head
     if ours.resident:
         _CFG["resident"] = "auto"
     try:

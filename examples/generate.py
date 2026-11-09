@@ -31,7 +31,7 @@ from mlx_lm.generate import generation_stream, wired_limit
 from mlx_lm.models.cache import make_prompt_cache
 
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
-                                prefill_cache, preload_popular)
+                                prefill_cache, preload_popular, resize_pools)
 
 PREFILL_STEP = 4096
 
@@ -58,6 +58,9 @@ def main() -> int:
     ap.add_argument("--trust-remote-code", action="store_true")
     ap.add_argument("--draft-head", default=None,
                     help="mlx-vlm drafter directory: pipelined decoding")
+    ap.add_argument("--stream-draft-head", action="store_true",
+                    help="stream the draft head's MoE experts through a pool "
+                         "in --budget-gib instead of loading them")
     ap.add_argument("--draft-k", type=int, default=4,
                     help="tokens in flight with --draft-head (default 4)")
     args = ap.parse_args()
@@ -85,8 +88,12 @@ def main() -> int:
         from streamlx.pipeline_adapters import adapter_for, load_drafter
 
         t0 = time.time()
-        drafter = load_drafter(args.draft_head, model, reader)
+        drafter = load_drafter(args.draft_head, model, reader,
+                               stream_head=args.stream_draft_head)
         ad = adapter_for(model, drafter)
+        head_pools = getattr(drafter, "budget_pools", None) or {}
+        if head_pools:   # the head's experts share the budget with the trunk's
+            resize_pools({**pools, **head_pools}, int(args.budget_gib * 2**30))
         print(f"[load] draft head in {time.time()-t0:.1f}s", file=sys.stderr)
 
     # what stream_generate holds while it runs: MLX's buffers stay wired
