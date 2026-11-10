@@ -10,7 +10,7 @@ Streams tokens to stdout live, then prints the punchline stats
 --draft-head decodes through streamlx.pipeline with an mlx-vlm block
 drafter (pip install mlx-vlm), e.g. Mistral Large 4's bundled DSpark head
 split out once with `python -m mlx_vlm.split_mtp --model <checkpoint>
---output <dir> --q-bits 4`: K tokens in flight, one layer apart, so each
+--output <dir> --q-bits 4`: K tokens in flight, so each
 token's expert reads overlap the others' compute; greedy output identical
 to plain decoding. A self-gate times drafting against plain decoding and
 keeps whichever is faster. DeepSeek-V4.1 and Qwen3.8 read their heads from

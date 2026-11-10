@@ -19,6 +19,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED
 from concurrent.futures import wait as _wait_all
 
 import mlx.core as mx
@@ -50,10 +51,12 @@ class _GpuKeepalive:
         self._x = mx.zeros((8,), dtype=mx.float32)
         self._inflight: list = []
 
-    def wait(self, futures) -> None:
+    def wait(self, futures, first: bool = False) -> None:
+        when = FIRST_COMPLETED if first else ALL_COMPLETED
         while True:
-            _, pending = _wait_all(futures, timeout=_KEEPALIVE_PERIOD_S)
-            if not pending:
+            done, pending = _wait_all(futures, timeout=_KEEPALIVE_PERIOD_S,
+                                      return_when=when)
+            if not pending or (first and done):
                 return
             y = self._x + 1
             mx.async_eval(y)
@@ -62,12 +65,13 @@ class _GpuKeepalive:
                 mx.eval(self._inflight.pop(0))
 
 
-def keepalive_wait(futures) -> None:
-    """Block until `futures` finish, keeping the GPU busy meanwhile."""
+def keepalive_wait(futures, first: bool = False) -> None:
+    """Block until `futures` finish (first: until one of them does), keeping
+    the GPU busy meanwhile."""
     ka = getattr(_KEEPALIVE_LOCAL, "ka", None)
     if ka is None:
         ka = _KEEPALIVE_LOCAL.ka = _GpuKeepalive()
-    ka.wait(futures)
+    ka.wait(futures, first)
 
 
 def switch_forward(x: mx.array, indices: mx.array, triples: dict,

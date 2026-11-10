@@ -55,7 +55,7 @@ only the active request's cache. --kv-cache-gib bounds the disk use (default
 its bandwidth with expert reads.
 
 --draft-head decodes greedy requests through streamlx.pipeline (PEF): K tokens
-in flight, one layer apart, so each token's expert reads overlap the others'
+in flight, so each token's expert reads overlap the others'
 compute, with plain decoding's output. It takes what generate.py's does: the
 model directory for Qwen3.8 and DeepSeek-V4.1, an mlx-vlm drafter directory
 otherwise. With --stream-draft-head, Qwen3.8's head streams its MoE layer

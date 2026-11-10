@@ -21,9 +21,11 @@ finish() runs the MoE and the expand, both with the block's own modules.
 The model keeps ONE cache object for all layers, with a position (`offset`,
 advanced once per forward), a cross-layer handoff (published by source layers
 and read by later ones in the same forward) and the Engram n-gram history. With
-tokens in flight one layer apart:
+several tokens in flight (each layer takes them in order, a token may be
+layers ahead of the next):
   - each token's attention runs with its own offset, and with its own handoff
-    swapped in and out around the call;
+    swapped in and out around the call; between calls the offset is past the
+    last token that has entered layer 0;
   - a token's Engram hashes are computed at its layer 0, in token order, so the
     history is sequential;
   - the core's per-layer cache handles are views on the one cache: a snapshot
@@ -346,11 +348,13 @@ class V41Adapter:
         if pos.handoff is not None:
             for name, val in zip(HANDOFF, pos.handoff):
                 setattr(e, name, val)
+        past = e.offset
         e.offset = pos.offset
         out = layer.attn(x, e)
         pos.handoff = tuple(getattr(e, name) for name in HANDOFF)
-        # what the token leaves behind (the layer-0 rollback point)
-        e.offset = pos.offset + 1
+        # what the tokens so far leave behind (the layer-0 rollback point),
+        # also when an earlier token runs a later layer after this one's 0
+        e.offset = max(past, pos.offset + 1)
         return out
 
     def begin(self, l, h, ids, ctx, cache, pos):
