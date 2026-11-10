@@ -158,9 +158,8 @@ class StandardMoEAdapter:
         return mx.concatenate([pos.taps[i] for i in self.tap_layers], axis=-1)
 
     def plain(self, tok: int, cache):
-        """The model's own one-token forward, expert prefetch included: the
-        pipeline's plain_fn. Returns (logits, the hidden draft_hidden
-        gives)."""
+        """The model's own one-token forward: the pipeline's plain_fn.
+        Returns (logits, the hidden draft_hidden gives)."""
         want = self.tap_layers or (len(self.layers) - 1,)
         with capture_layer_outputs(self.model, want) as got:
             logits = self.model(mx.array([[tok]]), cache=cache)

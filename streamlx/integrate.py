@@ -28,7 +28,7 @@ from .reader import ExpertReader
 from .stindex import PROJS, SafetensorsIndex
 
 
-_PF_EX = None   # shared 1-thread executor for prefetch submissions
+_PF_EX = None   # shared 1-thread executor for the next layer's read-ahead
 
 
 def _pf_ex():
@@ -113,48 +113,11 @@ class StreamingSwitchGLU(nn.Module):
         self._next = None
         self._early = None
         self._hist = None
-        # Attention-window prefetch (F18): predict the NEXT MoE layer's
-        # routing from this layer's residual and read its missing experts
-        # while this layer's FFN and the next layer's attention compute.
-        # (next pool, next gate module, this/next post-attn norm weights);
-        # wired by load_streaming_model when STREAMLX_PREFETCH != 0.
-        self._pf_next = None
-        self._pf_ratio = None    # lazy: w_next / w_this, built on first use
         # Hosts probe these to pick fused resident-tensor fast paths; None
         # sends them down the standard switch_mlp(x, indices) call.
         self.gate_proj = None
         self.up_proj = None
         self.down_proj = None
-
-    def _pf_pred_lazy(self, x: mx.array, k: int) -> mx.array | None:
-        """Lazy prediction of the next MoE layer's experts from this
-        layer's input.
-
-        x here is post_ln_this(h); the next gate wants post_ln_next(h).
-        Both RMSNorms divide by the same rms(h), so rescaling by
-        w_next / w_this reproduces the next layer's gate input exactly
-        (F18 depth-2: 71.8% top-k agreement on decode). The returned array
-        is NOT materialized here — the caller evaluates it inside the index
-        sync this layer already pays, so prefetch adds zero extra graph
-        splits. Layers whose routing isn't predictable this early gate
-        themselves off via the absorbing pool's agreement counters."""
-        nxt = self._pf_next
-        if nxt is None:
-            return None
-        pool_j, gate_j, w_i, w_j = nxt
-        if pool_j.pf_agree_tot >= 512 and pool_j.prefetch_agreement() < 0.55:
-            return None
-        try:
-            if self._pf_ratio is None:
-                self._pf_ratio = (w_j / w_i).astype(x.dtype)
-            out = gate_j(x * self._pf_ratio)
-            if isinstance(out, tuple):
-                return out[0], out[1]       # (inds, router scores)
-            inds = mx.argpartition(-out, kth=k - 1, axis=-1)[..., :k]
-            return inds, mx.take_along_axis(out, inds, axis=-1)
-        except Exception:
-            self._pf_next = None   # arch surprise: disable for this link
-            return None
 
     def _own_cache_states(self) -> None:
         """prefill_cache's per-layer step: evaluate the entries of the layers
@@ -334,7 +297,7 @@ class StreamingSwitchGLU(nn.Module):
         swept) that its pool does not hold, in id order, so the reads
         coalesce and its sweep, which also goes in id order, takes them
         first. One batch per task on the shared
-        prefetch thread (data-only arrays; their dtype views, which are ops,
+        read-ahead thread (data-only arrays; their dtype views, which are ops,
         are made on the compute thread). Skipped below _NEXT_MIN_COVERAGE,
         while the next layer still holds earlier reads, and when its pool
         would hold the whole call (no sweep)."""
@@ -566,11 +529,6 @@ class StreamingSwitchGLU(nn.Module):
             if self.record_sink is not None:
                 self.record_sink.append((self.pool.layer, idx.copy()))
             return self._stream_forward(x, idx, hint.rows, w)
-        pred = None
-        if decode and not self.pool._pf_suspend:
-            pred = self._pf_pred_lazy(x, indices.shape[-1])
-            if pred is not None:
-                mx.eval(indices, *pred)  # one sync covers all three graphs
         idx = np.array(indices)  # materializes the gate's selection (sync)
         if not decode and _PREFILL["cache"] is not None:
             self._own_cache_states()
@@ -582,8 +540,6 @@ class StreamingSwitchGLU(nn.Module):
             self._take_early(set())   # the previous layer read for a sweep
         # Decode reads wait with the GPU kept busy (see pool._GpuKeepalive).
         ka = keepalive_wait if decode and KEEPALIVE else None
-        if decode:
-            self.pool.prefetch_absorb(uniq, wait=ka)  # adopt predicted arrivals
         if len(uniq) <= self.pool.n_slots:
             # fast path: whole call fits the pool (always true for decode)
             if decode:
@@ -599,12 +555,6 @@ class StreamingSwitchGLU(nn.Module):
                     # Dispatch the layer's experts now, so the GPU starts on
                     # them while the host builds the rest of the layer.
                     mx.async_eval(y)
-                if pred is not None:
-                    pi = np.asarray(pred[0]).reshape(-1)
-                    ps = np.asarray(pred[1].astype(mx.float32)).reshape(-1)
-                    ordered = list(dict.fromkeys(
-                        int(pi[j]) for j in np.argsort(-ps)))
-                    self._pf_next[0].prefetch_start(ordered, _pf_ex())
                 return y
             self.pool.ensure(uniq)
             return self._pooled(x, idx, self._remap(idx), w)
@@ -922,37 +872,6 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
         pool.min_slots = min(k, pool.n_experts)
         pools[i] = pool
     _link_next_layers(model, pools)
-    if os.environ.get("STREAMLX_PREFETCH", "1") != "0":
-        # Link adjacent streamed MoE layers for attention-window prefetch.
-        # Non-adjacent pairs are skipped: an extra block between them stales
-        # the residual the prediction reads.
-        linked = 0
-        ordered = sorted(streamed)
-
-        def _post_ln(layer):
-            # `post_attention_layernorm` in mlx-lm models, `ffn_norm` in
-            # deepseek_v4 (there the residual passes a hyper-connection
-            # collapse before the norm, so the norm-ratio identity is
-            # approximate; the agreement gate decides per layer)
-            for attr in ("post_attention_layernorm", "ffn_norm"):
-                m = getattr(layer, attr, None)
-                if m is not None:
-                    return m
-            return None
-
-        for a, b in zip(ordered, ordered[1:]):
-            if b != a + 1:
-                continue
-            gate = getattr(_moe_block(model.layers[b]), "gate", None)
-            ln_a = _post_ln(model.layers[a])
-            ln_b = _post_ln(model.layers[b])
-            if gate is None or ln_a is None or ln_b is None:
-                continue
-            _moe_block(model.layers[a]).switch_mlp._pf_next = (
-                pools[b], gate, ln_a.weight, ln_b.weight)
-            linked += 1
-        print(f"[streamlx] attention-window prefetch: {linked} layer links",
-              file=sys.stderr)
     if res_layers:
         rb = sum(n_exp[i] * bpe[i] for i in res_layers) / 2**30
         print(f"[streamlx] {len(res_layers)} fully-resident MoE layers "
@@ -1054,15 +973,11 @@ def preload_popular(pools: dict, trace_npz: str) -> int:
 def aggregate_stats(pools: dict) -> dict:
     tot = {"hits": 0, "misses": 0, "evictions": 0, "fetch_s": 0.0,
            "sweep_experts": 0, "sweep_fetch_s": 0.0, "adopted": 0,
-           "next_layer_reads": 0, "next_layer_used": 0,
-           "pf_calls": 0, "pf_launched": 0, "pf_used": 0,
-           "pf_agree_hit": 0, "pf_agree_tot": 0}
+           "next_layer_reads": 0, "next_layer_used": 0}
     for p in pools.values():
         s = p.stats
         for k in ("hits", "misses", "evictions", "sweep_experts", "adopted",
-                  "next_layer_reads", "next_layer_used",
-                  "pf_calls", "pf_launched", "pf_used",
-                  "pf_agree_hit", "pf_agree_tot"):
+                  "next_layer_reads", "next_layer_used"):
             tot[k] += s.get(k, 0)
         tot["fetch_s"] += s["fetch_s"]
         tot["sweep_fetch_s"] += s.get("sweep_fetch_s", 0.0)

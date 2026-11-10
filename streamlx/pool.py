@@ -151,7 +151,6 @@ class StreamingSwitchMLP:
         self.act = None       # non-default activation, set at wrap time
         self.act_weights = False  # act takes the routing weights (v4.1)
         self.escales = None   # optional (gate_vec, out_vec), set at wrap time
-        self._pf_suspend = False  # a pipelined step is running: no lookahead
         # the pipeline's hint for the NEXT switch call (one stream's layer):
         # .rows = the experts the stream read itself, .idx = its routing when
         # the caller already synced it (None: the switch syncs as usual)
@@ -185,13 +184,6 @@ class StreamingSwitchMLP:
         self.adopted = 0         # experts placed by prefill sweeps (no IO)
         self.next_layer_reads = 0   # read for this layer's next sweep early
         self.next_layer_used = 0    # of those, routed by that sweep
-        self._pf = None          # in-flight: (pred_set, launch, fut, rank_of)
-        self.pf_calls = 0        # predictions targeting this layer
-        self.pf_launched = 0     # experts submitted to async read
-        self.pf_used = 0         # prefetched experts the step actually routed to
-        self.pf_agree_hit = 0    # |predicted ∩ actual| accumulator
-        self.pf_agree_tot = 0    # |actual| accumulator
-        self.pf_rank = {}        # confidence rank -> [launched, used]
 
     def _take_slot_for(self, e: int) -> int:
         """A slot for e: a free one, else the least recently used expert's."""
@@ -297,72 +289,6 @@ class StreamingSwitchMLP:
             self.id2slot.move_to_end(e)
             self.hits += 1
 
-    # Confidence cut: rank-vs-usefulness measured on Laguna decode (12 GiB,
-    # battery deltas): rank 0 = 95% used, 6 = 42%, 9 = 22%; top-7 beat both
-    # no-cut (46% efficiency, contention) and top-5 (starves absorption).
-    _PF_TOPM = int(os.environ.get("STREAMLX_PF_TOPM", "7"))
-
-    def prefetch_start(self, pred: list[int], ex) -> None:
-        """Attention-window prefetch (F18): async raw read of the predicted
-        experts for this layer's NEXT call that aren't resident. `pred` is
-        ordered by router score, most confident first; only missing
-        predictions with confidence rank < STREAMLX_PF_TOPM are read (the
-        rank tail is where mispredictions concentrate — see pf_rank). One
-        prediction in flight per layer; an unconsumed one is dropped here.
-        Reads are submitted on `ex`, a dedicated executor — read_experts_raw
-        fans spans onto the reader's own pool, so submitting from that same
-        pool could starve it."""
-        rank_of = {e: r for r, e in enumerate(pred)}
-        missing = [e for e in pred if e not in self.id2slot]
-        launch = [e for e in missing if rank_of[e] < self._PF_TOPM]
-        for e in launch:
-            self.pf_rank.setdefault(rank_of[e], [0, 0])[0] += 1
-        if not launch:
-            self._pf = (set(pred), [], None, rank_of)
-            return
-        self.pf_launched += len(launch)
-        self._pf = (set(pred), launch,
-                    ex.submit(self.reader.read_experts_raw,
-                              self.triples_loc, launch), rank_of)
-
-    def prefetch_absorb(self, wanted: list[int], wait=None) -> None:
-        """Adopt prefetched experts this step actually routed to. Called
-        before ensure(), so absorbed experts are hits with no blocking read.
-        Blocks on the in-flight read only when the step needs its bytes
-        (they're exactly the bytes ensure() would otherwise re-read).
-        Also tallies prediction agreement for the adaptive per-layer gate
-        and per-rank usefulness for the confidence cut."""
-        pf, self._pf = self._pf, None
-        if pf is None:
-            return
-        pred_set, launch, fut, rank_of = pf
-        self.pf_calls += 1
-        self.pf_agree_hit += len(set(wanted) & pred_set)
-        self.pf_agree_tot += len(wanted)
-        if fut is None:
-            return
-        take = [e for e in launch
-                if e in set(wanted) and e not in self.id2slot]
-        if not take:
-            return
-        try:
-            if wait is not None:
-                wait([fut])
-            raws = fut.result()
-            rows = self.reader.experts_from_raw(self.triples_loc, launch,
-                                                raws)
-        except Exception:
-            return
-        for e in take:
-            self.adopt(e, rows[e])
-            self.pf_rank.setdefault(rank_of[e], [0, 0])[1] += 1
-        self.adopted -= len(take)       # keep sweep-adoption count pure
-        self.pf_used += len(take)
-
-    def prefetch_agreement(self) -> float:
-        return (self.pf_agree_hit / self.pf_agree_tot
-                if self.pf_agree_tot else 1.0)
-
     def adopt(self, e: int, arrays: dict) -> None:
         """Place expert e's already-read rows into a slot without IO.
 
@@ -398,9 +324,6 @@ class StreamingSwitchMLP:
         self.sweep_fetch_s = 0.0
         self.adopted = 0
         self.next_layer_reads = self.next_layer_used = 0
-        self.pf_calls = self.pf_launched = self.pf_used = 0
-        self.pf_agree_hit = self.pf_agree_tot = 0
-        self.pf_rank = {}
 
     @property
     def stats(self) -> dict:
@@ -414,10 +337,5 @@ class StreamingSwitchMLP:
                 "adopted": self.adopted,
                 "next_layer_reads": self.next_layer_reads,
                 "next_layer_used": self.next_layer_used,
-                "pf_calls": self.pf_calls,
-                "pf_launched": self.pf_launched,
-                "pf_used": self.pf_used,
-                "pf_agree_hit": self.pf_agree_hit,
-                "pf_agree_tot": self.pf_agree_tot,
                 "bytes_read": self.reader.bytes_read,
                 "reads": self.reader.reads}

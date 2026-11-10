@@ -148,11 +148,11 @@ class PipelinedDecoder:
         self.ad = adapter
         self.pools = pools
         self.cache = cache
-        # plain_fn(tok, cache) -> (logits [1,1,V], hidden): the
-        # host's own one-token forward, routing prefetch included. A step
-        # with no drafts to launch runs through it instead of a lone K=1
-        # pipeline step (which would have no prefetch and no overlap). The
-        # hidden must be what the adapter's draft() consumes.
+        # plain_fn(tok, cache) -> (logits [1,1,V], hidden): the host's own
+        # one-token forward. A step with no drafts to launch runs through it
+        # instead of a lone K=1 pipeline step (which would compute nothing
+        # while its experts are read). The hidden must be what the adapter's
+        # draft() consumes.
         self.plain_fn = plain_fn
         # Self-gate: the pipeline pays only when fetch is a fraction of the
         # step and the drafter is byte-cheap and confident; elsewhere
@@ -365,20 +365,9 @@ class PipelinedDecoder:
         """Returns (outputs, hiddens, snaps): outputs[i] = argmax after
         stream i, hiddens[i] = its final (pre-head) hidden, snaps[l][i] =
         layer-l cache snapshot taken before stream i wrote it."""
-        # the core reads every stream's experts exactly; the wrapper's
-        # lookahead would only re-read them
-        for p in self.pools.values():
-            p._pf_suspend = True
-        self._reads, self._used, self._fin, self._done = {}, {}, {}, []
-        self._k_cur = len(toks)
-        try:
-            return self._step(toks, offset)
-        finally:
-            for p in self.pools.values():
-                p._pf_suspend = False
-
-    def _step(self, toks: list[int], offset: int):
         K, n = len(toks), self.n_layers
+        self._reads, self._used, self._fin, self._done = {}, {}, {}, []
+        self._k_cur = K
         streams = [Stream(i, t, *self.ad.prep(t, offset + i))
                    for i, t in enumerate(toks)]
         ctx = self.ad.masks(streams[0].h, self.cache)
@@ -417,8 +406,8 @@ class PipelinedDecoder:
 
     # -- the plain fallback and the self-gate --------------------------------
     def plain_step(self, tok: int):
-        """One token through the host's own forward (with its prefetch).
-        Returns (argmax, logits, hidden)."""
+        """One token through the host's own forward. Returns (argmax,
+        logits, hidden)."""
         t0 = time.perf_counter()
         logits, hidden = self.plain_fn(tok, self.cache)
         mx.eval(logits)
