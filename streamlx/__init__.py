@@ -1,7 +1,7 @@
-"""streamlx — SSD expert streaming for MoE models on mlx-lm.
+"""streamlx — SSD expert streaming for MoE models on mlx-lm and mlx-vlm.
 
-Phase 3 prototype (see notes/phase3-design.md). v1 scope: batch-1 decode,
-per-layer ExpertPool with LRU, pread-based miss path, no custom kernels.
+Batch-1 inference with a per-layer expert pool (LRU) and a pread-based miss
+path; no custom kernels.
 """
 
 from .pool import StreamingSwitchMLP, switch_forward

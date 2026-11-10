@@ -151,8 +151,8 @@ class V41DSpark:
         n = int(cfg.num_nextn_predict_layers)
         self.stages = [DSparkStage(cfg, s, n, len(self.tap_layers)) for s in range(n)]
         self._load(root, spec)
-        # routed experts: pools keyed past the trunk, like MTP stages in
-        # load_streaming_model
+        # routed experts: pools keyed past the trunk (as
+        # integrate.stream_moe_blocks keys a draft head's)
         self.pools = {}
         for s, st in enumerate(self.stages):
             key = cfg.num_hidden_layers + s

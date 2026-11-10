@@ -17,11 +17,10 @@ expert gather runs once), and ``finish`` calls the block for real, so
 whatever routing op is installed on the block class is the one used.
 
 Drafting: an mlx-vlm drafter (DSpark / DFlash / MTP heads, ``pip install
-mlx-vlm``; ``load_drafter``). Without one the core runs K=1 (or
-teacher-forced tests).
+mlx-vlm``; ``load_drafter``). Without one the core runs K=1.
 
-Adapters for other layer shapes (hyper-connected residuals, multi-branch
-blocks) are host-provided.
+Other layer shapes have their own adapters (``adapter_for``):
+mistral_large4 here, deepseek_v41 and qwen4_exp in their modules.
 """
 from __future__ import annotations
 

@@ -6,9 +6,9 @@ The wrapper is signature-compatible with SwitchGLU.__call__(x, indices):
 the surrounding SparseMoeBlock (gate, top-k, score weighting, shared expert)
 is untouched, so the only change in the graph is where expert weights live.
 
-Sync point (by design, see notes/phase3-design.md): routed indices must be
-materialized per layer per step to drive fetch decisions — this is the
-fundamental gate-then-fetch dependency of expert streaming.
+Sync point (by design): routed indices must be materialized per layer per
+step to drive fetch decisions — this is the fundamental gate-then-fetch
+dependency of expert streaming.
 """
 
 from __future__ import annotations
@@ -357,7 +357,7 @@ class StreamingSwitchGLU(nn.Module):
         row is a matrix-vector product as in stock; either way every output
         row depends only on its own x row and its own expert, so splitting
         the experts into batches is a permutation of independent
-        computations (same basis as _overlapped, F9).
+        computations (same basis as _overlapped).
 
         Batches dispatch with async_eval so the GPU computes batch i while
         batch i+1 is read; mini-pool buffers are immutable so no per-slice
@@ -756,8 +756,8 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
 
     The replaced SwitchGLU modules are dropped before any eval, so expert
     tensors are never materialized: resident memory = trunk + pools. Budget
-    is split per layer by that layer's actual expert byte size (same
-    equal-bytes policy as sim/lru_sim.py). Every streamed layer keeps at
+    is split per layer by that layer's actual expert byte size (equal
+    bytes a layer). Every streamed layer keeps at
     least k slots (default: the model's experts per token, which one decode
     step needs at once; 8 if the config does not say).
 

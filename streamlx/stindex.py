@@ -88,10 +88,10 @@ class SafetensorsIndex:
                        tag: str | None = None) -> dict[str, dict[str, TensorLoc]]:
         """{proj: {weight/scales[/biases]: TensorLoc}} for one MoE layer.
 
-        `tag` overrides the module path for non-trunk MoE blocks (an MTP
-        stage at `mtp.{s}`, or `mtp.{s}.block` when the stage wraps a full
-        decoder layer). biases are optional (mxfp modes ship weight and
-        scales only); weight and scales are required for every projection.
+        `tag` overrides the module path for non-trunk MoE blocks (a draft
+        head's, at `mtp.{s}` or `mtp.layers.{i}`). biases are optional (mxfp
+        modes ship weight and scales only); weight and scales are required
+        for every projection.
         """
         out: dict[str, dict[str, TensorLoc]] = {}
         base = tag if tag is not None else f"layers.{layer}"

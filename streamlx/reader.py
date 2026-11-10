@@ -1,14 +1,14 @@
 """pread-based expert fetcher with range coalescing.
 
-Miss path per notes/phase3-design.md: MLX lazy loading is tensor-granular
-(F10), so expert rows are read directly by byte range. Coalescing (M4):
-requests are planned per shard, sorted by offset, and merged into spans when
-adjacent or within --merge-gap; spans are read concurrently by a small thread
-pool (latency hiding for the many ~33 KB scales/biases rows — the device is
-throughput-flat across QD but small reads are latency-bound, F7).
+The miss path: MLX lazy loading is tensor-granular, so expert rows are read
+directly by byte range. Coalescing: requests are planned per shard, sorted by
+offset, and merged into spans when adjacent or within merge_gap; spans are
+read concurrently by a small thread pool (latency hiding for the many small
+scales/biases rows — the device is throughput-flat across queue depths but
+small reads are latency-bound).
 
-F_NOCACHE is set as declared intent, but per F5 (macOS 26.3) reads populate
-the page cache anyway — treated as a free reclaimable L2.
+F_NOCACHE is set as declared intent, but reads populate the page cache
+anyway (macOS 26.3) — a free reclaimable second level.
 """
 
 from __future__ import annotations

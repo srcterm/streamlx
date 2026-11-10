@@ -1,16 +1,13 @@
 """Per-layer ExpertPool: preallocated slot tensors, id->slot LRU, fetch-on-miss.
 
-Exactness basis (F9): gather_qmm over relocated expert rows with remapped
-indices is bitwise-identical to the full stacked call. The forward here is a
+Exactness basis: gather_qmm over relocated expert rows with remapped indices
+is bitwise-identical to the full stacked call. The forward here is a
 line-for-line mirror of mlx_lm SwitchGLU's decode path (no-sort branch),
-parameterized by which triples (full tensors or pool slots) it runs over —
-both the reference and the streaming path share `switch_forward`, so the ONLY
-difference under test is relocation + index remap.
+parameterized by which triples (full tensors or pool slots) it runs over.
 
-Eviction: LRU head, applied per-miss (identical semantics to sim/lru_sim.py's
-lru_layer, so measured misses cross-validate against the simulator). v1
-evicts only between steps by construction (ensure() runs before the step's
-compute graph is built). Requires n_slots >= k.
+Eviction: the least recently used expert leaves, applied per miss, only
+between steps by construction (ensure() runs before the step's compute graph
+is built). Requires n_slots >= k.
 """
 
 from __future__ import annotations
@@ -196,12 +193,11 @@ class StreamingSwitchMLP:
         return slot
 
     def ensure(self, ids: list[int], wait=None) -> list[int]:
-        """Return slot ids for `ids` (touch order = given order, like the sim).
+        """Return slot ids for `ids` (touch order = given order).
 
-        Misses are slot-assigned in order (LRU, identical semantics to the
-        simulator) but FETCHED as one coalesced batch —
-        eviction decisions never depend on fetch timing, so miss counts stay
-        sim-exact while IO gets span-merged + threaded (M4 coalescing).
+        Misses are slot-assigned in order (LRU) but FETCHED as one coalesced
+        batch: eviction decisions never depend on fetch timing, while the IO
+        is span-merged and threaded.
         `wait`, when given, blocks on the batch's read futures in place of a
         plain wait (the decode path's GPU keepalive).
         """
