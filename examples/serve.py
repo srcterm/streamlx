@@ -32,7 +32,8 @@ would pass the limit. A long conversation so gives slots back as its cache
 grows, and a short one takes them again. Resizing copies the kept slots (~1 s
 for 16 GiB); outputs don't change. --prefill-memory-gib caps what a prefill
 holds beyond the arrays it uses: MLX's freed buffers (a third, at most
-0.25 GiB) and the next layer's reads in flight (the rest, at most 0.5 GiB).
+0.25 GiB) and the expert reads queued ahead of the compute (the rest, at most
+0.5 GiB).
 
 Long prefills of models whose attention head size MLX does not fuse by
 default (256 in Qwen3.5/3.6) would build heads x queries x keys of scores per
@@ -641,9 +642,9 @@ def main() -> None:
     ap.add_argument("--prefill-memory-gib", type=float, default=None,
                     help="cap what prefill holds beyond the arrays it uses: "
                          "MLX's freed-buffer cache while prefilling (a third, "
-                         "at most 0.25 GiB) and the next layer's reads in "
-                         "flight (the rest, at most 0.5 GiB). Default: "
-                         "--mlx-cache-gib and 0.5 GiB")
+                         "at most 0.25 GiB) and the expert reads queued "
+                         "ahead of the compute (the rest, at most 0.5 GiB). "
+                         "Default: --mlx-cache-gib and 0.5 GiB")
     ap.add_argument("--memory-gib", type=float, default=None,
                     help="keep MLX's memory (active + buffer cache) under "
                          "this: before each request the expert pools are "

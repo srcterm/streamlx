@@ -27,25 +27,27 @@ from .reader import ExpertReader
 from .stindex import PROJS, SafetensorsIndex
 
 
-_PF_EX = None   # shared 1-thread executor for the next layer's read-ahead
+_PF_EX = None   # the prefill sweeps' read queue: two batches in flight
 
 
 def _pf_ex():
     global _PF_EX
     if _PF_EX is None:
-        _PF_EX = ThreadPoolExecutor(max_workers=1,
+        _PF_EX = ThreadPoolExecutor(max_workers=2,
                                     thread_name_prefix="streamlx-pf")
     return _PF_EX
 
 
-# Next-layer reads (prefill): a sweep that routes at least this share of its
-# layer's experts starts the next streamed layer's first reads once its own
-# last batch is read. The next layer sees the same tokens, so it routes most
-# of its experts too, and the drive would otherwise idle through this layer's
-# tail and the next layer's attention. Below it (a short chunk after a
-# prompt-cache hit), too many of those reads would go unused.
+# Prefill reads run ahead of the compute through one queue: a sweep's own
+# batches, then the next streamed layer's first reads, at most _NEXT_BYTES of
+# experts queued and not yet used. The next layer sees the same tokens, so it
+# routes most of its experts too, and the drive would otherwise idle through
+# this layer's tail and the next layer's attention. The next layer's are only
+# read by a sweep that routes at least _NEXT_MIN_COVERAGE of its layer's
+# experts: below it (a short chunk after a prompt-cache hit), too many of
+# those reads would go unused.
 _NEXT_MIN_COVERAGE = 0.7
-_NEXT_BYTES = 512 * 2**20   # read at most this much ahead per layer boundary
+_NEXT_BYTES = 512 * 2**20
 
 # The cache of the prefill chunk in flight (prefill_cache), and the last layer
 # whose entry its streamed layers have evaluated.
@@ -101,13 +103,14 @@ class StreamingSwitchGLU(nn.Module):
         # them) or "count" (its n_slots most-routed, evicting and retouching:
         # decode after a prefill then misses a third more).
         self.warm_policy = os.environ.get("STREAMLX_WARM_POLICY", "fill")
-        self._sweep_ex = None   # lazy 1-thread executor: batch read-ahead
         # Next-layer reads: the next streamed layer's wrapper (linked at
-        # load), the reads the previous layer started for this layer's next
-        # sweep ({expert id: future of its batch read}), and this layer's
-        # recent sweep routing (route counts, halved every sweep), which
-        # ranks what the previous layer reads.
+        # load), what a sweep may still queue for it (expert ids), the reads
+        # the previous layer started for this layer's next sweep ({expert id:
+        # future of its batch read}), and this layer's recent sweep routing
+        # (route counts, halved every sweep), which ranks what the previous
+        # layer reads.
         self._next = None
+        self._todo = None
         self._early = None
         self._hist = None
         # Hosts probe these to pick fused resident-tensor fast paths; None
@@ -285,50 +288,53 @@ class StreamingSwitchGLU(nn.Module):
         y = mx.take(y, mx.array(inv.astype(np.uint32)), axis=0)
         return y.reshape(b, t, k, -1)
 
-    def _read_next_layer(self, n_routed: int) -> None:
-        """Start the next layer's first sweep reads (see _expert_sweep).
-
-        On these tokens the next layer routes most of its experts too: up to
-        _NEXT_BYTES of them, and no more than this layer routed, are read --
-        its most-routed in recent sweeps (its lowest ids before it has
-        swept) that its pool does not hold, in id order, so the reads
-        coalesce and its sweep, which also goes in id order, takes them
-        first. One batch per task on the shared
-        read-ahead thread (data-only arrays; their dtype views, which are ops,
-        are made on the compute thread). Skipped below _NEXT_MIN_COVERAGE,
-        while the next layer still holds earlier reads, and when its pool
-        would hold the whole call (no sweep)."""
-        nxt = self._next
+    def _plan_next_layer(self, n_routed: int, n_read: int) -> None:
+        """What a sweep may read ahead for the next layer (self._todo, in id
+        order; see _read_next_layer): as many experts as it reads itself, the
+        next layer's most-routed in recent sweeps (its lowest ids before it
+        has swept) that its pool does not hold. Nothing below
+        _NEXT_MIN_COVERAGE, while the next layer still holds earlier reads,
+        and when its pool would hold the whole call (no sweep)."""
+        nxt, self._todo = self._next, None
         if (nxt is None or nxt._early is not None
                 or n_routed < _NEXT_MIN_COVERAGE * self.pool.n_experts
                 or nxt.pool.n_slots >= n_routed):
             return
-        p, bs = nxt.pool, nxt.sweep_batch
-        # no more than this layer routed: the next one routes about as many
-        n = min(n_routed, p.n_experts, max(bs, _NEXT_BYTES // p.expert_bytes))
-        h = nxt._hist
+        p, h = nxt.pool, nxt._hist
         rank = (np.argsort(-h, kind="stable") if h is not None
                 else np.arange(p.n_experts))
-        # not the ones its pool holds: its sweep takes those from their slots
-        top = sorted([int(e) for e in rank if not p.resident(int(e))][:n])
-        early = {}
-        for i0 in range(0, len(top), bs):
-            ids = top[i0:i0 + bs]
+        self._todo = sorted([int(e) for e in rank
+                             if not p.resident(int(e))][:n_read])
+        nxt._early = {}
+
+    def _read_next_layer(self, ahead: int) -> None:
+        """Queue the next layer's reads that fit under _NEXT_BYTES with this
+        sweep's `ahead` experts still to use. One batch per task (data-only
+        arrays; their dtype views, which are ops, are made on the compute
+        thread)."""
+        if not self._todo:
+            return
+        nxt = self._next
+        p, bs, early = nxt.pool, nxt.sweep_batch, nxt._early
+        room = (max(bs, _NEXT_BYTES // p.expert_bytes) - len(early)
+                - ahead * self.pool.expert_bytes // p.expert_bytes)
+        while self._todo and min(bs, len(self._todo)) <= room:
+            ids, self._todo = self._todo[:bs], self._todo[bs:]
             fut = _pf_ex().submit(p.reader.read_experts_arrays, p.triples_loc,
                                   ids)
             early.update(dict.fromkeys(ids, fut))
-        p.next_layer_reads += len(top)
-        nxt._early = early
+            p.next_layer_reads += len(ids)
+            room -= len(ids)
 
     def _take_early(self, routed: set) -> dict:
-        """The previous layer's reads for this call, minus experts it does
-        not route (reads of those not yet started are cancelled)."""
+        """The previous layer's reads for this call: those under way or done,
+        of experts it routes. The ones not started are cancelled (the call
+        now knows what it routes and reads exactly that)."""
         early, self._early = self._early, None
         if not early:
             return {}
-        keep = {e: f for e, f in early.items() if e in routed}
-        for f in set(early.values()) - set(keep.values()):
-            f.cancel()
+        keep = {e: f for e, f in early.items()
+                if not f.cancel() and e in routed}
         self.pool.next_layer_used += len(keep)
         return keep
 
@@ -358,18 +364,19 @@ class StreamingSwitchGLU(nn.Module):
         eval barrier is needed. One eval at the end materializes the layer
         output and frees the mini-pools before the next layer runs.
 
-        Reads run one batch ahead on a dedicated thread (sweep_fetch_s counts
-        only time actually blocked on IO). With sweep_warm (default on), the
-        chunk's most-routed experts are adopted into the pool's free slots as
-        their batch streams by (no extra IO), most-frequent most-recently-used;
-        the experts the pool holds stay as decoding left them, since decode
-        after the prefill routes more like the decode before it than like the
-        prompt (warm_policy "count" fills the whole pool from the chunk).
+        Reads run ahead of the compute on the shared read queue, at most
+        _NEXT_BYTES of experts queued and not yet used: the sweep's batches
+        in id order, then the experts the next layer is likely to route
+        (_plan_next_layer), so the drive keeps reading through this layer's
+        tail and the next one's attention; that sweep takes the ones it
+        routes. sweep_fetch_s counts only time blocked on IO.
 
-        Next-layer reads: once the last batch is read, a sweep that routed
-        most of its layer's experts starts reading the experts the next layer
-        is likely to route (_read_next_layer) while this layer finishes and
-        the next one runs attention; that sweep takes the ones it routes.
+        With sweep_warm (default on), the chunk's most-routed experts are
+        adopted into the pool's free slots as their batch streams by (no
+        extra IO), most-frequent most-recently-used; the experts the pool
+        holds stay as decoding left them, since decode after the prefill
+        routes more like the decode before it than like the prompt
+        (warm_policy "count" fills the whole pool from the chunk).
         """
         pool = self.pool
         b, t, k = idx.shape
@@ -413,35 +420,44 @@ class StreamingSwitchGLU(nn.Module):
             mx.eval(*(taken[p][q] for p in PROJS for q in pool.parts))
             pool.sweep_resident += len(resident)
 
-        if self._sweep_ex is None:
-            self._sweep_ex = ThreadPoolExecutor(max_workers=1)
         batches = [[int(e) for e in uniq[i0:i0 + self.sweep_batch]]
                    for i0 in range(0, len(uniq), self.sweep_batch)]
         early = self._take_early(set(uniq.tolist()))
+        self._plan_next_layer(len(uniq), len(uniq) - len(resident))
+        # what the previous layer did not start nor the pool has
+        need = [[e for e in ids if e not in early and e not in resident]
+                for ids in batches]
+        cap = max(self.sweep_batch, _NEXT_BYTES // pool.expert_bytes)
+        own, sub, ahead = {}, 0, len(early)   # ahead: queued, not yet used
 
-        def read(ids):  # what the previous layer did not start nor the pool has
-            need = [e for e in ids if e not in early and e not in resident]
-            if not need:
-                return None
-            return self._sweep_ex.submit(pool.reader.read_experts_arrays,
-                                         pool.triples_loc, need)
+        def queue(upto):   # this layer's reads in order, then the next one's
+            nonlocal sub, ahead
+            while sub < len(batches) and (
+                    sub <= upto or ahead + len(need[sub]) <= cap):
+                if need[sub]:
+                    own[sub] = _pf_ex().submit(
+                        pool.reader.read_experts_arrays, pool.triples_loc,
+                        need[sub])
+                    ahead += len(need[sub])
+                sub += 1
+            if sub == len(batches):
+                self._read_next_layer(ahead)
 
-        fut = read(batches[0])
+        queue(0)
         outs = []
         for bi, ids in enumerate(batches):
             t0 = time.perf_counter()
             raw = {}
-            for f in dict.fromkeys(early[e] for e in ids if e in early):
+            reads = [early[e] for e in ids if e in early]
+            if bi in own:
+                reads.append(own.pop(bi))
+            for f in dict.fromkeys(reads):
                 raw.update(f.result())
-            if fut is not None:
-                raw.update(fut.result())
             pool.sweep_fetch_s += time.perf_counter() - t0   # blocked wait
-            if bi + 1 < len(batches):
-                fut = read(batches[bi + 1])
-            else:
-                self._read_next_layer(len(uniq))   # the drive is free now
             # built on the reading threads; the dtype views (ops) here
             got = [e for e in ids if e not in resident]
+            ahead -= len(got)
+            queue(bi + 1)
             rows = pool.reader.experts_from_arrays(pool.triples_loc, got, raw)
             for e in ids:
                 if e in resident:
