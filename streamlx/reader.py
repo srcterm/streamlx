@@ -214,9 +214,6 @@ class ExpertReader:
             layer_triples, ids,
             self.read_experts_arrays(layer_triples, ids, wait=wait))
 
-    def read_expert(self, layer_triples: dict, e: int) -> dict:
-        return self.read_experts(layer_triples, [e])[e]
-
     def reset_stats(self) -> None:
         self.bytes_read = 0
         self.useful_bytes = 0

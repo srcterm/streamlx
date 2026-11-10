@@ -668,9 +668,6 @@ def _uncompile_ffn(layer) -> None:
         layer.compile_ffn = False
     if getattr(layer, "_ffn_c", None) is not None:
         layer._ffn_c = None
-    inner = getattr(layer, "block", None)     # an MTP stage wrapping a layer
-    if inner is not None and inner is not layer:
-        _uncompile_ffn(inner)
 
 
 def _n_args(fn) -> int:
@@ -731,8 +728,7 @@ def install_streaming(model, model_dir: str, n_slots: int):
 def _link_next_layers(model, pools: dict) -> None:
     """Point each streamed layer at the next streamed one for prefill
     next-layer reads (dense layers between them see the same tokens too)."""
-    ws = [_moe_block(model.layers[i]).switch_mlp for i in sorted(pools)
-          if i < len(model.layers)]     # MTP stages are not linked
+    ws = [_moe_block(model.layers[i]).switch_mlp for i in sorted(pools)]
     for a, b in zip(ws, ws[1:]):
         a._next = b
 
@@ -880,10 +876,6 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
     return (model, tokenizer) with LAZY weights, `model.layers` exposing
     the decoder stack, and MoE blocks discoverable by _moe_block. The
     mlx-lm path (and its vlm-export shim) is skipped.
-
-    A checkpoint's MTP stages (`model.mtp`) that hold their own switch
-    tensors stream through pools like trunk layers, keyed past the trunk
-    (len(model.layers) + s) and sharing the budget split.
     """
     if k is None:
         k = _routed_topk(model_dir)
@@ -921,48 +913,21 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
         res_layers, budget_left = plan_residency(moe_layers, bpe, n_exp,
                                                  budget_bytes, k)
     streamed = [i for i in moe_layers if i not in res_layers]
-    mtp_keys: dict[int, tuple[int, object, str]] = {}
-    for st, stage in enumerate(getattr(model, "mtp", None) or []):
-        blk = _moe_block(stage)
-        if blk is None:
-            continue
-        key = len(model.layers) + st
-        # `mtp.<s>.mlp...` (Qwen, DeepSeek) or one module deeper at
-        # `mtp.<s>.block.mlp...` (a stage wrapping a full decoder layer)
-        tag = None
-        for cand in (f"mtp.{st}", f"mtp.{st}.block"):
-            try:
-                bpe[key] = index.layer_expert_bytes(key, tag=cand)
-                tag = cand
-                break
-            except KeyError:
-                continue
-        if tag is None:
-            continue            # the stage has no streamable switch tensors
-        mtp_keys[key] = (st, blk, tag)
-        streamed.append(key)
     pools: dict[int, StreamingSwitchMLP] = {}
     for i in streamed:
         slots = max(k, int(budget_left / len(streamed) / bpe[i]))
-        if i in mtp_keys:
-            st, mlp, tag = mtp_keys[i]
-            pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
-                                      reader=reader, tag=tag)
-            _wrap(model.mtp[st], mlp, pool)
-        else:
-            pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
-                                      reader=reader)
-            _wrap(model.layers[i], _moe_block(model.layers[i]), pool)
+        pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
+                                  reader=reader)
+        _wrap(model.layers[i], _moe_block(model.layers[i]), pool)
         pool.min_slots = min(k, pool.n_experts)
         pools[i] = pool
     _link_next_layers(model, pools)
     if os.environ.get("STREAMLX_PREFETCH", "1") != "0":
         # Link adjacent streamed MoE layers for attention-window prefetch.
         # Non-adjacent pairs are skipped: an extra block between them stales
-        # the residual the prediction reads. MTP stages are not linked (the
-        # link reads trunk layer norms).
+        # the residual the prediction reads.
         linked = 0
-        ordered = sorted(i for i in streamed if i not in mtp_keys)
+        ordered = sorted(streamed)
 
         def _post_ln(layer):
             # `post_attention_layernorm` in mlx-lm models, `ffn_norm` in
