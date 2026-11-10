@@ -83,7 +83,6 @@ class StandardMoEAdapter:
         self.drafter = drafter
         # a block drafter (DSpark, DFlash) reads these layers' outputs,
         # concatenated in its order; other drafters read the last layer's
-        drafter = self.drafter
         self.tap_layers = tuple(getattr(drafter, "tap_layers", None) or ())
         self.taps = frozenset(self.tap_layers)
 
@@ -179,10 +178,6 @@ class StandardMoEAdapter:
             [mx.concatenate(got[i], axis=1) for i in self.tap_layers], axis=-1)
 
     # -- drafting ----------------------------------------------------------------
-    @property
-    def can_draft(self) -> bool:
-        return self.drafter is not None
-
     def reset_drafter(self) -> None:
         if self.drafter is not None:
             self.drafter.reset()
@@ -321,7 +316,6 @@ class VlmDrafter:
     def __init__(self, draft, model):
         cfg = draft.config
         self.head = draft
-        self.budget_pools = {}      # its experts are resident
         self.tap_layers = tuple(cfg.target_layer_ids)
         self.depth = int(getattr(cfg, "runtime_block_size", None)
                          or cfg.block_size) - 1
@@ -364,8 +358,6 @@ class VlmMtpDrafter:
     """The pipeline's drafter protocol over an mlx-vlm autoregressive MTP head
     (Qwen3.8's): the head's cache holds committed (hidden, next token) pairs,
     a draft chains on it and trims the chain back off."""
-
-    tap_layers = ()
 
     def __init__(self, head, model):
         self.head = head.bind(model)

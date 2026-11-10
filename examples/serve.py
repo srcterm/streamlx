@@ -321,8 +321,7 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
     fetch = _STATE.pop("fetch", None)
     prompt, cache, model = (kwargs.get(k)
                             for k in ("prompt", "prompt_cache", "model"))
-    if (cache is None or model is None or not isinstance(prompt, list)
-            or kwargs.get("draft_model") is not None):
+    if cache is None or model is None or not isinstance(prompt, list):
         return 0
     sfx = _STATE.get("suffix") or []
     cut = len(prompt) - (len(sfx) if sfx and prompt[-len(sfx):] == sfx
@@ -372,7 +371,6 @@ def _pipelined_decoder(kwargs: dict):
     if (_STATE.get("decoder") is None or args is None
             or args.sampling.temperature != 0 or args.logprobs
             or args.top_logprobs > 0 or kwargs.get("logits_processors")
-            or kwargs.get("draft_model") is not None
             or kwargs.get("input_embeddings") is not None
             or kwargs.get("kv_bits") is not None
             or not isinstance(kwargs.get("prompt"), list)):
@@ -545,11 +543,6 @@ class StreamingModelProvider(srv.ModelProvider):
         if adapter_path is not None or draft_model_path is not None:
             raise ValueError("adapters/draft models not supported with "
                              "expert streaming")
-        self.model_key = None
-        self.model = None
-        self.tokenizer = None
-        self.draft_model = None
-
         t0 = time.time()
         model, tokenizer, pools, reader = load_streaming_model(
             str(model_path), _CFG["budget_bytes"],
@@ -559,8 +552,6 @@ class StreamingModelProvider(srv.ModelProvider):
         print(f"[streamlx] trunk loaded in {time.time()-t0:.1f}s; "
               f"{len(pools)} pools, {slots} slots "
               f"({_CFG['budget_bytes']/2**30:.1f} GiB)", file=sys.stderr)
-        self.pools = pools
-        self.reader = reader
         _STATE["pools"], _STATE["reader"] = pools, reader
         _STATE["all_pools"] = dict(pools)
         _STATE["decoder"] = None
@@ -597,7 +588,6 @@ class StreamingModelProvider(srv.ModelProvider):
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
-        self.draft_model = None
         self.is_batchable = False  # batch-1 by design
 
 

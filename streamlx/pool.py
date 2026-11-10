@@ -156,8 +156,6 @@ class StreamingSwitchMLP:
         # the caller already synced it (None: the switch syncs as usual)
         self.call_hint = None
 
-        import numpy as np  # local: only for dtype mapping at alloc
-
         def alloc(loc):
             dt = {"U32": mx.uint32, "BF16": mx.bfloat16,
                   "F16": mx.float16, "F32": mx.float32,
@@ -305,16 +303,6 @@ class StreamingSwitchMLP:
         for proj in PROJS:
             for part in self.parts:
                 self.pool[proj][part][slot] = arrays[proj][part]
-
-    def __call__(self, x: mx.array, expert_ids: list[int]) -> mx.array:
-        if len(expert_ids) > self.n_slots:
-            raise ValueError("n_slots must be >= k")
-        slots = self.ensure(expert_ids)
-        inds = mx.array([[slots]], dtype=mx.uint32)
-        es = (None if self.escales is None else
-              (*self.escales, mx.array([[expert_ids]], dtype=mx.uint32)))
-        return switch_forward(x, inds, self.pool, self.qparams, self.act,
-                              escales=es)
 
     def reset_stats(self) -> None:
         self.hits = self.misses = self.evictions = 0

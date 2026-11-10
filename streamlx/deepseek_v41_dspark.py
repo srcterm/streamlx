@@ -147,7 +147,7 @@ class V41DSpark:
             setattr(cfg, k, raw["text_config"][k])
         self.cfg = cfg
         self.tap_layers = tuple(cfg.dspark_target_layer_ids)
-        self.block = self.depth = int(cfg.dspark_block_size)
+        self.block = int(cfg.dspark_block_size)
         self.window = int(cfg.sliding_window)
         n = int(cfg.num_nextn_predict_layers)
         self.stages = [DSparkStage(cfg, s, n, len(self.tap_layers)) for s in range(n)]

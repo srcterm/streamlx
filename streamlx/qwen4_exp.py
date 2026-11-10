@@ -303,7 +303,6 @@ def load_head(model_dir, model, reader=None):
 
     nn.quantize(head, class_predicate=predicate)
     head.load_weights(list(weights.items()))
-    head.streamlx_pools = {}
     if reader is not None:
         from .integrate import stream_moe_blocks
 
@@ -317,19 +316,15 @@ def load_head(model_dir, model, reader=None):
 
 
 class Qwen4ExpAdapter(StandardMoEAdapter):
-    exact_routing = True
-
     def __init__(self, model, drafter=None):
         self.model = model
         self.lm = model.language_model
         self.inner = self.lm.model
         self.layers = list(self.inner.layers)
         self.embed_tokens = self.inner.embed_tokens
-        self.final_norm = None
         self.hc_count = self.lm.args.hc_count
         self._switch_attr = {id(l.mlp): _find_switch(l) for l in self.layers}
         self.drafter = drafter
-        self.tap_layers = ()
         self.taps = frozenset()
         self._toks = []         # the step's tokens, from prep() to masks()
         self._ple = _ple_layers(self.layers)
@@ -384,7 +379,7 @@ class Qwen4ExpAdapter(StandardMoEAdapter):
                      * weights[..., None]).reshape(*hyper.shape)
         mixed, hyper, weights = layer.mlp_hyper_connection(h)
         st = SimpleNamespace(mixed=mixed, hyper=hyper, weights=weights,
-                             blk=layer.mlp, pos=pos, scores=None)
+                             blk=layer.mlp, scores=None)
         if self._own_route:
             st.inds, st.scores = _route(layer.mlp, mixed)
         else:

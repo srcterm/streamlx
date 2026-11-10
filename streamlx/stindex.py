@@ -30,7 +30,6 @@ def default_group_size(mode: str) -> int:
 class TensorLoc:
     path: str
     abs_start: int   # absolute file offset of tensor data
-    nbytes: int
     dtype: str
     shape: tuple
     name: str = ""   # tensor key in the checkpoint
@@ -58,9 +57,9 @@ class SafetensorsIndex:
             for name, info in hdr.items():
                 if name == "__metadata__":
                     continue
-                a, b = info["data_offsets"]
+                a = info["data_offsets"][0]
                 self.tensors[name] = TensorLoc(
-                    path=shard, abs_start=data_base + a, nbytes=b - a,
+                    path=shard, abs_start=data_base + a,
                     dtype=info["dtype"], shape=tuple(info["shape"]),
                     name=name)
         if not self.tensors:
