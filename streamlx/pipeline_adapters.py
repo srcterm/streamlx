@@ -16,11 +16,8 @@ shared expert run twice per layer, a few percent of the layer; the
 expert gather runs once), and ``finish`` calls the block for real, so
 whatever routing op is installed on the block class is the one used.
 
-Drafting: an mlx-vlm block drafter (DSpark / DFlash heads, ``pip install
-mlx-vlm``; ``load_drafter``), or the ``mtp_forward`` / ``make_mtp_cache``
-protocol a host puts on models with an attached MTP head
-(``mtp_head_prenorm`` decides whether the head wants the pre-norm
-hidden). Models without a head get no drafter: the core then runs K=1 (or
+Drafting: an mlx-vlm drafter (DSpark / DFlash / MTP heads, ``pip install
+mlx-vlm``; ``load_drafter``). Without one the core runs K=1 (or
 teacher-forced tests).
 
 Adapters for other layer shapes (hyper-connected residuals, multi-branch
@@ -83,7 +80,7 @@ class StandardMoEAdapter:
         for l in self.layers:
             blk = getattr(l, self._mlp, None)
             self._switch_attr[id(blk)] = _find_switch(l)
-        self.drafter = drafter if drafter is not None else _MtpDrafter.maybe(model, self)
+        self.drafter = drafter
         # a block drafter (DSpark, DFlash) reads these layers' outputs,
         # concatenated in its order; other drafters read the last layer's
         drafter = self.drafter
@@ -95,7 +92,7 @@ class StandardMoEAdapter:
         return cache
 
     # -- token entry / exit ----------------------------------------------------
-    def prep(self, tok: int, offset: int, pos_base=None, i: int = 0):
+    def prep(self, tok: int, offset: int):
         ids = mx.array([[tok]])
         pos = SimpleNamespace(taps={}) if self.taps else None
         return ids, self.embed_tokens(ids), pos
@@ -120,10 +117,6 @@ class StandardMoEAdapter:
         if self.lm_head is not None:
             return self.lm_head(out)
         return self.embed_tokens.as_linear(out)
-
-    def hidden_for_draft(self, h):
-        prenorm = getattr(self.model, "mtp_head_prenorm", False)
-        return h if (prenorm or self.final_norm is None) else self.final_norm(h)
 
     # -- the layer split -------------------------------------------------------
     def begin(self, l, h, ids, ctx, cache, pos):
@@ -164,10 +157,10 @@ class StandardMoEAdapter:
             return h
         return mx.concatenate([pos.taps[i] for i in self.tap_layers], axis=-1)
 
-    def plain(self, tok: int, cache, pos_base=None):
+    def plain(self, tok: int, cache):
         """The model's own one-token forward, expert prefetch included: the
         pipeline's plain_fn. Returns (logits, the hidden draft_hidden
-        gives). Hosts that pass position ids supply their own."""
+        gives)."""
         want = self.tap_layers or (len(self.layers) - 1,)
         with capture_layer_outputs(self.model, want) as got:
             logits = self.model(mx.array([[tok]]), cache=cache)
@@ -207,10 +200,10 @@ class StandardMoEAdapter:
         self.drafter.prime_pairs(mx.concatenate([h for h, _ in pairs], axis=1),
                                  mx.array([[t for _, t in pairs]]))
 
-    def draft(self, pairs, depth: int, spec=None):
+    def draft(self, pairs, depth: int):
         if self.drafter is None:
-            return [], [], None
-        return self.drafter.draft(pairs, depth, spec)
+            return [], []
+        return self.drafter.draft(pairs, depth)
 
 
 class MistralLarge4Adapter(StandardMoEAdapter):
@@ -227,7 +220,7 @@ class MistralLarge4Adapter(StandardMoEAdapter):
         self._dims, self._freqs = self.inner.rope.dims, self.inner.rope.freqs()
         self._cap = getattr(model.text_args, "final_logit_softcapping", None)
 
-    def prep(self, tok: int, offset: int, pos_base=None, i: int = 0):
+    def prep(self, tok: int, offset: int):
         ids = mx.array([[tok]])
         dims, freqs = self._dims, self._freqs
 
@@ -316,80 +309,6 @@ def _find_switch(layer):
     return None
 
 
-class _MtpDrafter:
-    """The host's MTP-head protocol: model.mtp_forward(hidden, ids, cache,
-    return_hidden=True, logits_keep=1) + make_mtp_cache(); chained on the
-    head's own hidden for depth > 1; the chain's speculative cache
-    entries undone by snapshot/restore."""
-
-    @classmethod
-    def maybe(cls, model, adapter):
-        if callable(getattr(model, "mtp_forward", None)) and callable(
-                getattr(model, "make_mtp_cache", None)):
-            try:
-                if not model.make_mtp_cache():
-                    return None
-            except Exception:  # noqa: BLE001
-                return None
-            return cls(model, adapter)
-        return None
-
-    def __init__(self, model, adapter):
-        self.model = model
-        self.adapter = adapter
-        self.cache = None
-        self.fed = 0
-
-    def reset(self):
-        self.cache = self.model.make_mtp_cache()
-        self.fed = 0
-
-    def prime_pairs(self, hidden, next_ids):
-        if hidden.shape[1] == 0:
-            return
-        if self.cache is None:
-            self.reset()
-        lg = self.model.mtp_forward(self.adapter.hidden_for_draft(hidden), next_ids,
-                                    self.cache, logits_keep=1)
-        mx.eval(lg)
-        self.fed += int(hidden.shape[1])
-
-    def draft(self, pairs, depth, spec=None):
-        from .pipeline import restore_cache, sampling_logprobs, snapshot_cache
-
-        if self.cache is None or not pairs or depth <= 0:
-            return [], [], None
-        rows = self.adapter.hidden_for_draft(mx.concatenate([h for h, _ in pairs], axis=1))
-        committed = mx.array([[t for _, t in pairs]])
-        logits, head_hidden = self.model.mtp_forward(
-            rows, committed, self.cache, return_hidden=True, logits_keep=1)
-        self.fed += len(pairs)
-        toks, probs, qs = [], [], []
-        snap = [snapshot_cache(c) for c in self.cache]
-        h = head_hidden[:, -1:]
-        for j in range(depth):
-            lg = logits[:, -1, :]
-            if spec is not None:
-                lp = sampling_logprobs(lg, spec)
-                tok = mx.random.categorical(lp)
-                probs.append(mx.exp(lp[tok]))
-                qs.append(lp)
-            else:
-                tok = mx.argmax(lg, axis=-1)
-                probs.append(mx.max(mx.softmax(lg, axis=-1, precise=True), axis=-1))
-            toks.append(tok)
-            if j + 1 == depth:
-                break
-            logits, head_hidden = self.model.mtp_forward(
-                h, tok.reshape(1, 1), self.cache, return_hidden=True)
-            h = head_hidden[:, -1:]
-        mx.eval(*toks, *probs, *qs)
-        for c, s in zip(self.cache, snap):
-            restore_cache(c, s)
-        return ([int(t.item()) for t in toks], [float(p.item()) for p in probs],
-                qs if spec is not None else None)
-
-
 class VlmDrafter:
     """The pipeline's drafter protocol over an mlx-vlm block drafter: it
     drafts a block after the last committed token from the target's
@@ -424,9 +343,9 @@ class VlmDrafter:
                 tail = mx.concatenate(self.pending, axis=1)[:, -self._keep:]
                 self.pending = [tail]
 
-    def draft(self, pairs, depth: int, spec=None):
+    def draft(self, pairs, depth: int):
         if self.cache is None or not pairs or depth <= 0:
-            return [], [], None
+            return [], []
         hidden = mx.concatenate(self.pending + [h for h, _ in pairs], axis=1)
         self.pending = []
         probs = []
@@ -439,8 +358,7 @@ class VlmDrafter:
         toks = self.head.draft_block(pairs[-1][1], hidden, self.cache,
                                       min(depth, self.depth) + 1, greedy)
         mx.eval(toks, *probs)
-        return (toks.reshape(-1).tolist(), [float(p.item()) for p in probs],
-                None)
+        return toks.reshape(-1).tolist(), [float(p.item()) for p in probs]
 
 
 class VlmMtpDrafter:
@@ -465,9 +383,9 @@ class VlmMtpDrafter:
             lg, h = self.head._forward_tokens(next_ids, hidden, mx.int32)
             mx.eval(lg, h)
 
-    def draft(self, pairs, depth: int, spec=None):
+    def draft(self, pairs, depth: int):
         if not pairs or depth <= 0:
-            return [], [], None
+            return [], []
         rows = mx.concatenate([h for h, _ in pairs], axis=1)
         toks = mx.array([[t for _, t in pairs]], dtype=mx.int32)
         out, h = self.head._forward_tokens(toks, rows, mx.int32)
@@ -484,7 +402,7 @@ class VlmMtpDrafter:
             c.trim(depth - 1)
         self.head._next_position -= depth - 1
         return ([int(d.item()) for d in drafts],
-                [float(p.item()) for p in probs], None)
+                [float(p.item()) for p in probs])
 
 
 def _vlm_target(model, cfg):

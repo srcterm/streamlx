@@ -319,7 +319,7 @@ class V41Adapter:
             e.offset, e.engram = snap["offset"], snap["engram"]
 
     # -- token entry / exit ------------------------------------------------
-    def prep(self, tok: int, offset: int, pos_base=None, i: int = 0):
+    def prep(self, tok: int, offset: int):
         ids = mx.array([[tok]])
         h = self.lm.embed_tokens(ids)
         h = mx.broadcast_to(h[..., None, :],
@@ -405,7 +405,7 @@ class V41Adapter:
         return h
 
     # -- the model's own forward -------------------------------------------
-    def plain(self, tok: int, cache, pos_base=None):
+    def plain(self, tok: int, cache):
         return self.forward_taps(mx.array([[tok]]), [cache[0].entry])
 
     def forward_taps(self, ids, cache):
@@ -437,7 +437,7 @@ class V41Adapter:
                 else mx.concatenate([h for h, _ in pairs], 1),
                 mx.array([[t for _, t in pairs]]))
 
-    def draft(self, pairs, depth, spec=None):
+    def draft(self, pairs, depth):
         if self.drafter is None:
-            return [], [], None
-        return self.drafter.draft(pairs, depth, spec)
+            return [], []
+        return self.drafter.draft(pairs, depth)

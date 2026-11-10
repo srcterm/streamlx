@@ -243,9 +243,9 @@ class V41DSpark:
             self.pending = [tail]
             self.pos += n - self.window
 
-    def draft(self, pairs, depth, spec=None):
+    def draft(self, pairs, depth):
         if not pairs or depth <= 0:
-            return [], [], None
+            return [], []
         hs = self.pending + [h for h, _ in pairs if h is not None]
         self.pending = []
         if hs:
@@ -274,4 +274,4 @@ class V41DSpark:
             [hf[:, :n], mx.stack(embs, axis=1).astype(hf.dtype)],
             axis=-1).astype(mx.float32)))
         mx.eval(toks, conf)
-        return [int(t.item()) for t in toks], conf.reshape(-1).tolist(), None
+        return [int(t.item()) for t in toks], conf.reshape(-1).tolist()

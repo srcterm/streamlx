@@ -269,7 +269,7 @@ class Qwen4ExpAdapter(StandardMoEAdapter):
     def offset(self, cache) -> int:
         return int(cache[self.inner.fa_idx].offset)
 
-    def prep(self, tok: int, offset: int, pos_base=None, i: int = 0):
+    def prep(self, tok: int, offset: int):
         ids = mx.array([[tok]])
         h = mx.tile(self.embed_tokens(ids), (1, 1, self.hc_count))
         # the position ids the model gives a decode step (its shape is what
@@ -326,7 +326,7 @@ class Qwen4ExpAdapter(StandardMoEAdapter):
         return st.hyper + (branch[..., None, :]
                            * st.weights[..., None]).reshape(*st.hyper.shape)
 
-    def plain(self, tok: int, cache, pos_base=None):
+    def plain(self, tok: int, cache):
         out = self.lm(mx.array([[tok]]), cache=cache, return_hidden=True)
         return out.logits, out.hidden_states[0]
 
