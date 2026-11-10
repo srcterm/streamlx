@@ -94,9 +94,8 @@ class StreamingSwitchGLU(nn.Module):
         super().__init__()
         self.pool = pool
         self.record_sink = None  # optional: list collecting (layer, idx np)
-        # Prefill strategy when a chunk's expert union exceeds the pool:
-        # "sweep" (expert-major, read-once) or "slice" (legacy token slices).
-        self.prefill_mode = os.environ.get("STREAMLX_PREFILL", "sweep")
+        # A chunk that routes more experts than the pool holds is swept
+        # (_expert_sweep), this many experts a batch.
         self.sweep_batch = int(os.environ.get("STREAMLX_SWEEP_BATCH", "16"))
         self.sweep_warm = os.environ.get("STREAMLX_SWEEP_WARM", "1") != "0"
         # What a sweep adopts: "fill" (its most-routed experts into the free
@@ -339,9 +338,10 @@ class StreamingSwitchGLU(nn.Module):
                       w=None) -> mx.array:
         """Expert-major prefill: read each routed expert once, in id order.
 
-        When a chunk's expert union exceeds the pool, the token-slicing path
-        re-reads evicted experts (measured 2.7x on Laguna) at scattered-read
-        bandwidth. Here (position, pick) pairs are grouped by expert instead:
+        A chunk whose expert union exceeds the pool, run in token slices that
+        fit it, re-reads evicted experts (measured 2.7x on Laguna) at
+        scattered-read bandwidth. Here (position, pick) pairs are grouped by
+        expert instead:
         experts stream through throwaway mini-pools in ascending id order
         (adjacent rows coalesce into long sequential spans), each read exactly
         once per chunk. Experts the pool holds are not read: their rows are
@@ -535,68 +535,27 @@ class StreamingSwitchGLU(nn.Module):
         if self.record_sink is not None:
             self.record_sink.append((self.pool.layer, idx.copy()))
         uniq = list(dict.fromkeys(idx.reshape(-1).tolist()))
-        sweep = len(uniq) > self.pool.n_slots and self.prefill_mode == "sweep"
-        if self._early is not None and not sweep:
+        if len(uniq) > self.pool.n_slots:
+            return self._expert_sweep(x, idx, w)
+        if self._early is not None:
             self._take_early(set())   # the previous layer read for a sweep
-        # Decode reads wait with the GPU kept busy (see pool._GpuKeepalive).
-        ka = keepalive_wait if decode and KEEPALIVE else None
-        if len(uniq) <= self.pool.n_slots:
-            # fast path: whole call fits the pool (always true for decode)
-            if decode:
-                y = self._overlapped(x, idx, wait=ka, w=w)
-                if y is None:
-                    self.pool.ensure(uniq, wait=ka)
-                    y = switch_forward(x, mx.array(self._remap(idx)),
-                                       self.pool.pool, self.pool.qparams,
-                                       self.pool.act,
-                                       escales=self._esc(
-                                           idx.astype(np.uint32)), weights=w)
-                if ka is not None:
-                    # Dispatch the layer's experts now, so the GPU starts on
-                    # them while the host builds the rest of the layer.
-                    mx.async_eval(y)
-                return y
+        if not decode:
             self.pool.ensure(uniq)
             return self._pooled(x, idx, self._remap(idx), w)
-
-        if sweep:
-            return self._expert_sweep(x, idx, w)
-
-        # Legacy chunked prefill: process position slices whose expert union
-        # fits. Each slice's output MUST be materialized before the next
-        # slice's ensure() mutates pool slots (the gather graph reads pool
-        # buffers in place); mx.eval per slice enforces that.
-        b, t, k = idx.shape
-        flat = idx.reshape(-1, k)                     # [P, k], P = B*T
-        x_flat = x.reshape(1, -1, x.shape[-1])        # [1, P, D]
-        outs = []
-        s, P = 0, flat.shape[0]
-        while s < P:
-            union: set = set()
-            e = s
-            while e < P:
-                nxt = union | set(flat[e].tolist())
-                if len(nxt) > self.pool.n_slots:
-                    break
-                union = nxt
-                e += 1
-            if e == s:
-                raise RuntimeError(f"k > n_slots (layer {self.pool.layer})")
-            ids = list(dict.fromkeys(flat[s:e].reshape(-1).tolist()))
-            self.pool.ensure(ids)
-            sl = self._remap(flat[s:e])[None]         # [1, T', k]
-            y = switch_forward(x_flat[:, s:e], mx.array(sl),
-                               self.pool.pool, self.pool.qparams,
-                               self.pool.act,
-                               escales=self._esc(flat[s:e][None]
-                                                 .astype(np.uint32)),
-                               weights=None if w is None
-                               else w.reshape(-1, k)[s:e][None])
-            mx.eval(y)
-            outs.append(y)
-            s = e
-        y = mx.concatenate(outs, axis=1)              # [1, P, k, D_out]
-        return y.reshape(b, t, k, y.shape[-1])
+        # Decode reads wait with the GPU kept busy (see pool._GpuKeepalive).
+        ka = keepalive_wait if KEEPALIVE else None
+        y = self._overlapped(x, idx, wait=ka, w=w)
+        if y is None:
+            self.pool.ensure(uniq, wait=ka)
+            y = switch_forward(x, mx.array(self._remap(idx)), self.pool.pool,
+                               self.pool.qparams, self.pool.act,
+                               escales=self._esc(idx.astype(np.uint32)),
+                               weights=w)
+        if ka is not None:
+            # Dispatch the layer's experts now, so the GPU starts on them
+            # while the host builds the rest of the layer.
+            mx.async_eval(y)
+        return y
 
 
 def _moe_block(layer):
