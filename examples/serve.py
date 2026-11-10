@@ -5,7 +5,7 @@ with streamlx: trunk resident, experts streamed from SSD on demand.
 
   python examples/serve.py --budget-gib 16 \
       --model <local-model-dir> --port 8080 [--trust-remote-code] \
-      [--warmstart-trace trace.npz] [--tokenizer-config key=json ...] \
+      [--tokenizer-config key=json ...] \
       [--resident] [--prompt-cache-gib N] [--mlx-cache-gib N] \
       [--kv-cache-dir DIR [--kv-cache-gib N]] \
       [--draft-head DIR [--draft-k 4] [--stream-draft-head]] \
@@ -87,11 +87,10 @@ from mlx_lm.models.cache import can_trim_prompt_cache
 from streamlx import attention
 from streamlx import integrate as _integrate
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
-                                pool_bytes, prefill_cache, preload_popular,
-                                resize_pools)
+                                pool_bytes, prefill_cache, resize_pools)
 from streamlx.kvcache import PagedPromptCache
 
-_CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
+_CFG = {"budget_bytes": 8 * 2**30, "trust": False,
         "tokenizer_config": {}, "resident": None,
         "prompt_cache_bytes": 4 * 2**30, "draft_head": None, "draft_k": 4,
         "memory_bytes": 0, "mlx_cache_bytes": 2 * 2**30,
@@ -561,11 +560,6 @@ class StreamingModelProvider(srv.ModelProvider):
         print(f"[streamlx] trunk loaded in {time.time()-t0:.1f}s; "
               f"{len(pools)} pools, {slots} slots "
               f"({_CFG['budget_bytes']/2**30:.1f} GiB)", file=sys.stderr)
-        if _CFG["warmstart_trace"]:
-            t0 = time.time()
-            preload_popular(pools, _CFG["warmstart_trace"])
-            print(f"[streamlx] warm-start: {reader.bytes_read/1e9:.1f} GB "
-                  f"in {time.time()-t0:.1f}s", file=sys.stderr)
         self.pools = pools
         self.reader = reader
         _STATE["pools"], _STATE["reader"] = pools, reader
@@ -620,7 +614,6 @@ def _auto_prompt_cache_bytes(ram: int, budget: int) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--budget-gib", type=float, default=8.0)
-    ap.add_argument("--warmstart-trace", default=None)
     ap.add_argument("--trust-remote-code", action="store_true")
     ap.add_argument("--tokenizer-config", action="append", default=[],
                     metavar="KEY=JSON",
@@ -664,7 +657,6 @@ def main() -> None:
                          "will grow to, from earlier requests' peaks")
     ours, rest = ap.parse_known_args()
     _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
-    _CFG["warmstart_trace"] = ours.warmstart_trace
     _CFG["trust"] = ours.trust_remote_code
     _CFG["draft_head"], _CFG["draft_k"] = ours.draft_head, ours.draft_k
     _CFG["stream_head"] = ours.stream_draft_head

@@ -93,7 +93,6 @@ class StreamingSwitchGLU(nn.Module):
     def __init__(self, pool: StreamingSwitchMLP):
         super().__init__()
         self.pool = pool
-        self.record_sink = None  # optional: list collecting (layer, idx np)
         # A chunk that routes more experts than the pool holds is swept
         # (_expert_sweep), this many experts a batch.
         self.sweep_batch = int(os.environ.get("STREAMLX_SWEEP_BATCH", "16"))
@@ -526,14 +525,10 @@ class StreamingSwitchGLU(nn.Module):
         if hint is not None and decode:
             idx = (np.array(indices) if hint.idx is None
                    else hint.idx.reshape(indices.shape))
-            if self.record_sink is not None:
-                self.record_sink.append((self.pool.layer, idx.copy()))
             return self._stream_forward(x, idx, hint.rows, w)
         idx = np.array(indices)  # materializes the gate's selection (sync)
         if not decode and _PREFILL["cache"] is not None:
             self._own_cache_states()
-        if self.record_sink is not None:
-            self.record_sink.append((self.pool.layer, idx.copy()))
         uniq = list(dict.fromkeys(idx.reshape(-1).tolist()))
         if len(uniq) > self.pool.n_slots:
             return self._expert_sweep(x, idx, w)
@@ -894,39 +889,6 @@ def stream_moe_blocks(module, index: SafetensorsIndex, reader: ExpertReader,
         _wrap(layer, mlp, pool)
         pools[key0 + i] = pool
     return pools
-
-
-def preload_popular(pools: dict, trace_npz: str) -> int:
-    """Warm-start each pool with its layer's most-popular experts (measured
-    skew); sorted id order => semi-sequential reads.
-
-    Trace axis -> model layer comes from the sidecar's layer_ids (models with
-    dense layers, e.g. kimi_linear layer 0, are NOT axis-identity)."""
-    import json
-    from pathlib import Path
-
-    d = np.load(trace_npz)
-    e = d["experts"]
-    p = Path(trace_npz)
-    side = p.parent / (p.stem + ".meta.json")
-    if side.exists():
-        layer_ids = json.loads(side.read_text())["layer_ids"]
-    else:
-        layer_ids = list(range(e.shape[1]))
-    axis_of = {int(lid): i for i, lid in enumerate(layer_ids)}
-    total = 0
-    for lid, pool in pools.items():
-        ax = axis_of.get(lid)
-        if ax is None:
-            continue
-        hist = np.bincount(e[:, ax, :].ravel(), minlength=pool.n_experts)
-        top = np.argsort(hist)[::-1][: pool.n_slots]
-        pool.ensure(sorted(int(x) for x in top))
-        # Slice-updates from ensure() are lazy; eval per pool so buffers are
-        # real before another thread (multi-threaded hosts) reads them.
-        mx.eval([t for proj in pool.pool.values() for t in proj.values()])
-        total += len(top)
-    return total
 
 
 def aggregate_stats(pools: dict) -> dict:

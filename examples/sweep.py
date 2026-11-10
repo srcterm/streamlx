@@ -1,8 +1,7 @@
 """Pool-budget sweep: measured tok/s, miss rate, and memory vs expert budget.
 
   python examples/sweep.py --model <local-model-dir> --budget-gib 12 \
-      [--warmup 96] [--measure 192] [--warmstart-trace t.npz] \
-      [--trust-remote-code] [--out sweep.csv]
+      [--warmup 96] [--measure 192] [--trust-remote-code] [--out sweep.csv]
 """
 
 from __future__ import annotations
@@ -18,14 +17,13 @@ import mlx.core as mx
 
 from mlx_lm.models.cache import make_prompt_cache
 
-from streamlx.integrate import (aggregate_stats, load_streaming_model,
-                                preload_popular)
+from streamlx.integrate import aggregate_stats, load_streaming_model
 
 PROMPT = ("The tradeoff between memory bandwidth and storage bandwidth in "
           "local inference of mixture-of-experts models is")
 
-CSV_FIELDS = ["ts", "budget_gib", "slots_total", "trunk_load_s", "preload_s",
-              "preload_gb", "warmup_tokens", "measured_tokens", "tok_s",
+CSV_FIELDS = ["ts", "budget_gib", "slots_total", "trunk_load_s",
+              "warmup_tokens", "measured_tokens", "tok_s",
               "miss_rate", "miss_mb_per_token", "fetch_ms_per_expert",
               "fetch_bw_gbs", "peak_rss_gb", "mlx_peak_gb", "notes"]
 
@@ -39,7 +37,6 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True)
     ap.add_argument("--budget-gib", type=float, required=True)
-    ap.add_argument("--warmstart-trace", default=None)
     ap.add_argument("--warmup", type=int, default=96)
     ap.add_argument("--measure", type=int, default=192)
     ap.add_argument("--out", default="sweep.csv")
@@ -54,15 +51,6 @@ def main() -> int:
     slots_total = sum(p.n_slots for p in pools.values())
     print(f"[sweep] {args.budget_gib} GiB: trunk in {trunk_s:.1f}s, "
           f"{len(pools)} pools, {slots_total} slots", file=sys.stderr)
-
-    preload_s = preload_gb = 0.0
-    if args.warmstart_trace:
-        t0 = time.time()
-        preload_popular(pools, args.warmstart_trace)
-        preload_s = time.time() - t0
-        preload_gb = reader.bytes_read / 1e9
-        print(f"[sweep] warm-start: {preload_gb:.1f} GB in {preload_s:.1f}s",
-              file=sys.stderr)
 
     cache = make_prompt_cache(model)
     for pid in tokenizer.encode(PROMPT):
@@ -89,8 +77,7 @@ def main() -> int:
                 if st["fetch_s"] else 0.0)
     row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
            "budget_gib": args.budget_gib, "slots_total": slots_total,
-           "trunk_load_s": round(trunk_s, 1), "preload_s": round(preload_s, 1),
-           "preload_gb": round(preload_gb, 2), "warmup_tokens": args.warmup,
+           "trunk_load_s": round(trunk_s, 1), "warmup_tokens": args.warmup,
            "measured_tokens": args.measure, "tok_s": round(tok_s, 2),
            "miss_rate": round(st["miss_rate"], 4),
            "miss_mb_per_token": round(miss_mb, 1),
