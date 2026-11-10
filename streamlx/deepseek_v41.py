@@ -60,13 +60,12 @@ from mlx_vlm.models.deepseek_v41.language import (DeepseekV41Block,
                                                   DeepseekV41Cache, hc_expand,
                                                   make_identity_pre_mix)
 
-from .pipeline_adapters import capture_layer_outputs
-from .stindex import default_group_size
+from .pipeline_adapters import StandardMoEAdapter, capture_layer_outputs
+from .stindex import DS_PROJ as _W, default_group_size
 
 # what the server's prompt cache bounds itself with
 DeepseekV41Cache.nbytes = property(lambda c: cache_nbytes(c.state))
 
-_W = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 _ROUTED = re.compile(r"\.experts\.(w[123])\.")
 _EMBED_KEY = "language_model.embed.weight"
 HANDOFF = ("index_k", "candidates", "compress_kv", "topk_idxs")
@@ -267,9 +266,8 @@ class V41View:
         self.entry, self.layer = entry, layer
 
 
-class V41Adapter:
-    exact_routing = True          # begin() routes with the MoE's own gate
-
+class V41Adapter(StandardMoEAdapter):
+    # begin() routes with the MoE's own gate (exact_routing)
     def __init__(self, model, drafter=None):
         self.model = model
         self.lm = model.language_model
@@ -337,11 +335,6 @@ class V41Adapter:
 
     def logits(self, h):
         return self.lm.head(self.lm.norm(h))
-
-    def draft_hidden(self, h, pos):
-        if not self.taps:
-            return h
-        return mx.concatenate([pos.taps[i] for i in self.tap_layers], axis=-1)
 
     # -- the layer split ---------------------------------------------------
     def _attention(self, layer, x, e, pos):
@@ -425,23 +418,10 @@ class V41Adapter:
             [mx.mean(mx.concatenate(got[i], axis=1), axis=2) for i in prev],
             axis=-1)
 
-    # -- drafting ----------------------------------------------------------
-    def reset_drafter(self):
-        if self.drafter is not None:
-            self.drafter.reset()
-
-    def prime_pairs(self, hidden, next_ids):
-        if self.drafter is not None:
-            self.drafter.prime_pairs(hidden, next_ids)
-
+    # -- drafting (the rest is StandardMoEAdapter's) -------------------------
     def feed_pairs(self, pairs):
         if self.drafter is not None and pairs:
             self.drafter.prime_pairs(
                 None if pairs[0][0] is None
                 else mx.concatenate([h for h, _ in pairs], 1),
                 mx.array([[t for _, t in pairs]]))
-
-    def draft(self, pairs, depth):
-        if self.drafter is None:
-            return [], []
-        return self.drafter.draft(pairs, depth)

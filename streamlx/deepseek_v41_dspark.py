@@ -37,9 +37,8 @@ from mlx_vlm.models.deepseek_v41.language import (DeepseekV41Block,
 
 from .integrate import _wrap
 from .pool import StreamingSwitchMLP
-from .stindex import default_group_size
+from .stindex import DS_PROJ as _W, default_group_size
 
-_W = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 _HEADS = ("main_proj", "main_norm", "norm", "markov_head", "confidence_head")
 
 

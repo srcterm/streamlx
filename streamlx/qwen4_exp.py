@@ -23,7 +23,6 @@ finish() runs the MoE and the inject, both with the block's own modules.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import tempfile
@@ -42,7 +41,7 @@ from mlx_vlm.models.qwen4_exp.ple_storage import (PLE_MARKER,
                                                   build_quantized_ple_manifest)
 
 from .pipeline_adapters import StandardMoEAdapter, _find_switch
-from .reader import F_NOCACHE, F_RDAHEAD
+from .reader import open_nocache
 
 
 def _route(blk, x):
@@ -79,12 +78,7 @@ class _PreadRows:
                 a = arrays[name]
                 fd = fds.get(a.filename)
                 if fd is None:
-                    fd = fds[a.filename] = os.open(a.filename, os.O_RDONLY)
-                    try:
-                        fcntl.fcntl(fd, F_NOCACHE, 1)
-                        fcntl.fcntl(fd, F_RDAHEAD, 0)
-                    except OSError:
-                        pass
+                    fd = fds[a.filename] = open_nocache(a.filename)
                 parts.append((fd, a.offset, a.shape[1] * a.dtype.itemsize,
                               a.dtype))
             self.starts.append(start)
@@ -190,9 +184,7 @@ def _ple_rows(lm, root: Path) -> None:
     """The PLE stores' row reads (_PreadRows) and the oQ table scale."""
     wmap = json.loads((root / "model.safetensors.index.json").read_text())[
         "weight_map"]
-    for i, layer in enumerate(lm.model.layers):
-        if "ple" not in layer:
-            continue
+    for i, layer in _ple_layers(lm.model.layers):
         emb = layer.ple.ple_embedding
         store = emb.ngram_embedding
         if (getattr(store, "cache_rows", None) == 0

@@ -26,6 +26,18 @@ from .stindex import PROJS, SafetensorsIndex, TensorLoc
 F_NOCACHE = getattr(fcntl, "F_NOCACHE", 48)
 F_RDAHEAD = getattr(fcntl, "F_RDAHEAD", 45)
 
+
+def open_nocache(path) -> int:
+    """A read-only fd with the page cache and read-ahead turned off."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fcntl.fcntl(fd, F_NOCACHE, 1)
+        fcntl.fcntl(fd, F_RDAHEAD, 0)
+    except OSError:
+        pass
+    return fd
+
+
 _NP_VIEW = {"U8": np.uint8, "U32": np.uint32, "BF16": np.uint16,
             "F16": np.float16, "F32": np.float32}
 _MX_VIEW = {"BF16": mx.bfloat16}
@@ -50,13 +62,7 @@ class ExpertReader:
         with self._fd_lock:
             fd = self._fds.get(path)
             if fd is None:
-                fd = os.open(path, os.O_RDONLY)
-                try:
-                    fcntl.fcntl(fd, F_NOCACHE, 1)
-                    fcntl.fcntl(fd, F_RDAHEAD, 0)
-                except OSError:
-                    pass
-                self._fds[path] = fd
+                fd = self._fds[path] = open_nocache(path)
             return fd
 
     # -- planning ------------------------------------------------------------

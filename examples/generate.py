@@ -21,7 +21,7 @@ V4.1 and 3 for Qwen3.8.
 from __future__ import annotations
 
 import argparse
-import subprocess
+import os
 import sys
 import time
 from pathlib import Path
@@ -39,12 +39,6 @@ PREFILL_STEP = 4096
 def model_size_gb(model_dir: str) -> float:
     return sum(f.stat().st_size
                for f in Path(model_dir).glob("*.safetensors")) / 1e9
-
-
-def ram_gb() -> float:
-    out = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"],
-                         capture_output=True, text=True).stdout.strip()
-    return int(out) / 1e9
 
 
 def main() -> int:
@@ -65,7 +59,7 @@ def main() -> int:
     args = ap.parse_args()
 
     size = model_size_gb(args.model)
-    ram = ram_gb()
+    ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
     print(f"model: {Path(args.model).name}  ({size:.0f} GB weights)")
     print(f"machine RAM: {ram:.0f} GB  |  expert budget: "
           f"{args.budget_gib:.0f} GiB\n")
