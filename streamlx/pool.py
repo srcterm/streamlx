@@ -167,18 +167,9 @@ class StreamingSwitchMLP:
 
         self.pool = {p: {part: alloc(self.triples_loc[p][part])
                          for part in self.parts} for p in PROJS}
+        # expert -> slot, the least recently used first (the next to go)
         self.id2slot: OrderedDict[int, int] = OrderedDict()
         self.free = list(range(n_slots))
-        # Eviction policy: "lru" (default) or "s3fifo" (F19: -9..-12% misses
-        # on Laguna — small FIFO filters one-hit wonders, ghost queue rescues
-        # repeaters). Policy only decides WHICH expert loses its slot; the
-        # arithmetic never changes.
-        self.policy = os.environ.get("STREAMLX_EVICT", "lru")
-        self.n_small = max(1, int(n_slots * 0.1))
-        self.n_main = max(1, n_slots - self.n_small)
-        self.q_small: OrderedDict[int, int] = OrderedDict()  # expert -> freq
-        self.q_main: OrderedDict[int, int] = OrderedDict()
-        self.q_ghost: OrderedDict[int, bool] = OrderedDict()
         # expert id -> slot, SENTINEL when absent; enables in-graph-free
         # vectorized remap in the wrapper (numpy take, no per-id dict walk)
         self.SENTINEL = np.uint32(0xFFFFFFFF)
@@ -202,63 +193,12 @@ class StreamingSwitchMLP:
         self.pf_agree_tot = 0    # |actual| accumulator
         self.pf_rank = {}        # confidence rank -> [launched, used]
 
-    def _policy_hit(self, e: int) -> None:
-        if self.policy == "s3fifo":
-            q = self.q_small if e in self.q_small else self.q_main
-            q[e] = min(3, q[e] + 1)
-        else:
-            self.id2slot.move_to_end(e)
-
-    def _s3_evict_main(self) -> int:
-        """Pop main's first zero-freq entry (decrement-and-recycle heads),
-        per sim/policy_ab.py run_s3fifo."""
-        while self.q_main:
-            e, f = self.q_main.popitem(last=False)
-            if f > 0:
-                self.q_main[e] = f - 1
-                continue
-            return e
-        raise RuntimeError("s3fifo: empty main on eviction")
-
-    def _s3_insert(self, e: int) -> int | None:
-        """Register e in its queue; return the evicted expert, or None when
-        queue capacity allowed the insert without one (a free physical slot
-        is guaranteed to exist in that case)."""
-        if e in self.q_ghost:
-            del self.q_ghost[e]
-            victim = (self._s3_evict_main()
-                      if len(self.q_main) >= self.n_main else None)
-            self.q_main[e] = 0
-            return victim
-        victim = None
-        if len(self.q_small) >= self.n_small:
-            e2, f = self.q_small.popitem(last=False)
-            if f > 0:                      # proved itself: promote to main
-                if len(self.q_main) >= self.n_main:
-                    victim = self._s3_evict_main()
-                self.q_main[e2] = 0
-            else:                          # one-hit wonder: ghost it
-                if len(self.q_ghost) >= self.n_main:
-                    self.q_ghost.popitem(last=False)
-                self.q_ghost[e2] = True
-                victim = e2
-        self.q_small[e] = 0
-        return victim
-
     def _take_slot_for(self, e: int) -> int:
-        """Free a physical slot per the eviction policy and bind it to e."""
-        if self.policy == "s3fifo":
-            victim = self._s3_insert(e)
-            if victim is not None:
-                slot = self.id2slot.pop(victim)
-                self.slot_table[victim] = self.SENTINEL
-                self.evictions += 1
-                self.free.append(slot)
-            slot = self.free.pop()
-        elif self.free:
+        """A slot for e: a free one, else the least recently used expert's."""
+        if self.free:
             slot = self.free.pop()
         else:
-            old_id, slot = self.id2slot.popitem(last=False)  # LRU head
+            old_id, slot = self.id2slot.popitem(last=False)
             self.slot_table[old_id] = self.SENTINEL
             self.evictions += 1
         self.id2slot[e] = slot
@@ -268,8 +208,8 @@ class StreamingSwitchMLP:
     def ensure(self, ids: list[int], wait=None) -> list[int]:
         """Return slot ids for `ids` (touch order = given order, like the sim).
 
-        Misses are slot-assigned in order (eviction policy above, identical
-        semantics to the simulator) but FETCHED as one coalesced batch —
+        Misses are slot-assigned in order (LRU, identical semantics to the
+        simulator) but FETCHED as one coalesced batch —
         eviction decisions never depend on fetch timing, so miss counts stay
         sim-exact while IO gets span-merged + threaded (M4 coalescing).
         `wait`, when given, blocks on the batch's read futures in place of a
@@ -279,7 +219,7 @@ class StreamingSwitchMLP:
         missing: list[int] = []
         for e in ids:
             if e in self.id2slot:
-                self._policy_hit(e)
+                self.id2slot.move_to_end(e)
                 self.hits += 1
             else:
                 self.misses += 1
@@ -301,19 +241,10 @@ class StreamingSwitchMLP:
     def resident(self, e: int) -> bool:
         return e in self.id2slot
 
-    def _coldest(self, n: int) -> list[int]:
-        """The n experts the policy would evict first: the LRU order, or
-        s3fifo's small queue then its main queue, each oldest first."""
-        if n <= 0:
-            return []
-        if self.policy == "s3fifo":
-            return (list(self.q_small) + list(self.q_main))[:n]
-        return list(self.id2slot)[:n]
-
     def resize(self, n_slots: int) -> int:
         """Change the slot count, within [min_slots, the layer's experts].
-        Fewer slots: the experts the policy would evict first lose theirs and
-        the rest move into the first slots; more: free slots are added. Kept
+        Fewer slots: the least recently used experts lose theirs and the
+        rest move into the first slots; more: free slots are added. Kept
         experts' bytes are copied unchanged and only which experts are
         resident changes, so outputs don't. Call it with nothing in flight
         on the pool (between requests). Returns the new count."""
@@ -321,11 +252,9 @@ class StreamingSwitchMLP:
         if n == self.n_slots:
             return n
         if n < self.n_slots:
-            for e in self._coldest(len(self.id2slot) - n):
+            for e in list(self.id2slot)[:max(0, len(self.id2slot) - n)]:
                 self.id2slot.pop(e)
                 self.slot_table[e] = self.SENTINEL
-                self.q_small.pop(e, None)
-                self.q_main.pop(e, None)
                 self.evictions += 1
             used = {slot: e for e, slot in self.id2slot.items()}
             free = [t for t in range(n) if t not in used]
@@ -354,8 +283,6 @@ class StreamingSwitchMLP:
                     self.pool[proj][part] = a
             self.free.extend(range(self.n_slots, n))
         self.n_slots = n
-        self.n_small = max(1, int(n * 0.1))
-        self.n_main = max(1, n - self.n_small)
         return n
 
     def touch(self, ids: list[int]) -> None:
@@ -367,7 +294,7 @@ class StreamingSwitchMLP:
         budget); below that, touch-first merely avoids a double fetch.
         """
         for e in ids:
-            self._policy_hit(e)
+            self.id2slot.move_to_end(e)
             self.hits += 1
 
     # Confidence cut: rank-vs-usefulness measured on Laguna decode (12 GiB,
@@ -444,7 +371,7 @@ class StreamingSwitchMLP:
         the LRU head when full); no hit/miss accounting — adoptions are free.
         """
         if e in self.id2slot:
-            self._policy_hit(e)
+            self.id2slot.move_to_end(e)
             slot = self.id2slot[e]
         else:
             slot = self._take_slot_for(e)

@@ -322,7 +322,7 @@ class PipelinedDecoder:
             # then the new rows into the least recent slots
             for e in keep:
                 if e in pool.id2slot:
-                    pool._policy_hit(e)
+                    pool.id2slot.move_to_end(e)
             new = [e for e in keep if e not in pool.id2slot and e in held]
             for e in new:
                 pool.adopt(e, held[e].rows[e])

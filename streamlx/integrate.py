@@ -527,7 +527,7 @@ class StreamingSwitchGLU(nn.Module):
             for e in ids:
                 if e in warm_ids:
                     if e in pool.id2slot:   # adopt() would rewrite its bytes
-                        pool._policy_hit(e)
+                        pool.id2slot.move_to_end(e)
                     else:
                         pool.adopt(e, rows[e])
         if warm_ids:
