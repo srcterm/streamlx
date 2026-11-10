@@ -14,7 +14,6 @@ fundamental gate-then-fetch dependency of expert streaming.
 from __future__ import annotations
 
 import os
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -637,33 +636,6 @@ def _link_next_layers(model, pools: dict) -> None:
         a._next = b
 
 
-def plan_residency(layers: list, bpe: dict, n_exp: dict,
-                   budget_bytes: int, k: int) -> tuple[set, float]:
-    """Greedy water-fill: a layer goes FULLY RESIDENT when the fair share of
-    the remaining budget covers all its experts (cheapest layer first, freed
-    surplus cascades), provided every still-streamed layer keeps at least k
-    slots. Fully-resident layers keep their stock SwitchGLU: no gate sync,
-    no remap, no pool — the streaming wrapper never touches them.
-
-    Self-selecting by regime: fetch-dominated models (budget << expert
-    bytes, e.g. Laguna at 16-18 GiB) qualify no layers and are unchanged;
-    overhead-dominated ones (budget ~ expert bytes, e.g. Qwen3.6 at 20 GiB)
-    cascade to fully resident. Uniform-width models flip near budget ==
-    total expert bytes; mixed-width models (dense-first, varying widths) go
-    partial. Returns (resident layer set, budget left for pools)."""
-    resident: set = set()
-    streamed = list(layers)
-    left = float(budget_bytes)
-    for i in sorted(layers, key=lambda j: n_exp[j] * bpe[j]):
-        full = n_exp[i] * bpe[i]
-        min_rest = sum(k * bpe[j] for j in streamed if j != i)
-        if left / len(streamed) >= full and left - full >= min_rest:
-            resident.add(i)
-            streamed.remove(i)
-            left -= full
-    return resident, left
-
-
 def _vlm_export_shim(model_dir: str) -> dict | None:
     """mlx-vlm exports of text-only models prefix every tensor AND every
     per-path quantization override with "language_model.", which stock
@@ -762,13 +734,12 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
                          k: int | None = None,
                          trust_remote_code: bool = False,
                          tokenizer_config: dict | None = None,
-                         resident: str | None = None,
                          model_config: dict | None = None,
                          loader=None):
     """Load with lazy=True, wrap MoE layers, materialize ONLY the trunk.
 
     The replaced SwitchGLU modules are dropped before any eval, so expert
-    tensors are never materialized — resident memory = trunk + pools. Budget
+    tensors are never materialized: resident memory = trunk + pools. Budget
     is split per layer by that layer's actual expert byte size (same
     equal-bytes policy as sim/lru_sim.py). Every streamed layer keeps at
     least k slots (default: the model's experts per token, which one decode
@@ -804,35 +775,17 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
     moe_layers = [i for i, l in enumerate(model.layers)
                   if _moe_block(l) is not None]
     bpe = {i: index.layer_expert_bytes(i) for i in moe_layers}
-    n_exp = {i: index.switch_triples(i)["gate_proj"]["weight"].shape[0]
-             for i in moe_layers}
-    # Residency is OPT-IN ("auto"): it trades RAM headroom (KV cache for
-    # long agent/coding contexts) for speed, so the streaming default stays
-    # predictable. serve.py exposes it as --resident.
-    mode = resident if resident is not None else os.environ.get(
-        "STREAMLX_RESIDENT", "off")
-    res_layers: set = set()
-    budget_left = float(budget_bytes)
-    if mode not in ("off", "0"):
-        res_layers, budget_left = plan_residency(moe_layers, bpe, n_exp,
-                                                 budget_bytes, k)
-    streamed = [i for i in moe_layers if i not in res_layers]
     pools: dict[int, StreamingSwitchMLP] = {}
-    for i in streamed:
-        slots = max(k, int(budget_left / len(streamed) / bpe[i]))
+    for i in moe_layers:
+        slots = max(k, int(budget_bytes / len(moe_layers) / bpe[i]))
         pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
                                   reader=reader)
         _wrap(model.layers[i], _moe_block(model.layers[i]), pool)
         pool.min_slots = min(k, pool.n_experts)
         pools[i] = pool
     _link_next_layers(model, pools)
-    if res_layers:
-        rb = sum(n_exp[i] * bpe[i] for i in res_layers) / 2**30
-        print(f"[streamlx] {len(res_layers)} fully-resident MoE layers "
-              f"({rb:.1f} GiB, stock path); {len(streamed)} streamed",
-              file=sys.stderr)
-    # trunk + any fully-resident layers; streamed experts were replaced
-    # before eval and never materialize
+    # the trunk: the experts' modules were replaced before any eval and
+    # never materialize
     mx.eval(model.parameters())
     # Pool slot buffers are plain-object attrs, invisible to parameters();
     # eval them on the loader thread so multi-threaded hosts never touch

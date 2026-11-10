@@ -6,7 +6,7 @@ with streamlx: trunk resident, experts streamed from SSD on demand.
   python examples/serve.py --budget-gib 16 \
       --model <local-model-dir> --port 8080 [--trust-remote-code] \
       [--tokenizer-config key=json ...] \
-      [--resident] [--prompt-cache-gib N] [--mlx-cache-gib N] \
+      [--prompt-cache-gib N] [--mlx-cache-gib N] \
       [--kv-cache-dir DIR [--kv-cache-gib N]] \
       [--draft-head DIR [--draft-k 4] [--stream-draft-head]] \
       [--memory-gib N] [--prefill-memory-gib N]
@@ -90,8 +90,7 @@ from streamlx.integrate import (aggregate_stats, load_streaming_model,
                                 pool_bytes, prefill_cache, resize_pools)
 from streamlx.kvcache import PagedPromptCache
 
-_CFG = {"budget_bytes": 8 * 2**30, "trust": False,
-        "tokenizer_config": {}, "resident": None,
+_CFG = {"budget_bytes": 8 * 2**30, "trust": False, "tokenizer_config": {},
         "prompt_cache_bytes": 4 * 2**30, "draft_head": None, "draft_k": 4,
         "memory_bytes": 0, "mlx_cache_bytes": 2 * 2**30,
         "prefill_cache_bytes": 0, "stream_head": False}
@@ -554,8 +553,7 @@ class StreamingModelProvider(srv.ModelProvider):
         model, tokenizer, pools, reader = load_streaming_model(
             str(model_path), _CFG["budget_bytes"],
             trust_remote_code=_CFG["trust"],
-            tokenizer_config=_CFG["tokenizer_config"],
-            resident=_CFG["resident"])
+            tokenizer_config=_CFG["tokenizer_config"])
         slots = sum(p.n_slots for p in pools.values())
         print(f"[streamlx] trunk loaded in {time.time()-t0:.1f}s; "
               f"{len(pools)} pools, {slots} slots "
@@ -619,10 +617,6 @@ def main() -> None:
                     metavar="KEY=JSON",
                     help="extra tokenizer kwarg, repeatable "
                          "(e.g. fix_mistral_regex=true)")
-    ap.add_argument("--resident", action="store_true",
-                    help="let fully-covered MoE layers stay on the stock "
-                         "resident path (faster; trades RAM headroom that "
-                         "long contexts need for KV cache)")
     ap.add_argument("--prompt-cache-gib", type=float, default=None,
                     help="byte cap for the server's prompt-cache LRU "
                          "(default: RAM - budget - 12 GiB, clamped to "
@@ -660,8 +654,6 @@ def main() -> None:
     _CFG["trust"] = ours.trust_remote_code
     _CFG["draft_head"], _CFG["draft_k"] = ours.draft_head, ours.draft_k
     _CFG["stream_head"] = ours.stream_draft_head
-    if ours.resident:
-        _CFG["resident"] = "auto"
     try:
         ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (ValueError, OSError):
