@@ -1,14 +1,14 @@
 """pread-based expert fetcher with range coalescing.
 
-Miss path per notes/phase3-design.md: MLX lazy loading is tensor-granular
-(F10), so expert rows are read directly by byte range. Coalescing (M4):
-requests are planned per shard, sorted by offset, and merged into spans when
-adjacent or within --merge-gap; spans are read concurrently by a small thread
-pool (latency hiding for the many ~33 KB scales/biases rows — the device is
-throughput-flat across QD but small reads are latency-bound, F7).
+The miss path: MLX lazy loading is tensor-granular, so expert rows are read
+directly by byte range. Coalescing: requests are planned per shard, sorted by
+offset, and merged into spans when adjacent or within merge_gap; spans are
+read concurrently by a small thread pool (latency hiding for the many small
+scales/biases rows — the device is throughput-flat across queue depths but
+small reads are latency-bound).
 
-F_NOCACHE is set as declared intent, but per F5 (macOS 26.3) reads populate
-the page cache anyway — treated as a free reclaimable L2.
+F_NOCACHE is set as declared intent, but reads populate the page cache
+anyway (macOS 26.3) — a free reclaimable second level.
 """
 
 from __future__ import annotations
@@ -25,6 +25,18 @@ from .stindex import PROJS, SafetensorsIndex, TensorLoc
 
 F_NOCACHE = getattr(fcntl, "F_NOCACHE", 48)
 F_RDAHEAD = getattr(fcntl, "F_RDAHEAD", 45)
+
+
+def open_nocache(path) -> int:
+    """A read-only fd with the page cache and read-ahead turned off."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fcntl.fcntl(fd, F_NOCACHE, 1)
+        fcntl.fcntl(fd, F_RDAHEAD, 0)
+    except OSError:
+        pass
+    return fd
+
 
 _NP_VIEW = {"U8": np.uint8, "U32": np.uint32, "BF16": np.uint16,
             "F16": np.float16, "F32": np.float32}
@@ -44,20 +56,13 @@ class ExpertReader:
         self._workers = workers
         self._ex = ThreadPoolExecutor(max_workers=workers)
         self.bytes_read = 0      # actual bytes off the device (incl. gap waste)
-        self.useful_bytes = 0    # bytes delivered to the pool
         self.reads = 0           # preads issued (post-merge)
 
     def _fd(self, path: str) -> int:
         with self._fd_lock:
             fd = self._fds.get(path)
             if fd is None:
-                fd = os.open(path, os.O_RDONLY)
-                try:
-                    fcntl.fcntl(fd, F_NOCACHE, 1)
-                    fcntl.fcntl(fd, F_RDAHEAD, 0)
-                except OSError:
-                    pass
-                self._fds[path] = fd
+                fd = self._fds[path] = open_nocache(path)
             return fd
 
     # -- planning ------------------------------------------------------------
@@ -78,13 +83,12 @@ class ExpertReader:
             spans.append((path, off, n, [(key, 0, n)]))
         return spans
 
-    def read_ranges(self, requests, wait=None, convert=None) -> dict:
-        """[(key, path, off, n)] -> {key: memoryview of exactly n bytes}.
-        `wait`, when given, is called with the read futures before they are
-        harvested (it must return only once all of them are done).
-        `convert(key, view)`, when given, runs on the reading thread right
-        after its span arrives and its result is returned instead of the
-        view (the expert arrays are built off the compute thread)."""
+    def read_ranges(self, requests, convert, wait=None) -> dict:
+        """[(key, path, off, n)] -> {key: convert(key, view of its n bytes)}.
+        convert runs on the reading thread right after its span arrives (the
+        expert arrays are built off the compute thread). `wait`, when given,
+        is called with the read futures before they are harvested (it must
+        return only once all of them are done)."""
         spans = self._plan(requests)
 
         def read_span(span):
@@ -92,11 +96,9 @@ class ExpertReader:
             buf = os.pread(self._fd(path), n, off)
             if len(buf) != n:
                 raise IOError(f"short read {len(buf)}/{n} at {off} of {path}")
-            if convert is not None:            # the bytes go once converted
-                view = memoryview(buf)
-                return n, members, {key: convert(key, view[rel:rel + m])
-                                    for key, rel, m in members}
-            return buf, members, None
+            view = memoryview(buf)             # the bytes go once converted
+            return n, {key: convert(key, view[rel:rel + m])
+                       for key, rel, m in members}
 
         def read_bucket(bucket):
             return [read_span(s) for s in bucket]
@@ -104,13 +106,10 @@ class ExpertReader:
         out: dict = {}
 
         def harvest(results):
-            for buf, members, conv in results:
-                self.bytes_read += buf if conv is not None else len(buf)
+            for n, conv in results:
+                self.bytes_read += n
                 self.reads += 1
-                view = None if conv is not None else memoryview(buf)
-                for key, rel, n in members:
-                    out[key] = conv[key] if conv is not None else view[rel:rel + n]
-                    self.useful_bytes += n
+                out.update(conv)
 
         if len(spans) > self._workers:
             # One task per worker, not per span: a decode run makes tens of
@@ -139,9 +138,6 @@ class ExpertReader:
 
     # -- expert-level API ----------------------------------------------------
 
-    def _to_mx(self, raw: memoryview, loc: TensorLoc) -> mx.array:
-        return self._viewed(self._stored(raw, loc), loc)
-
     @staticmethod
     def _stored(raw: memoryview, loc: TensorLoc) -> mx.array:
         """The bytes as an mx array of their stored dtype: a data-only array
@@ -154,30 +150,6 @@ class ExpertReader:
         """The model dtype view (bf16 is stored as uint16): a lazy op, so it
         is made on the thread that builds the compute graph."""
         return arr.view(_MX_VIEW[loc.dtype]) if loc.dtype in _MX_VIEW else arr
-
-    def read_experts_raw(self, layer_triples: dict, ids: list[int],
-                         wait=None) -> dict:
-        """{(e, proj, part): memoryview} — raw bytes only, one coalesced
-        batch. Safe from any thread: no mx arrays are created (mx arrays are
-        stream-bound to the creating thread)."""
-        requests = []
-        for e in ids:
-            for proj in PROJS:
-                for part in layer_triples[proj]:
-                    loc = layer_triples[proj][part]
-                    path, off, n = loc.expert_range(e)
-                    requests.append(((e, proj, part), path, off, n))
-        return self.read_ranges(requests, wait=wait)
-
-    def experts_from_raw(self, layer_triples: dict, ids: list[int],
-                         raw: dict) -> dict:
-        """Materialize {e: {proj: {part: mx.array}}} from raw bytes.
-        Must run on the thread that will build the compute graph."""
-        return {e: {proj: {part: self._to_mx(raw[(e, proj, part)],
-                                             layer_triples[proj][part])
-                           for part in layer_triples[proj]}
-                    for proj in PROJS}
-                for e in ids}
 
     def read_experts_arrays(self, layer_triples: dict, ids: list[int],
                             wait=None) -> dict:
@@ -194,8 +166,7 @@ class ExpertReader:
                     requests.append(((e, proj, part), path, off, n))
                     locs[(e, proj, part)] = loc
         return self.read_ranges(
-            requests, wait=wait,
-            convert=lambda key, view: self._stored(view, locs[key]))
+            requests, lambda key, view: self._stored(view, locs[key]), wait)
 
     def experts_from_arrays(self, layer_triples: dict, ids: list[int],
                             arrays: dict) -> dict:
@@ -214,12 +185,8 @@ class ExpertReader:
             layer_triples, ids,
             self.read_experts_arrays(layer_triples, ids, wait=wait))
 
-    def read_expert(self, layer_triples: dict, e: int) -> dict:
-        return self.read_experts(layer_triples, [e])[e]
-
     def reset_stats(self) -> None:
         self.bytes_read = 0
-        self.useful_bytes = 0
         self.reads = 0
 
     def close(self) -> None:

@@ -37,9 +37,8 @@ from mlx_vlm.models.deepseek_v41.language import (DeepseekV41Block,
 
 from .integrate import _wrap
 from .pool import StreamingSwitchMLP
-from .stindex import default_group_size
+from .stindex import DS_PROJ as _W, default_group_size
 
-_W = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 _HEADS = ("main_proj", "main_norm", "norm", "markov_head", "confidence_head")
 
 
@@ -147,13 +146,13 @@ class V41DSpark:
             setattr(cfg, k, raw["text_config"][k])
         self.cfg = cfg
         self.tap_layers = tuple(cfg.dspark_target_layer_ids)
-        self.block = self.depth = int(cfg.dspark_block_size)
+        self.block = int(cfg.dspark_block_size)
         self.window = int(cfg.sliding_window)
         n = int(cfg.num_nextn_predict_layers)
         self.stages = [DSparkStage(cfg, s, n, len(self.tap_layers)) for s in range(n)]
         self._load(root, spec)
-        # routed experts: pools keyed past the trunk, like MTP stages in
-        # load_streaming_model
+        # routed experts: pools keyed past the trunk (as
+        # integrate.stream_moe_blocks keys a draft head's)
         self.pools = {}
         for s, st in enumerate(self.stages):
             key = cfg.num_hidden_layers + s
@@ -243,9 +242,9 @@ class V41DSpark:
             self.pending = [tail]
             self.pos += n - self.window
 
-    def draft(self, pairs, depth, spec=None):
+    def draft(self, pairs, depth):
         if not pairs or depth <= 0:
-            return [], [], None
+            return [], []
         hs = self.pending + [h for h, _ in pairs if h is not None]
         self.pending = []
         if hs:
@@ -274,4 +273,4 @@ class V41DSpark:
             [hf[:, :n], mx.stack(embs, axis=1).astype(hf.dtype)],
             axis=-1).astype(mx.float32)))
         mx.eval(toks, conf)
-        return [int(t.item()) for t in toks], conf.reshape(-1).tolist(), None
+        return [int(t.item()) for t in toks], conf.reshape(-1).tolist()

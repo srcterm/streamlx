@@ -1,16 +1,13 @@
 """Per-layer ExpertPool: preallocated slot tensors, id->slot LRU, fetch-on-miss.
 
-Exactness basis (F9): gather_qmm over relocated expert rows with remapped
-indices is bitwise-identical to the full stacked call. The forward here is a
+Exactness basis: gather_qmm over relocated expert rows with remapped indices
+is bitwise-identical to the full stacked call. The forward here is a
 line-for-line mirror of mlx_lm SwitchGLU's decode path (no-sort branch),
-parameterized by which triples (full tensors or pool slots) it runs over —
-both the reference and the streaming path share `switch_forward`, so the ONLY
-difference under test is relocation + index remap.
+parameterized by which triples (full tensors or pool slots) it runs over.
 
-Eviction: LRU head, applied per-miss (identical semantics to sim/lru_sim.py's
-lru_layer, so measured misses cross-validate against the simulator). v1
-evicts only between steps by construction (ensure() runs before the step's
-compute graph is built). Requires n_slots >= k.
+Eviction: the least recently used expert leaves, applied per miss, only
+between steps by construction (ensure() runs before the step's compute graph
+is built). Requires n_slots >= k.
 """
 
 from __future__ import annotations
@@ -19,6 +16,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED
 from concurrent.futures import wait as _wait_all
 
 import mlx.core as mx
@@ -50,10 +48,12 @@ class _GpuKeepalive:
         self._x = mx.zeros((8,), dtype=mx.float32)
         self._inflight: list = []
 
-    def wait(self, futures) -> None:
+    def wait(self, futures, first: bool = False) -> None:
+        when = FIRST_COMPLETED if first else ALL_COMPLETED
         while True:
-            _, pending = _wait_all(futures, timeout=_KEEPALIVE_PERIOD_S)
-            if not pending:
+            done, pending = _wait_all(futures, timeout=_KEEPALIVE_PERIOD_S,
+                                      return_when=when)
+            if not pending or (first and done):
                 return
             y = self._x + 1
             mx.async_eval(y)
@@ -62,12 +62,13 @@ class _GpuKeepalive:
                 mx.eval(self._inflight.pop(0))
 
 
-def keepalive_wait(futures) -> None:
-    """Block until `futures` finish, keeping the GPU busy meanwhile."""
+def keepalive_wait(futures, first: bool = False) -> None:
+    """Block until `futures` finish (first: until one of them does), keeping
+    the GPU busy meanwhile."""
     ka = getattr(_KEEPALIVE_LOCAL, "ka", None)
     if ka is None:
         ka = _KEEPALIVE_LOCAL.ka = _GpuKeepalive()
-    ka.wait(futures)
+    ka.wait(futures, first)
 
 
 def switch_forward(x: mx.array, indices: mx.array, triples: dict,
@@ -147,13 +148,10 @@ class StreamingSwitchMLP:
         self.act = None       # non-default activation, set at wrap time
         self.act_weights = False  # act takes the routing weights (v4.1)
         self.escales = None   # optional (gate_vec, out_vec), set at wrap time
-        self._pf_suspend = False  # a pipelined step is running: no lookahead
         # the pipeline's hint for the NEXT switch call (one stream's layer):
         # .rows = the experts the stream read itself, .idx = its routing when
         # the caller already synced it (None: the switch syncs as usual)
         self.call_hint = None
-
-        import numpy as np  # local: only for dtype mapping at alloc
 
         def alloc(loc):
             dt = {"U32": mx.uint32, "BF16": mx.bfloat16,
@@ -163,18 +161,9 @@ class StreamingSwitchMLP:
 
         self.pool = {p: {part: alloc(self.triples_loc[p][part])
                          for part in self.parts} for p in PROJS}
+        # expert -> slot, the least recently used first (the next to go)
         self.id2slot: OrderedDict[int, int] = OrderedDict()
         self.free = list(range(n_slots))
-        # Eviction policy: "lru" (default) or "s3fifo" (F19: -9..-12% misses
-        # on Laguna — small FIFO filters one-hit wonders, ghost queue rescues
-        # repeaters). Policy only decides WHICH expert loses its slot; the
-        # arithmetic never changes.
-        self.policy = os.environ.get("STREAMLX_EVICT", "lru")
-        self.n_small = max(1, int(n_slots * 0.1))
-        self.n_main = max(1, n_slots - self.n_small)
-        self.q_small: OrderedDict[int, int] = OrderedDict()  # expert -> freq
-        self.q_main: OrderedDict[int, int] = OrderedDict()
-        self.q_ghost: OrderedDict[int, bool] = OrderedDict()
         # expert id -> slot, SENTINEL when absent; enables in-graph-free
         # vectorized remap in the wrapper (numpy take, no per-id dict walk)
         self.SENTINEL = np.uint32(0xFFFFFFFF)
@@ -190,71 +179,13 @@ class StreamingSwitchMLP:
         self.adopted = 0         # experts placed by prefill sweeps (no IO)
         self.next_layer_reads = 0   # read for this layer's next sweep early
         self.next_layer_used = 0    # of those, routed by that sweep
-        self._pf = None          # in-flight: (pred_set, launch, fut, rank_of)
-        self.pf_calls = 0        # predictions targeting this layer
-        self.pf_launched = 0     # experts submitted to async read
-        self.pf_used = 0         # prefetched experts the step actually routed to
-        self.pf_agree_hit = 0    # |predicted ∩ actual| accumulator
-        self.pf_agree_tot = 0    # |actual| accumulator
-        self.pf_rank = {}        # confidence rank -> [launched, used]
-
-    def _policy_hit(self, e: int) -> None:
-        if self.policy == "s3fifo":
-            q = self.q_small if e in self.q_small else self.q_main
-            q[e] = min(3, q[e] + 1)
-        else:
-            self.id2slot.move_to_end(e)
-
-    def _s3_evict_main(self) -> int:
-        """Pop main's first zero-freq entry (decrement-and-recycle heads),
-        per sim/policy_ab.py run_s3fifo."""
-        while self.q_main:
-            e, f = self.q_main.popitem(last=False)
-            if f > 0:
-                self.q_main[e] = f - 1
-                continue
-            return e
-        raise RuntimeError("s3fifo: empty main on eviction")
-
-    def _s3_insert(self, e: int) -> int | None:
-        """Register e in its queue; return the evicted expert, or None when
-        queue capacity allowed the insert without one (a free physical slot
-        is guaranteed to exist in that case)."""
-        if e in self.q_ghost:
-            del self.q_ghost[e]
-            victim = (self._s3_evict_main()
-                      if len(self.q_main) >= self.n_main else None)
-            self.q_main[e] = 0
-            return victim
-        victim = None
-        if len(self.q_small) >= self.n_small:
-            e2, f = self.q_small.popitem(last=False)
-            if f > 0:                      # proved itself: promote to main
-                if len(self.q_main) >= self.n_main:
-                    victim = self._s3_evict_main()
-                self.q_main[e2] = 0
-            else:                          # one-hit wonder: ghost it
-                if len(self.q_ghost) >= self.n_main:
-                    self.q_ghost.popitem(last=False)
-                self.q_ghost[e2] = True
-                victim = e2
-        self.q_small[e] = 0
-        return victim
 
     def _take_slot_for(self, e: int) -> int:
-        """Free a physical slot per the eviction policy and bind it to e."""
-        if self.policy == "s3fifo":
-            victim = self._s3_insert(e)
-            if victim is not None:
-                slot = self.id2slot.pop(victim)
-                self.slot_table[victim] = self.SENTINEL
-                self.evictions += 1
-                self.free.append(slot)
-            slot = self.free.pop()
-        elif self.free:
+        """A slot for e: a free one, else the least recently used expert's."""
+        if self.free:
             slot = self.free.pop()
         else:
-            old_id, slot = self.id2slot.popitem(last=False)  # LRU head
+            old_id, slot = self.id2slot.popitem(last=False)
             self.slot_table[old_id] = self.SENTINEL
             self.evictions += 1
         self.id2slot[e] = slot
@@ -262,12 +193,11 @@ class StreamingSwitchMLP:
         return slot
 
     def ensure(self, ids: list[int], wait=None) -> list[int]:
-        """Return slot ids for `ids` (touch order = given order, like the sim).
+        """Return slot ids for `ids` (touch order = given order).
 
-        Misses are slot-assigned in order (eviction policy above, identical
-        semantics to the simulator) but FETCHED as one coalesced batch —
-        eviction decisions never depend on fetch timing, so miss counts stay
-        sim-exact while IO gets span-merged + threaded (M4 coalescing).
+        Misses are slot-assigned in order (LRU) but FETCHED as one coalesced
+        batch: eviction decisions never depend on fetch timing, while the IO
+        is span-merged and threaded.
         `wait`, when given, blocks on the batch's read futures in place of a
         plain wait (the decode path's GPU keepalive).
         """
@@ -275,7 +205,7 @@ class StreamingSwitchMLP:
         missing: list[int] = []
         for e in ids:
             if e in self.id2slot:
-                self._policy_hit(e)
+                self.id2slot.move_to_end(e)
                 self.hits += 1
             else:
                 self.misses += 1
@@ -297,19 +227,10 @@ class StreamingSwitchMLP:
     def resident(self, e: int) -> bool:
         return e in self.id2slot
 
-    def _coldest(self, n: int) -> list[int]:
-        """The n experts the policy would evict first: the LRU order, or
-        s3fifo's small queue then its main queue, each oldest first."""
-        if n <= 0:
-            return []
-        if self.policy == "s3fifo":
-            return (list(self.q_small) + list(self.q_main))[:n]
-        return list(self.id2slot)[:n]
-
     def resize(self, n_slots: int) -> int:
         """Change the slot count, within [min_slots, the layer's experts].
-        Fewer slots: the experts the policy would evict first lose theirs and
-        the rest move into the first slots; more: free slots are added. Kept
+        Fewer slots: the least recently used experts lose theirs and the
+        rest move into the first slots; more: free slots are added. Kept
         experts' bytes are copied unchanged and only which experts are
         resident changes, so outputs don't. Call it with nothing in flight
         on the pool (between requests). Returns the new count."""
@@ -317,11 +238,9 @@ class StreamingSwitchMLP:
         if n == self.n_slots:
             return n
         if n < self.n_slots:
-            for e in self._coldest(len(self.id2slot) - n):
+            for e in list(self.id2slot)[:max(0, len(self.id2slot) - n)]:
                 self.id2slot.pop(e)
                 self.slot_table[e] = self.SENTINEL
-                self.q_small.pop(e, None)
-                self.q_main.pop(e, None)
                 self.evictions += 1
             used = {slot: e for e, slot in self.id2slot.items()}
             free = [t for t in range(n) if t not in used]
@@ -350,8 +269,6 @@ class StreamingSwitchMLP:
                     self.pool[proj][part] = a
             self.free.extend(range(self.n_slots, n))
         self.n_slots = n
-        self.n_small = max(1, int(n * 0.1))
-        self.n_main = max(1, n - self.n_small)
         return n
 
     def touch(self, ids: list[int]) -> None:
@@ -363,74 +280,8 @@ class StreamingSwitchMLP:
         budget); below that, touch-first merely avoids a double fetch.
         """
         for e in ids:
-            self._policy_hit(e)
+            self.id2slot.move_to_end(e)
             self.hits += 1
-
-    # Confidence cut: rank-vs-usefulness measured on Laguna decode (12 GiB,
-    # battery deltas): rank 0 = 95% used, 6 = 42%, 9 = 22%; top-7 beat both
-    # no-cut (46% efficiency, contention) and top-5 (starves absorption).
-    _PF_TOPM = int(os.environ.get("STREAMLX_PF_TOPM", "7"))
-
-    def prefetch_start(self, pred: list[int], ex) -> None:
-        """Attention-window prefetch (F18): async raw read of the predicted
-        experts for this layer's NEXT call that aren't resident. `pred` is
-        ordered by router score, most confident first; only missing
-        predictions with confidence rank < STREAMLX_PF_TOPM are read (the
-        rank tail is where mispredictions concentrate — see pf_rank). One
-        prediction in flight per layer; an unconsumed one is dropped here.
-        Reads are submitted on `ex`, a dedicated executor — read_experts_raw
-        fans spans onto the reader's own pool, so submitting from that same
-        pool could starve it."""
-        rank_of = {e: r for r, e in enumerate(pred)}
-        missing = [e for e in pred if e not in self.id2slot]
-        launch = [e for e in missing if rank_of[e] < self._PF_TOPM]
-        for e in launch:
-            self.pf_rank.setdefault(rank_of[e], [0, 0])[0] += 1
-        if not launch:
-            self._pf = (set(pred), [], None, rank_of)
-            return
-        self.pf_launched += len(launch)
-        self._pf = (set(pred), launch,
-                    ex.submit(self.reader.read_experts_raw,
-                              self.triples_loc, launch), rank_of)
-
-    def prefetch_absorb(self, wanted: list[int], wait=None) -> None:
-        """Adopt prefetched experts this step actually routed to. Called
-        before ensure(), so absorbed experts are hits with no blocking read.
-        Blocks on the in-flight read only when the step needs its bytes
-        (they're exactly the bytes ensure() would otherwise re-read).
-        Also tallies prediction agreement for the adaptive per-layer gate
-        and per-rank usefulness for the confidence cut."""
-        pf, self._pf = self._pf, None
-        if pf is None:
-            return
-        pred_set, launch, fut, rank_of = pf
-        self.pf_calls += 1
-        self.pf_agree_hit += len(set(wanted) & pred_set)
-        self.pf_agree_tot += len(wanted)
-        if fut is None:
-            return
-        take = [e for e in launch
-                if e in set(wanted) and e not in self.id2slot]
-        if not take:
-            return
-        try:
-            if wait is not None:
-                wait([fut])
-            raws = fut.result()
-            rows = self.reader.experts_from_raw(self.triples_loc, launch,
-                                                raws)
-        except Exception:
-            return
-        for e in take:
-            self.adopt(e, rows[e])
-            self.pf_rank.setdefault(rank_of[e], [0, 0])[1] += 1
-        self.adopted -= len(take)       # keep sweep-adoption count pure
-        self.pf_used += len(take)
-
-    def prefetch_agreement(self) -> float:
-        return (self.pf_agree_hit / self.pf_agree_tot
-                if self.pf_agree_tot else 1.0)
 
     def adopt(self, e: int, arrays: dict) -> None:
         """Place expert e's already-read rows into a slot without IO.
@@ -440,7 +291,7 @@ class StreamingSwitchMLP:
         the LRU head when full); no hit/miss accounting — adoptions are free.
         """
         if e in self.id2slot:
-            self._policy_hit(e)
+            self.id2slot.move_to_end(e)
             slot = self.id2slot[e]
         else:
             slot = self._take_slot_for(e)
@@ -448,16 +299,6 @@ class StreamingSwitchMLP:
         for proj in PROJS:
             for part in self.parts:
                 self.pool[proj][part][slot] = arrays[proj][part]
-
-    def __call__(self, x: mx.array, expert_ids: list[int]) -> mx.array:
-        if len(expert_ids) > self.n_slots:
-            raise ValueError("n_slots must be >= k")
-        slots = self.ensure(expert_ids)
-        inds = mx.array([[slots]], dtype=mx.uint32)
-        es = (None if self.escales is None else
-              (*self.escales, mx.array([[expert_ids]], dtype=mx.uint32)))
-        return switch_forward(x, inds, self.pool, self.qparams, self.act,
-                              escales=es)
 
     def reset_stats(self) -> None:
         self.hits = self.misses = self.evictions = 0
@@ -467,9 +308,6 @@ class StreamingSwitchMLP:
         self.sweep_fetch_s = 0.0
         self.adopted = 0
         self.next_layer_reads = self.next_layer_used = 0
-        self.pf_calls = self.pf_launched = self.pf_used = 0
-        self.pf_agree_hit = self.pf_agree_tot = 0
-        self.pf_rank = {}
 
     @property
     def stats(self) -> dict:
@@ -483,10 +321,5 @@ class StreamingSwitchMLP:
                 "adopted": self.adopted,
                 "next_layer_reads": self.next_layer_reads,
                 "next_layer_used": self.next_layer_used,
-                "pf_calls": self.pf_calls,
-                "pf_launched": self.pf_launched,
-                "pf_used": self.pf_used,
-                "pf_agree_hit": self.pf_agree_hit,
-                "pf_agree_tot": self.pf_agree_tot,
                 "bytes_read": self.reader.bytes_read,
                 "reads": self.reader.reads}

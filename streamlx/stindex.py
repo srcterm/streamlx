@@ -17,7 +17,7 @@ from pathlib import Path
 
 DTYPE_SIZE = {"U32": 4, "BF16": 2, "F16": 2, "F32": 4, "U16": 2, "U8": 1}
 PROJS = ("gate_proj", "up_proj", "down_proj")
-_DS_PROJ = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
+DS_PROJ = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
 PARTS = ("weight", "scales", "biases")
 
 
@@ -30,7 +30,6 @@ def default_group_size(mode: str) -> int:
 class TensorLoc:
     path: str
     abs_start: int   # absolute file offset of tensor data
-    nbytes: int
     dtype: str
     shape: tuple
     name: str = ""   # tensor key in the checkpoint
@@ -58,9 +57,9 @@ class SafetensorsIndex:
             for name, info in hdr.items():
                 if name == "__metadata__":
                     continue
-                a, b = info["data_offsets"]
+                a = info["data_offsets"][0]
                 self.tensors[name] = TensorLoc(
-                    path=shard, abs_start=data_base + a, nbytes=b - a,
+                    path=shard, abs_start=data_base + a,
                     dtype=info["dtype"], shape=tuple(info["shape"]),
                     name=name)
         if not self.tensors:
@@ -89,10 +88,10 @@ class SafetensorsIndex:
                        tag: str | None = None) -> dict[str, dict[str, TensorLoc]]:
         """{proj: {weight/scales[/biases]: TensorLoc}} for one MoE layer.
 
-        `tag` overrides the module path for non-trunk MoE blocks (an MTP
-        stage at `mtp.{s}`, or `mtp.{s}.block` when the stage wraps a full
-        decoder layer). biases are optional (mxfp modes ship weight and
-        scales only); weight and scales are required for every projection.
+        `tag` overrides the module path for non-trunk MoE blocks (a draft
+        head's, at `mtp.{s}` or `mtp.layers.{i}`). biases are optional (mxfp
+        modes ship weight and scales only); weight and scales are required
+        for every projection.
         """
         out: dict[str, dict[str, TensorLoc]] = {}
         base = tag if tag is not None else f"layers.{layer}"
@@ -112,7 +111,7 @@ class SafetensorsIndex:
             norm = self._norm(name)
             ds = ds_names.match(norm)
             if ds is not None:
-                proj = _DS_PROJ[ds.group(1)]
+                proj = DS_PROJ[ds.group(1)]
                 out.setdefault(proj, {})[ds.group(2)] = loc
                 continue
             if anchored.match(norm) is None:

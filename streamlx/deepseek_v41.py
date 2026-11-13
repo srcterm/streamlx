@@ -21,9 +21,11 @@ finish() runs the MoE and the expand, both with the block's own modules.
 The model keeps ONE cache object for all layers, with a position (`offset`,
 advanced once per forward), a cross-layer handoff (published by source layers
 and read by later ones in the same forward) and the Engram n-gram history. With
-tokens in flight one layer apart:
+several tokens in flight (each layer takes them in order, a token may be
+layers ahead of the next):
   - each token's attention runs with its own offset, and with its own handoff
-    swapped in and out around the call;
+    swapped in and out around the call; between calls the offset is past the
+    last token that has entered layer 0;
   - a token's Engram hashes are computed at its layer 0, in token order, so the
     history is sequential;
   - the core's per-layer cache handles are views on the one cache: a snapshot
@@ -58,13 +60,12 @@ from mlx_vlm.models.deepseek_v41.language import (DeepseekV41Block,
                                                   DeepseekV41Cache, hc_expand,
                                                   make_identity_pre_mix)
 
-from .pipeline_adapters import capture_layer_outputs
-from .stindex import default_group_size
+from .pipeline_adapters import StandardMoEAdapter, capture_layer_outputs
+from .stindex import DS_PROJ as _W, default_group_size
 
 # what the server's prompt cache bounds itself with
 DeepseekV41Cache.nbytes = property(lambda c: cache_nbytes(c.state))
 
-_W = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 _ROUTED = re.compile(r"\.experts\.(w[123])\.")
 _EMBED_KEY = "language_model.embed.weight"
 HANDOFF = ("index_k", "candidates", "compress_kv", "topk_idxs")
@@ -265,9 +266,8 @@ class V41View:
         self.entry, self.layer = entry, layer
 
 
-class V41Adapter:
-    exact_routing = True          # begin() routes with the MoE's own gate
-
+class V41Adapter(StandardMoEAdapter):
+    # begin() routes with the MoE's own gate (exact_routing)
     def __init__(self, model, drafter=None):
         self.model = model
         self.lm = model.language_model
@@ -319,7 +319,7 @@ class V41Adapter:
             e.offset, e.engram = snap["offset"], snap["engram"]
 
     # -- token entry / exit ------------------------------------------------
-    def prep(self, tok: int, offset: int, pos_base=None, i: int = 0):
+    def prep(self, tok: int, offset: int):
         ids = mx.array([[tok]])
         h = self.lm.embed_tokens(ids)
         h = mx.broadcast_to(h[..., None, :],
@@ -336,21 +336,18 @@ class V41Adapter:
     def logits(self, h):
         return self.lm.head(self.lm.norm(h))
 
-    def draft_hidden(self, h, pos):
-        if not self.taps:
-            return h
-        return mx.concatenate([pos.taps[i] for i in self.tap_layers], axis=-1)
-
     # -- the layer split ---------------------------------------------------
     def _attention(self, layer, x, e, pos):
         if pos.handoff is not None:
             for name, val in zip(HANDOFF, pos.handoff):
                 setattr(e, name, val)
+        past = e.offset
         e.offset = pos.offset
         out = layer.attn(x, e)
         pos.handoff = tuple(getattr(e, name) for name in HANDOFF)
-        # what the token leaves behind (the layer-0 rollback point)
-        e.offset = pos.offset + 1
+        # what the tokens so far leave behind (the layer-0 rollback point),
+        # also when an earlier token runs a later layer after this one's 0
+        e.offset = max(past, pos.offset + 1)
         return out
 
     def begin(self, l, h, ids, ctx, cache, pos):
@@ -405,7 +402,7 @@ class V41Adapter:
         return h
 
     # -- the model's own forward -------------------------------------------
-    def plain(self, tok: int, cache, pos_base=None):
+    def plain(self, tok: int, cache):
         return self.forward_taps(mx.array([[tok]]), [cache[0].entry])
 
     def forward_taps(self, ids, cache):
@@ -421,23 +418,10 @@ class V41Adapter:
             [mx.mean(mx.concatenate(got[i], axis=1), axis=2) for i in prev],
             axis=-1)
 
-    # -- drafting ----------------------------------------------------------
-    def reset_drafter(self):
-        if self.drafter is not None:
-            self.drafter.reset()
-
-    def prime_pairs(self, hidden, next_ids):
-        if self.drafter is not None:
-            self.drafter.prime_pairs(hidden, next_ids)
-
+    # -- drafting (the rest is StandardMoEAdapter's) -------------------------
     def feed_pairs(self, pairs):
         if self.drafter is not None and pairs:
             self.drafter.prime_pairs(
                 None if pairs[0][0] is None
                 else mx.concatenate([h for h, _ in pairs], 1),
                 mx.array([[t for _, t in pairs]]))
-
-    def draft(self, pairs, depth, spec=None):
-        if self.drafter is None:
-            return [], [], None
-        return self.drafter.draft(pairs, depth, spec)

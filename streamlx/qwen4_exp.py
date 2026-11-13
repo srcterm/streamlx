@@ -23,7 +23,6 @@ finish() runs the MoE and the inject, both with the block's own modules.
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import tempfile
@@ -42,7 +41,7 @@ from mlx_vlm.models.qwen4_exp.ple_storage import (PLE_MARKER,
                                                   build_quantized_ple_manifest)
 
 from .pipeline_adapters import StandardMoEAdapter, _find_switch
-from .reader import F_NOCACHE, F_RDAHEAD
+from .reader import open_nocache
 
 
 def _route(blk, x):
@@ -61,11 +60,13 @@ class _PreadRows:
     row and tensor, of exactly its bytes, on a thread pool. A row is 160
     values at Q4: 80 B of weight, 10 B of scales and 10 B of biases in three
     tensors, so the store's memmap faults three 16 KB pages a row, one at a
-    time (16 rows a token); the same bytes, read in parallel."""
+    time (16 rows a token); the same bytes, read in parallel. ahead() starts
+    the reads of rows a later call asks for, off the compute thread."""
 
     _ex = None
 
     def __init__(self, store, workers: int = 32):
+        self._ahead = None      # (sorted row ids, their rows, the reads)
         if _PreadRows._ex is None:
             _PreadRows._ex = ThreadPoolExecutor(max_workers=workers,
                                                 thread_name_prefix="ple-rows")
@@ -77,12 +78,7 @@ class _PreadRows:
                 a = arrays[name]
                 fd = fds.get(a.filename)
                 if fd is None:
-                    fd = fds[a.filename] = os.open(a.filename, os.O_RDONLY)
-                    try:
-                        fcntl.fcntl(fd, F_NOCACHE, 1)
-                        fcntl.fcntl(fd, F_RDAHEAD, 0)
-                    except OSError:
-                        pass
+                    fd = fds[a.filename] = open_nocache(a.filename)
                 parts.append((fd, a.offset, a.shape[1] * a.dtype.itemsize,
                               a.dtype))
             self.starts.append(start)
@@ -90,8 +86,8 @@ class _PreadRows:
         self.starts = np.array(self.starts)
         self.cols = [arrays[name].shape[1] for name in store._tensor_names]
 
-    def __call__(self, row_ids):
-        ids = np.asarray(row_ids, dtype=np.int64).reshape(-1)
+    def _start(self, ids):
+        """(rows, reads): the arrays the rows of `ids` are being read into."""
         shard = np.searchsorted(self.starts, ids, side="right") - 1
         local = (ids - self.starts[shard]).tolist()
         shard = shard.tolist()
@@ -105,10 +101,73 @@ class _PreadRows:
                                            dt)
 
         step = max(1, -(-ids.size // (4 * self.workers)))
-        for f in [self._ex.submit(read, lo, min(ids.size, lo + step))
-                  for lo in range(0, ids.size, step)]:
+        return outs, [self._ex.submit(read, lo, min(ids.size, lo + step))
+                      for lo in range(0, ids.size, step)]
+
+    def ahead(self, row_ids) -> None:
+        ids = np.unique(np.asarray(row_ids, dtype=np.int64).reshape(-1))
+        self._ahead = (ids, *self._start(ids))
+
+    def __call__(self, row_ids):
+        ids = np.asarray(row_ids, dtype=np.int64).reshape(-1)
+        at = None
+        if self._ahead is not None and ids.size and self._ahead[0].size:
+            have, outs, reads = self._ahead
+            at = np.minimum(np.searchsorted(have, ids), have.size - 1)
+            if not (have[at] == ids).all():
+                at = None
+        if at is None:
+            outs, reads = self._start(ids)
+        for f in reads:
             f.result()
-        return tuple(outs)
+        return tuple(outs) if at is None else tuple(o[at] for o in outs)
+
+
+class _Context:
+    """A PLE layer's cache entry as its n-gram embedding reads it (the context
+    tokens), written to by nothing."""
+
+    def __init__(self, entry):
+        self.entry = entry
+
+    def __getitem__(self, i):
+        return None if self.entry is None else self.entry[i]
+
+    def update_window(self, *_a) -> None:
+        pass
+
+
+class _RowIds:
+    """Stands in for an n-gram embedding's table: keeps the row ids asked for."""
+
+    ids = None
+
+    def __call__(self, row_ids):
+        self.ids = row_ids
+        return mx.zeros((*row_ids.shape, 1))
+
+
+def _ple_layers(layers) -> list:
+    return [(i, l) for i, l in enumerate(layers) if "ple" in l]
+
+
+def _ple_ahead(layers, ids, cache) -> None:
+    """Start the row reads the PLE layers will make for token ids `ids`
+    [1, T], the next tokens of `cache`'s sequence: the row ids by each
+    embedding's own hashing of its context and these tokens, so the reads
+    run while the layers below compute."""
+    for i, layer in layers:
+        emb = layer.ple.ple_embedding
+        table = emb.ngram_embedding
+        rows = getattr(getattr(table, "table", table), "_read_rows", None)
+        if not isinstance(rows, _PreadRows):
+            continue
+        emb.ngram_embedding = rec = _RowIds()
+        try:
+            emb(ids, _Context(None if cache is None else cache[i]))
+        finally:
+            emb.ngram_embedding = table
+        rows.ahead(np.asarray(rec.ids))     # a sync on a few integer ops
 
 
 class _ScaledRows:
@@ -125,9 +184,7 @@ def _ple_rows(lm, root: Path) -> None:
     """The PLE stores' row reads (_PreadRows) and the oQ table scale."""
     wmap = json.loads((root / "model.safetensors.index.json").read_text())[
         "weight_map"]
-    for i, layer in enumerate(lm.model.layers):
-        if "ple" not in layer:
-            continue
+    for i, layer in _ple_layers(lm.model.layers):
         emb = layer.ple.ple_embedding
         store = emb.ngram_embedding
         if (getattr(store, "cache_rows", None) == 0
@@ -160,8 +217,14 @@ class Qwen4ExpText(nn.Module):
     def make_cache(self):
         return self.language_model.make_cache()
 
+    def forward(self, inputs, cache=None, **kw):
+        """The language model's forward, its PLE rows read from the start."""
+        if getattr(inputs, "ndim", 0) == 2:
+            _ple_ahead(_ple_layers(self.layers), inputs, cache)
+        return self.language_model(inputs, cache=cache, **kw)
+
     def __call__(self, inputs, cache=None, **kw):
-        return self.language_model(inputs, cache=cache, **kw).logits
+        return self.forward(inputs, cache, **kw).logits
 
 
 def load_qwen4_exp(model_dir, tokenizer_config=None, model_config=None):
@@ -232,7 +295,6 @@ def load_head(model_dir, model, reader=None):
 
     nn.quantize(head, class_predicate=predicate)
     head.load_weights(list(weights.items()))
-    head.streamlx_pools = {}
     if reader is not None:
         from .integrate import stream_moe_blocks
 
@@ -246,20 +308,18 @@ def load_head(model_dir, model, reader=None):
 
 
 class Qwen4ExpAdapter(StandardMoEAdapter):
-    exact_routing = True
-
     def __init__(self, model, drafter=None):
         self.model = model
         self.lm = model.language_model
         self.inner = self.lm.model
         self.layers = list(self.inner.layers)
         self.embed_tokens = self.inner.embed_tokens
-        self.final_norm = None
         self.hc_count = self.lm.args.hc_count
         self._switch_attr = {id(l.mlp): _find_switch(l) for l in self.layers}
         self.drafter = drafter
-        self.tap_layers = ()
         self.taps = frozenset()
+        self._toks = []         # the step's tokens, from prep() to masks()
+        self._ple = _ple_layers(self.layers)
         # begin() computes the block's routing itself and finish() runs the
         # rest of the block once, while the block's __call__ is the one
         # _route() mirrors; otherwise the generic way, the block run twice
@@ -269,7 +329,8 @@ class Qwen4ExpAdapter(StandardMoEAdapter):
     def offset(self, cache) -> int:
         return int(cache[self.inner.fa_idx].offset)
 
-    def prep(self, tok: int, offset: int, pos_base=None, i: int = 0):
+    def prep(self, tok: int, offset: int):
+        self._toks.append(tok)
         ids = mx.array([[tok]])
         h = mx.tile(self.embed_tokens(ids), (1, 1, self.hc_count))
         # the position ids the model gives a decode step (its shape is what
@@ -283,6 +344,9 @@ class Qwen4ExpAdapter(StandardMoEAdapter):
         return ids, h, pos
 
     def masks(self, h, cache):
+        # once a step, every stream prepared: their PLE rows start reading
+        toks, self._toks = self._toks, []
+        _ple_ahead(self._ple, mx.array([toks]), cache)
         return (_create_qwen4_exp_attention_mask(h, cache[self.inner.fa_idx]),
                 _create_qwen3_5_ssm_mask(h, cache[self.inner.ssm_idx]))
 
@@ -307,7 +371,7 @@ class Qwen4ExpAdapter(StandardMoEAdapter):
                      * weights[..., None]).reshape(*hyper.shape)
         mixed, hyper, weights = layer.mlp_hyper_connection(h)
         st = SimpleNamespace(mixed=mixed, hyper=hyper, weights=weights,
-                             blk=layer.mlp, pos=pos, scores=None)
+                             blk=layer.mlp, scores=None)
         if self._own_route:
             st.inds, st.scores = _route(layer.mlp, mixed)
         else:
@@ -326,10 +390,9 @@ class Qwen4ExpAdapter(StandardMoEAdapter):
         return st.hyper + (branch[..., None, :]
                            * st.weights[..., None]).reshape(*st.hyper.shape)
 
-    def plain(self, tok: int, cache, pos_base=None):
-        out = self.lm(mx.array([[tok]]), cache=cache, return_hidden=True)
-        return out.logits, out.hidden_states[0]
+    def plain(self, tok: int, cache):
+        return self.forward_taps(mx.array([[tok]]), cache)
 
     def forward_taps(self, ids, cache):
-        out = self.lm(ids, cache=cache, return_hidden=True)
+        out = self.model.forward(ids, cache, return_hidden=True)
         return out.logits, out.hidden_states[0]

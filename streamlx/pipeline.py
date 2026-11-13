@@ -1,20 +1,23 @@
 """Pipelined expert fetching: speculative decode pipelined over streaming pools.
 
-K tokens in flight, one layer apart, on the REAL cache. Token 0 of a step
-is a committed token; tokens 1..K-1 are drafts (from the host's own MTP
-head, or any host drafter). Each layer is split at the routing boundary:
+K tokens in flight on the REAL cache. Token 0 of a step is a committed
+token; tokens 1..K-1 are drafts (from the host's own MTP head, or any host
+drafter). Each layer is split at the routing boundary:
 
     begin  = attention half -> gate -> routing indices (the sync)
              -> the pool's missing experts are read asynchronously
-    finish = wait -> expert gather (resident slots + the rows the stream
-             read) -> rest of layer; the pool is updated once every stream
-             has finished the layer
+    finish = expert gather (resident slots + the rows read in this step)
+             -> rest of layer; the pool is updated once every stream has
+             finished the layer
 
-and the per-layer order S0.begin, [S_i.finish(l-1), S_i.begin]_{i>=1},
-S0.finish keeps every stream's read in flight across the other K-1
-streams' GPU phases. Because the streams touch each layer's cache in
-sequence order, the computation IS the sequential decode; the only new
-machinery is undoing the cache writes of drafts that turn out wrong.
+A stream runs finish(l-1), begin(l) whenever its read has arrived and the
+stream before it has begun layer l; the least advanced such stream goes
+first, and only when none can run does the step wait for a read. So a
+stream's read is in flight across the other streams' GPU phases, and a late
+read holds back its own stream, not the ones ahead of it. Because the
+streams still touch each layer's cache in sequence order, the computation
+IS the sequential decode; the only new machinery is undoing the cache
+writes of drafts that turn out wrong.
 
 The model-specific pieces are a host ADAPTER (the same pattern as
 load_streaming_model's `loader=`): how to embed a token, split a layer,
@@ -23,9 +26,7 @@ scheduling, pool IO, acceptance, snapshot/rollback, stats.
 
 Adapter protocol (duck-typed):
     layers                      the decoder stack (len == number of layers)
-    prep(tok, offset, pos_base=None, i=0) -> (ids, h, pos)
-                                pos = pos_base + i when the host supplied
-                                position ids, else from offset
+    prep(tok, offset) -> (ids, h, pos)   pos: the stream's own state
     offset(cache) -> int        the layer-0-of-attention cache offset
     masks(h, cache) -> ctx      opaque, handed to begin()
     begin(l, h, ids, ctx, cache, pos) -> state   with `state.inds`, an
@@ -53,11 +54,9 @@ snapshot/restore itself (adapter.snapshot_cache / restore_cache).
 """
 from __future__ import annotations
 
-import os
 import time
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -116,76 +115,44 @@ def restore_cache(c, snap) -> None:
             restore_cache(cur, sub)
 
 
-# -- stochastic acceptance ------------------------------------------------------
-
-@dataclass
-class SamplingSpec:
-    """The host's sampling pipeline, mlx-lm order: filters (top_p, min_p,
-    top_k) on log-probs, then temperature inside categorical sampling.
-    temp <= 0 is greedy."""
-    temp: float = 0.0
-    top_p: float = 0.0
-    min_p: float = 0.0
-    top_k: int = 0
-    min_tokens_to_keep: int = 1
-
-    @property
-    def greedy(self) -> bool:
-        return self.temp <= 0
-
-
-def sampling_logprobs(logits, spec: SamplingSpec):
-    """Log-probs of the distribution the host's sampler draws from, for
-    the last position of `logits` [..., V] -> [V] float32."""
-    from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
-
-    lp = logits.reshape(-1, logits.shape[-1])[-1:].astype(mx.float32)
-    lp = lp - mx.logsumexp(lp, axis=-1, keepdims=True)
-    if 0.0 < spec.top_p < 1.0:
-        lp = apply_top_p(lp, spec.top_p)
-    if spec.min_p != 0.0:
-        lp = apply_min_p(lp, spec.min_p, spec.min_tokens_to_keep)
-    if spec.top_k > 0:
-        lp = apply_top_k(lp, spec.top_k)
-    lp = lp * (1.0 / spec.temp)
-    return (lp - mx.logsumexp(lp, axis=-1, keepdims=True)).reshape(-1)
-
-
-def forced_logits(tok: int, like) -> mx.array:
-    """A logits array the host's sampler can only resolve to `tok`."""
-    v = mx.full(like.shape, -1e9, dtype=like.dtype)
-    v[..., tok] = 0
-    return v
-
-
 # -- streams ------------------------------------------------------------------
 
 @dataclass
 class Stream:
+    i: int                      # its place in the step: token i
     tok: int
     ids: mx.array
     h: mx.array
     pos: object
     ctx: object = None
-    st: object = None
-    missing: list = field(default_factory=list)   # experts it reads
-    need: list = field(default_factory=list)      # + those an earlier one reads
-    fut: object = None
+    l: int = 0                  # the next layer to begin
+    st: object = None           # the layer begun, until finished
+    idx: object = None          # its routing there (numpy)
+    need: tuple = ()            # the routed experts its pool lacks
+    reads: tuple = ()           # the reads that hold them
+    out: object = None          # its logits, once through the stack
+
+
+class _Read:
+    """One read of a layer's experts, for every stream of the step that
+    routes to them."""
+    __slots__ = ("fut", "ids", "rows")
+
+    def __init__(self, fut, ids):
+        self.fut, self.ids, self.rows = fut, ids, None
 
 
 class PipelinedDecoder:
     def __init__(self, adapter, pools: dict, cache: list, k_max: int = 3,
-                 tau: float = 0.0, k_min: int = 1,
-                 io_workers: int | None = None, adaptive: bool = True,
-                 plain_fn=None, self_gate: bool = True):
+                 adaptive: bool = True, plain_fn=None, self_gate: bool = True):
         self.ad = adapter
         self.pools = pools
         self.cache = cache
-        # plain_fn(tok, cache, pos_base) -> (logits [1,1,V], hidden): the
-        # host's own one-token forward, routing prefetch included. A step
-        # with no drafts to launch runs through it instead of a lone K=1
-        # pipeline step (which would have no prefetch and no overlap). The
-        # hidden must be what the adapter's draft() consumes.
+        # plain_fn(tok, cache) -> (logits [1,1,V], hidden): the host's own
+        # one-token forward. A step with no drafts to launch runs through it
+        # instead of a lone K=1 pipeline step (which would compute nothing
+        # while its experts are read). The hidden must be what the adapter's
+        # draft() consumes.
         self.plain_fn = plain_fn
         # Self-gate: the pipeline pays only when fetch is a fraction of the
         # step and the drafter is byte-cheap and confident; elsewhere
@@ -227,34 +194,23 @@ class PipelinedDecoder:
         self._restore = getattr(adapter, "restore_cache", None) or restore_cache
         self.reader = next(iter(pools.values())).reader
         self.k_max = max(1, k_max)
-        # k_min: streams the confidence gate may never drop below. A K=1
-        # step is a plain step with no overlap at all, worse per token than
-        # a K=2 step even at 50% draft acceptance, so the gate should only
-        # decide the streams beyond k_min.
-        self.k_min = max(1, min(k_min, self.k_max))
-        self.tau = tau
-        self.ex = ThreadPoolExecutor(max_workers=io_workers or self.k_max,
+        self.ex = ThreadPoolExecutor(max_workers=self.k_max,
                                      thread_name_prefix="streamlx-pipe-io")
         self.n_layers = len(adapter.layers)
         # stats
         self.t_sync = self.t_io = self.t_adopt = self.t_draft = 0.0
         self.t_snap = self.t_rollback = 0.0
-        self.n_lookups = self.n_miss = 0
         self.steps = 0
         self.accepted_hist: dict[int, int] = {}   # a -> count
         self.k_hist: dict[int, int] = {}          # K used -> count
         self.draft_tried = self.draft_ok = 0
-        self.depth_tried: dict[int, int] = {}     # draft depth -> tried
-        self.depth_ok: dict[int, int] = {}        # draft depth -> accepted
-        self.gated = 0
         # -- adaptive K controller ------------------------------------------
         # Picks K per step to maximize expected tokens per second from two
         # online estimates: the wall time of a step at each K (EMA) and the
         # acceptance rate of a draft given its confidence (EMA per
         # confidence bucket, prior = the confidence itself). Content that
-        # drafts badly (reasoning text) sinks to K=2 or 1; code climbs to
-        # k_max. Subsumes a fixed tau: the confidence enters the expected
-        # token count instead of a threshold. tau > 0 disables it.
+        # drafts badly (reasoning text) sinks to K=2; code climbs to k_max.
+        # adaptive=False runs every draft the head gives (tests).
         self.adaptive = adaptive
         self._t_step: dict[int, float] = {}       # K -> EMA seconds per step
         self._calib = [None] * 10                 # conf bucket -> EMA accept
@@ -268,90 +224,74 @@ class PipelinedDecoder:
         self._t_n: dict[int, int] = {}            # K -> clean samples
         self._t_last: dict[int, int] = {}         # K -> clock of last sample
         self._t_clock = 0
-        self._warm = 0                            # steps since sequence start
-        self.adaptive_hist: dict[int, int] = {}
-        self._draft_q = None
-        # Experts a lower stream is already reading at a layer are not read
-        # again by a later stream: every stream's begin() runs before any
-        # stream's finish(), so a shared miss would otherwise be read once
-        # per stream. finish() runs in stream order per layer, so the first
-        # reader's rows are there before the later stream's compute.
-        self._inflight: dict = {}          # layer -> {expert: True}
-        self.n_dup = self.n_read = 0       # duplicates avoided / reads issued
+        self._warm = self._warm_gate = 0          # steps since sequence start
+        self._stale_drafter = False               # gated off with no feed
         # The pools do not change during a step: a stream computes its
         # resident experts from their slots and its misses from the rows read
         # in this step (handed to the streaming switch as pool.call_hint), so
         # streams in flight never evict each other's experts, whatever the
-        # budget. Once every stream has computed a layer, its pool takes what
-        # the tokens would have left there one after another (_settle), but
-        # only after a later routing sync: a slot write into a slab that a
-        # gather still in flight reads cannot reuse the slab's buffer (MLX
-        # holds a command buffer's inputs until it completes), so it would
-        # copy the whole slab, every layer, every step.
-        self._rows: dict = {}              # layer -> {expert: rows} this step
+        # budget, and an expert is read once a step however many streams
+        # route to it. Once every stream has computed a layer, its pool takes
+        # what the tokens would have left there one after another (_settle),
+        # but only after the routing sync that follows: a slot write into a
+        # slab that a gather still in flight reads cannot reuse the slab's
+        # buffer (MLX holds a command buffer's inputs until it completes), so
+        # it would copy the whole slab, every layer, every step.
+        self._reads: dict = {}             # layer -> {expert: _Read} this step
         self._used: dict = {}              # layer -> [stream's experts, ...]
         self._fin: dict = {}               # layer -> streams finished
-        self._unsettled: list = []         # layers computed, pool not updated
+        self._done: list = []              # layers computed, pool not updated
         self._k_cur = 0
         # an adapter whose begin() routes with the block's own code lets the
         # switch reuse that routing instead of syncing on it a second time
         self._exact_routing = bool(getattr(adapter, "exact_routing", False))
 
     # -- layer halves over the pools ---------------------------------------
-    def _begin(self, l: int, s: Stream) -> None:
-        st = self.ad.begin(l, s.h, s.ids, s.ctx, self.cache, s.pos)
-        s.st, s.missing, s.need, s.fut = st, [], [], None
+    def _begin(self, s: Stream) -> None:
+        """The stream's next layer up to its routing; the routed experts no
+        pool slot nor read of this step holds start reading."""
+        l = s.l
+        s.st = st = self.ad.begin(l, s.h, s.ids, s.ctx, self.cache, s.pos)
         t0 = time.perf_counter()
         mx.eval(st.inds)                                   # routing sync
         self.t_sync += time.perf_counter() - t0
+        s.l, s.need, s.reads = l + 1, (), ()
         pool = self.pools.get(l)
         if pool is None:
             return
-        uniq = list(dict.fromkeys(np.array(st.inds).reshape(-1).tolist()))
+        s.idx = np.array(st.inds)
+        uniq = list(dict.fromkeys(s.idx.reshape(-1).tolist()))
         self._used.setdefault(l, []).append(uniq)
-        self.n_lookups += len(uniq)
-        missing = [e for e in uniq if e not in pool.id2slot]
-        self.n_miss += len(missing)
-        s.need = missing
-        infl = self._inflight.setdefault(l, {})
-        if infl:
-            dup = [e for e in missing if e in infl]
-            self.n_dup += len(dup)
-            missing = [e for e in missing if e not in infl]
-        if missing:
-            self.n_read += len(missing)
-            for e in missing:
-                infl[e] = True
-            s.missing = missing
-            s.fut = self.ex.submit(self.reader.read_experts_arrays,
-                                   pool.triples_loc, missing)
+        s.need = need = [e for e in uniq if e not in pool.id2slot]
+        held = self._reads.setdefault(l, {})
+        new = [e for e in need if e not in held]
+        # the pool's counts, as for the tokens one after another: an expert
+        # an earlier stream reads is there for the later one
+        pool.hits += len(uniq) - len(new)
+        pool.misses += len(new)
+        if new:
+            rd = _Read(self.ex.submit(self.reader.read_experts_arrays,
+                                      pool.triples_loc, new), new)
+            held.update(dict.fromkeys(new, rd))
+        s.reads = tuple(dict.fromkeys(held[e] for e in need))
 
-    def _finish(self, l: int, s: Stream) -> None:
+    def _finish(self, s: Stream) -> None:
+        """The rest of the layer the stream began (its reads have arrived)."""
+        l = s.l - 1
         pool = self.pools.get(l)
-        if s.fut is not None:
-            t0 = time.perf_counter()
-            if KEEPALIVE:
-                keepalive_wait([s.fut])                     # GPU kept busy
-            raw = s.fut.result()                            # IO residual
-            t1 = time.perf_counter()
-            rows = self.reader.experts_from_arrays(pool.triples_loc,
-                                                   s.missing, raw)
-            self._rows.setdefault(l, {}).update(rows)
-            infl = self._inflight.get(l)
-            if infl:
-                for e in s.missing:
-                    infl.pop(e, None)
-            self.t_io += t1 - t0
-            self.t_adopt += time.perf_counter() - t1
-            s.fut = None
         if pool is None:
-            s.h = self.ad.finish(l, s.st)
-            s.st = None
+            s.h, s.st = self.ad.finish(l, s.st), None
             return
-        got = self._rows.get(l, {})
+        t0 = time.perf_counter()
+        for rd in s.reads:
+            if rd.rows is None:
+                rd.rows = self.reader.experts_from_arrays(
+                    pool.triples_loc, rd.ids, rd.fut.result())
+        self.t_adopt += time.perf_counter() - t0
+        held = self._reads.get(l)
         pool.call_hint = SimpleNamespace(
-            rows={e: got[e] for e in s.need},
-            idx=np.array(s.st.inds) if self._exact_routing else None)
+            rows={e: held[e].rows[e] for e in s.need},
+            idx=s.idx if self._exact_routing else None)
         try:
             s.h = self.ad.finish(l, s.st)
         finally:
@@ -359,99 +299,99 @@ class PipelinedDecoder:
         s.st = None
         self._fin[l] = self._fin.get(l, 0) + 1
         if self._fin[l] == self._k_cur:
-            self._unsettled.append(l)
+            self._done.append(l)
 
-    def _settle_before(self, l: int) -> None:
-        """Settle the computed layers below l (their gathers have completed:
-        a routing sync came after their last stream's)."""
-        while self._unsettled and self._unsettled[0] < l:
-            self._settle(self._unsettled.pop(0))
-
-    def _settle(self, l: int) -> None:
-        """Every stream has computed layer l: leave in its pool what the
-        step's tokens would have left there one after another (the last
-        n_slots experts they used, the last stream's most recent) and drop
-        the step's rows."""
-        pool = self.pools[l]
-        seq = [e for uniq in self._used.pop(l, ()) for e in uniq]
-        rows = self._rows.pop(l, {})
-        keep: list = []
-        for e in reversed(seq):
-            if e not in keep:
-                keep.append(e)
-                if len(keep) == pool.n_slots:
-                    break
-        keep.reverse()                                  # oldest first
+    def _settle(self) -> None:
+        """Every stream has computed these layers and a sync has run them:
+        leave in each pool what the step's tokens would have left there one
+        after another (the last n_slots experts they used, the last stream's
+        most recent) and drop the step's rows."""
         t0 = time.perf_counter()
-        # residents first (made recent, so no adopt below evicts them),
-        # then the new rows into the least recent slots
-        for e in keep:
-            if e in pool.id2slot:
-                pool._policy_hit(e)
-        new = [e for e in keep if e not in pool.id2slot and e in rows]
-        for e in new:
-            pool.adopt(e, rows[e])
-        if new:
-            # run the slot writes now: left lazy until the layer's next use,
-            # every layer would hold its old slabs and the new rows (GiBs)
-            mx.async_eval([a for part in pool.pool.values()
-                           for a in part.values()])
+        for l in self._done:
+            pool = self.pools[l]
+            seq = [e for uniq in self._used.pop(l, ()) for e in uniq]
+            held = self._reads.pop(l, {})
+            keep: list = []
+            for e in reversed(seq):
+                if e not in keep:
+                    keep.append(e)
+                    if len(keep) == pool.n_slots:
+                        break
+            keep.reverse()                              # oldest first
+            # residents first (made recent, so no adopt below evicts them),
+            # then the new rows into the least recent slots
+            for e in keep:
+                if e in pool.id2slot:
+                    pool.id2slot.move_to_end(e)
+            new = [e for e in keep if e not in pool.id2slot and e in held]
+            for e in new:
+                pool.adopt(e, held[e].rows[e])
+            if new:
+                # run the slot writes now: left lazy until the layer's next
+                # use, every layer would hold its old slabs and the new rows
+                mx.async_eval([a for part in pool.pool.values()
+                               for a in part.values()])
+        self._done = []
         self.t_adopt += time.perf_counter() - t0
 
+    def _pick(self, streams: list):
+        """The stream to run next: the least advanced one whose reads have
+        arrived and, for a layer to begin, whose predecessor has begun it
+        (the cache takes the tokens in order). Waits for a read while none
+        can run; None once every stream is through the stack."""
+        n = self.n_layers
+        while True:
+            best, pending = None, []
+            for s in streams:
+                if s.l > n:
+                    continue
+                late = [r.fut for r in s.reads if not r.fut.done()]
+                if late:
+                    pending += late
+                elif ((s.l == n or s.i == 0 or streams[s.i - 1].l > s.l)
+                      and (best is None or s.l < best.l)):
+                    best = s
+            if best is not None or not pending:
+                return best
+            t0 = time.perf_counter()
+            if KEEPALIVE:
+                keepalive_wait(pending, first=True)         # GPU kept busy
+            else:
+                wait(pending, return_when=FIRST_COMPLETED)
+            self.t_io += time.perf_counter() - t0
+
     # -- one step: K tokens in flight ----------------------------------------
-    def step(self, toks: list[int], offset: int, pos_base=None):
+    def step(self, toks: list[int], offset: int):
         """Returns (outputs, hiddens, snaps): outputs[i] = argmax after
         stream i, hiddens[i] = its final (pre-head) hidden, snaps[l][i] =
-        layer-l cache snapshot taken before stream i wrote it. `pos_base`
-        is the host's position_ids for stream 0 (any shape); stream i
-        gets pos_base + i, exactly what the host would pass i calls
-        later."""
-        # the core reads every stream's experts exactly; the wrapper's
-        # lookahead would only re-read them
-        for p in self.pools.values():
-            p._pf_suspend = True
-        self._inflight.clear()
-        self._rows, self._used, self._fin = {}, {}, {}
-        self._unsettled = []
-        self._k_cur = len(toks)
-        try:
-            return self._step(toks, offset, pos_base)
-        finally:
-            for p in self.pools.values():
-                p._pf_suspend = False
-
-    def _step(self, toks: list[int], offset: int, pos_base=None):
-        K = len(toks)
-        streams = []
-        for i, t in enumerate(toks):
-            ids, h, pos = self.ad.prep(t, offset + i, pos_base, i)
-            streams.append(Stream(t, ids, h, pos))
+        layer-l cache snapshot taken before stream i wrote it."""
+        K, n = len(toks), self.n_layers
+        self._reads, self._used, self._fin, self._done = {}, {}, {}, []
+        self._k_cur = K
+        streams = [Stream(i, t, *self.ad.prep(t, offset + i))
+                   for i, t in enumerate(toks)]
         ctx = self.ad.masks(streams[0].h, self.cache)
         for s in streams:
             s.ctx = ctx
-        n = self.n_layers
         snaps = [[None] * K for _ in range(n)]
-        for l in range(n):
-            for i in range(K):
-                if i > 0 and l > 0:
-                    self._finish(l - 1, streams[i])
-                if K > 1:
-                    t0 = time.perf_counter()
-                    snaps[l][i] = self._snap(self.cache[l])
-                    self.t_snap += time.perf_counter() - t0
-                self._begin(l, streams[i])
-                if i == 0:
-                    # every stream's layer l-2 gather finished before the
-                    # routing syncs since its last stream's
-                    self._settle_before(l - 1)
-            self._finish(l, streams[0])
-        for i in range(1, K):
-            self._finish(n - 1, streams[i])
-        lg = [self.ad.logits(s.h) for s in streams]
-        mx.eval(*lg)
-        self._settle_before(n)
-        outs = [int(mx.argmax(x[0, -1]).item()) for x in lg]
-        self._last_logits = lg
+        while (s := self._pick(streams)) is not None:
+            if s.st is not None:
+                self._finish(s)
+            if s.l == n:
+                s.l = n + 1                  # through the stack: its logits
+                s.out = self.ad.logits(s.h)  # run while the others finish
+                mx.async_eval(s.out)
+                continue
+            if K > 1:
+                t0 = time.perf_counter()
+                snaps[s.l][s.i] = self._snap(self.cache[s.l])
+                self.t_snap += time.perf_counter() - t0
+            self._begin(s)
+            if self._done:                   # its sync ran their last gather
+                self._settle()
+        mx.eval(*(s.out for s in streams))
+        self._settle()
+        outs = [int(mx.argmax(s.out[0, -1]).item()) for s in streams]
         dh = getattr(self.ad, "draft_hidden", None)
         return outs, [dh(s.h, s.pos) if dh else s.h for s in streams], snaps
 
@@ -465,13 +405,12 @@ class PipelinedDecoder:
         self.t_rollback += time.perf_counter() - t0
 
     # -- the plain fallback and the self-gate --------------------------------
-    def plain_step(self, tok: int, pos_base=None):
-        """One token through the host's own forward (with its prefetch).
-        Returns (argmax, logits, hidden)."""
+    def plain_step(self, tok: int):
+        """One token through the host's own forward. Returns (argmax,
+        logits, hidden)."""
         t0 = time.perf_counter()
-        logits, hidden = self.plain_fn(tok, self.cache, pos_base)
+        logits, hidden = self.plain_fn(tok, self.cache)
         mx.eval(logits)
-        self._last_logits = [logits]
         self.plain_steps += 1
         self.k_hist[1] = self.k_hist.get(1, 0) + 1
         self._gate_account(time.perf_counter() - t0, 1)
@@ -485,7 +424,7 @@ class PipelinedDecoder:
         dt += self._g_draft
         self._g_draft = 0.0
         explore, self._g_explore = self._g_explore, False
-        self._warm_gate = getattr(self, "_warm_gate", 0) + 1
+        self._warm_gate += 1
         if self._warm_gate <= 2:
             return                        # a sequence's cold steps
         if self._g_hold_left > 0:
@@ -592,10 +531,6 @@ class PipelinedDecoder:
             self._learn_accept(conf, a)
             self.draft_tried += K - 1
             self.draft_ok += a - 1
-            for d in range(1, K):
-                self.depth_tried[d] = self.depth_tried.get(d, 0) + 1
-                if d < a:
-                    self.depth_ok[d] = self.depth_ok.get(d, 0) + 1
             self.accepted_hist[a] = self.accepted_hist.get(a, 0) + 1
             self._gate_account(dt, a)
             self.rollback(snaps, a)
@@ -669,15 +604,15 @@ class PipelinedDecoder:
             self._t_step[K] = v + self._ema * (dt - v)
 
     def _choose_k(self, confs) -> int:
-        """K in [k_floor, 1 + len(confs)] maximizing E[tokens]/t_step[K].
-        k_floor is 2 whenever a draft exists: a K=1 step inside a
-        pipelined sequence is worse than a low-confidence K=2 step (the
-        pool churns faster under K>1, so the lone plain step pays more
-        fetch than the steady-state plain rate would credit it with)."""
+        """K in [2, 1 + len(confs)] maximizing E[tokens]/t_step[K]. At
+        least 2 whenever a draft exists: a K=1 step inside a pipelined
+        sequence is worse than a low-confidence K=2 step (the pool churns
+        faster under K>1, so the lone plain step pays more fetch than the
+        steady-state plain rate would credit it with)."""
         kmax = 1 + len(confs)
         if kmax <= 1:
             return 1
-        k_floor = max(self.k_min, 2 if kmax >= 2 else 1)
+        k_floor = 2
         best_k, best_rate = k_floor, None
         exp_tok = 1.0
         prod = 1.0
@@ -708,47 +643,10 @@ class PipelinedDecoder:
                 return K
         return best_k
 
-    def _accept_stochastic(self, drafts, q_lps, logits_list, spec):
-        """Speculative-sampling acceptance against the host's distribution.
-        Stream i's target p_i (its logits through the host's sampling
-        pipeline) judges draft i+1: accept with prob min(1, p_i(d)/q_i(d));
-        on rejection the emitted token is drawn from the residual
-        max(0, p_i - q_i). Returns (a, forced): streams 0..a-1 are kept;
-        forced[i] is the token the host must emit after stream i (the
-        accepted draft, or the residual sample), None for the last kept
-        stream when every draft was accepted (the host samples the bonus
-        token from the true logits itself). Lossless: the emitted
-        sequence is distributed exactly as the host's own sampling."""
-        K = len(logits_list)
-        forced = [None] * K
-        a = 1
-        for i in range(K - 1):
-            d = drafts[i]
-            p = sampling_logprobs(logits_list[i], spec)
-            q = q_lps[i]
-            pd = float(mx.exp(p[d]).item())
-            qd = float(mx.exp(q[d]).item())
-            u = float(mx.random.uniform().item())
-            if qd <= 0.0 or u < min(1.0, pd / qd):
-                forced[i] = d
-                a += 1
-                continue
-            resid = mx.maximum(mx.exp(p) - mx.exp(q), 0.0)
-            z = float(mx.sum(resid).item())
-            if z <= 0.0:
-                # p == q on this support: any draw from p is valid
-                tok = int(mx.random.categorical(p).item())
-            else:
-                tok = int(mx.random.categorical(mx.log(resid / z + 1e-30)).item())
-            forced[i] = tok
-            break
-        return a, forced
-
     def _draft_for(self, tok_pairs, depth):
-        """Drafts for the next step. tau > 0: fixed confidence gate (with
-        k_min). Otherwise the adaptive controller picks K from calibrated
-        confidence and measured step times. Returns (drafts, confs) of the
-        streams to run."""
+        """Drafts for the next step: the head's, cut to the K the adaptive
+        controller picks from calibrated confidence and measured step times.
+        Returns (drafts, confs) of the streams to run."""
         if depth <= 0 or not tok_pairs:
             return [], []
         if not self.drafting:
@@ -764,38 +662,15 @@ class PipelinedDecoder:
             else:
                 self._stale_drafter = True
             return [], []
-        if getattr(self, "_stale_drafter", False):
+        if self._stale_drafter:
             return [], []
         t0 = time.perf_counter()
-        spec = getattr(self, "sampling", None)
-        if spec is not None and not spec.greedy:
-            res = self.ad.draft(tok_pairs, depth, spec)
-        else:
-            res = self.ad.draft(tok_pairs, depth)
+        drafts, conf = (list(v) for v in self.ad.draft(tok_pairs, depth))
         dt = time.perf_counter() - t0
         self.t_draft += dt
         self._g_draft = dt                  # charged with this step's time
-        drafts, conf = list(res[0]), list(res[1])
-        self._draft_q = list(res[2]) if len(res) > 2 and res[2] is not None else None
-        if self.tau > 0:
-            keep = 0
-            for c in conf:
-                if c < self.tau:
-                    break
-                keep += 1
-            keep = max(keep, self.k_min - 1)
-            if keep < len(drafts):
-                self.gated += 1
-            if self._draft_q is not None:
-                self._draft_q = self._draft_q[:keep]
-            return drafts[:keep], conf[:keep]
         if self.adaptive:
             K = self._choose_k(conf)
-            self.adaptive_hist[K] = self.adaptive_hist.get(K, 0) + 1
-            if K - 1 < len(drafts):
-                self.gated += 1
-            if self._draft_q is not None:
-                self._draft_q = self._draft_q[:K - 1]
             return drafts[:K - 1], conf[:K - 1]
         return drafts, conf
 
@@ -806,17 +681,9 @@ class PipelinedDecoder:
             "accepted_hist": dict(sorted(self.accepted_hist.items())),
             "draft_accept": (self.draft_ok / self.draft_tried
                              if self.draft_tried else None),
-            "gated_steps": self.gated,
-            "depth_accept": {d: round(self.depth_ok.get(d, 0) / n, 3)
-                             for d, n in sorted(self.depth_tried.items())},
-            "adaptive": self.adaptive and self.tau <= 0,
             "t_step": {k: round(v, 3) for k, v in sorted(self._t_step.items())},
             "t_n": dict(sorted(self._t_n.items())),
             "calib": [None if v is None else round(v, 2) for v in self._calib],
-            "miss_rate": self.n_miss / max(self.n_lookups, 1),
-            "n_miss": self.n_miss,
-            "n_dup": self.n_dup,
-            "n_read": self.n_read,
             "t_sync": round(self.t_sync, 1),
             "t_io": round(self.t_io, 1),
             "t_adopt": round(self.t_adopt, 1),
@@ -833,230 +700,3 @@ class PipelinedDecoder:
             },
         }
 
-
-class LookaheadDecoder(PipelinedDecoder):
-    """Serve a host's ONE-token decode calls from pipelined steps.
-
-    A host that decodes one token per model call: call(tok) must return
-    the logits of tok's
-    forward with the cache advanced by one. Here that call runs a whole
-    K-stream step — tok plus K-1 drafts — returns stream 0's logits, and
-    keeps the accepted drafts' streams PENDING. The next call is served
-    from the pending stream when the host asks for exactly the token that
-    stream ran on (always, under greedy: the host samples the argmax we
-    already verified against); its cache writes are already in place,
-    so the host sees a normal step that happens to be nearly free. Any
-    other token means the pending streams were speculation the host did
-    not take: their writes are rolled back to the last consumed stream
-    and a fresh step starts from the requested token. Sampling therefore
-    degrades to plain decode, never to a wrong result.
-
-    Invariants checked on every call: the cache objects are the ones the
-    pending streams wrote (a host that swapped caches gets a fresh
-    start) and the layer offset is where the step left it (a host that
-    trimmed or rewound the cache invalidates the pending streams without
-    a restore — the host owns the cache now).
-
-    The drafter is fed (hidden, next_token) pairs from CONSUMED calls
-    only, with the token the host actually asked for, so the head's own
-    cache is exact whatever the host samples.
-    """
-
-    def __init__(self, adapter, pools, cache, k_max=3, tau=0.0, k_min=1,
-                 io_workers=None, adaptive=True, plain_fn=None, self_gate=True):
-        super().__init__(adapter, pools, cache, k_max, tau, k_min, io_workers,
-                         adaptive, plain_fn=plain_fn, self_gate=self_gate)
-        self.pending: deque = deque()     # (input_tok, logits, hidden)
-        self.snaps = None
-        self.consumed = 0
-        self.end_offset = None
-        self.last_hidden = None
-        self.primed_offset = None
-        self.pairs: list = []
-        self.hits = self.misses = self.invalidated = 0
-        self.invalidated_by: dict[str, int] = {}
-        self.sampling: SamplingSpec | None = None
-        self.stochastic_steps = 0
-        self.residual_draws = 0
-        # STREAMLX_PIPE_TRACE=1: per-call trace (hit / step records) for
-        # divergence hunting; read via .trace, cleared by reset_stats()
-        self.trace = [] if os.environ.get("STREAMLX_PIPE_TRACE") == "1" else None
-
-    def set_sampling(self, spec: SamplingSpec | None) -> None:
-        """The host's sampling parameters (None or temp 0 = greedy)."""
-        self.sampling = spec if (spec is not None and not spec.greedy) else None
-
-    def prime(self, last_hidden, offset: int | None = None) -> None:
-        """Hidden of the token that produced the first decode token (the
-        prompt's last position); lets the very first call draft. `offset`:
-        the cache offset the prompt left behind, so a later call arriving
-        with a different cache container at that same offset is
-        recognised as the same sequence."""
-        self.last_hidden = last_hidden
-        self.primed_offset = offset
-        self._warm = 0
-
-    def _cache_matches(self, cache) -> bool:
-        if cache is None or cache is self.cache:
-            return True
-        if self.cache is None or len(cache) != len(self.cache):
-            return False
-        return all(a is b for a, b in zip(cache, self.cache))
-
-    def discard_pending(self, reason: str = "") -> None:
-        """Undo the cache writes of every pending (unconsumed) stream and
-        forget them. Called whenever the host does anything other than
-        ask for the next pending token: a passthrough forward (prefill,
-        a multi-token call), a cache swap, or a rewind. If the host has
-        already moved the cache's offset off the step's end, a restore is
-        applied only when the offset sits exactly at the consumed point
-        (then it is idempotent: the host trimmed what we would undo);
-        anywhere else the host owns the cache and we only forget."""
-        if not self.pending and self.snaps is None:
-            return
-        if self.pending and self.snaps is not None and self.cache is not None:
-            try:
-                offset = self.ad.offset(self.cache)
-            except Exception:  # noqa: BLE001
-                offset = None
-            step_start = (self.end_offset - self.consumed
-                          - len(self.pending)) if self.end_offset is not None \
-                else None
-            if offset == self.end_offset or (
-                    step_start is not None and offset == step_start + self.consumed):
-                self.rollback(self.snaps, self.consumed)
-            self.invalidated += 1
-            if reason:
-                self.invalidated_by[reason] = self.invalidated_by.get(reason, 0) + 1
-        self.pending.clear()
-        self.snaps = None
-
-    def call(self, tok: int, cache=None, pos_base=None):
-        """Logits [1, 1, V] of `tok`'s forward; cache advanced by one.
-        `pos_base`: the host's position_ids for this call, if any."""
-        if not self._cache_matches(cache):
-            # a host-owned cache we have not seen (first call, or a swap):
-            # the old cache must not keep our speculation. If nothing is
-            # pending and the new container sits exactly where priming
-            # left the sequence, it is the SAME sequence in a new container
-            # (a host moving a request's prefill cache into a batch cache):
-            # keep the primed hidden so the first step can draft.
-            same_seq = (not self.pending and self.primed_offset is not None
-                        and self.ad.offset(cache) == self.primed_offset)
-            self.discard_pending("cache-swap")
-            self.cache = cache
-            if not same_seq:
-                self.last_hidden = None
-                self.pairs = []
-            self.primed_offset = None
-        offset = self.ad.offset(self.cache)
-        if self.pending:
-            if self.end_offset != offset:
-                # the host moved the cache under us
-                self.discard_pending("offset")
-                offset = self.ad.offset(self.cache)
-            else:
-                ptok, plog, ph = self.pending[0]
-                if ptok == tok:
-                    self.pending.popleft()
-                    self.consumed += 1
-                    self.hits += 1
-                    self.pairs.append((self.last_hidden, tok))
-                    self.last_hidden = ph
-                    if self.trace is not None:
-                        self.trace.append(("hit", tok))
-                    return plog
-                # speculation the host did not take
-                self.misses += 1
-                self.rollback(self.snaps, self.consumed)
-                self.pending.clear()
-                self.snaps = None
-                offset = self.ad.offset(self.cache)
-        if self.last_hidden is not None:
-            self.pairs.append((self.last_hidden, tok))
-        drafts, conf = self._draft_for(self.pairs, self.k_max - 1)
-        self.pairs = []
-        if not drafts and self.plain_fn is not None:
-            # nothing to pipeline: the host's own step, prefetch and all
-            _nxt, logits, hidden = self.plain_step(tok, pos_base)
-            self.steps += 1
-            self.snaps = None
-            self.consumed = 0
-            self.end_offset = offset + 1
-            self.last_hidden = hidden
-            if self.trace is not None:
-                self.trace.append(("plain", tok))
-            return logits
-        toks = [tok] + drafts
-        K = len(toks)
-        self.k_hist[K] = self.k_hist.get(K, 0) + 1
-        ts = time.perf_counter()
-        outs, hiddens, snaps = self.step(toks, offset, pos_base)
-        dt = time.perf_counter() - ts
-        self._learn_time(K, dt)
-        lg = self._last_logits
-        self.steps += 1
-        spec = self.sampling
-        if spec is not None and K > 1 and self._draft_q is not None:
-            a, forced = self._accept_stochastic(drafts, self._draft_q, lg, spec)
-            self.stochastic_steps += 1
-            if a < K:
-                self.residual_draws += 1
-        else:
-            a = self._accepted(drafts, outs)
-            forced = [None] * K
-        self._learn_accept(conf, a)
-        self.draft_tried += K - 1
-        self.draft_ok += a - 1
-        for d in range(1, K):
-            self.depth_tried[d] = self.depth_tried.get(d, 0) + 1
-            if d < a:
-                self.depth_ok[d] = self.depth_ok.get(d, 0) + 1
-        self.accepted_hist[a] = self.accepted_hist.get(a, 0) + 1
-        self._gate_account(dt, a)
-        self.rollback(snaps, a)
-        self.snaps = snaps
-        self.consumed = 1
-        self.end_offset = offset + a
-        rets = [lg[i] if forced[i] is None else forced_logits(forced[i], lg[i])
-                for i in range(a)]
-        self.pending = deque((toks[i], rets[i], hiddens[i]) for i in range(1, a))
-        self.last_hidden = hiddens[0]
-        if self.trace is not None:
-            self.trace.append(("step", tok, K, a, list(drafts), list(outs)))
-        return rets[0]
-
-    def stats(self) -> dict:
-        d = super().stats()
-        d.update(hits=self.hits, misses=self.misses,
-                 invalidated=self.invalidated,
-                 invalidated_by=dict(self.invalidated_by),
-                 sampling=None if self.sampling is None else vars(self.sampling),
-                 stochastic_steps=self.stochastic_steps,
-                 residual_draws=self.residual_draws)
-        return d
-
-    def reset_stats(self) -> None:
-        self.t_sync = self.t_io = self.t_adopt = self.t_draft = 0.0
-        self.t_snap = self.t_rollback = 0.0
-        self.n_lookups = self.n_miss = 0
-        self.n_dup = self.n_read = 0
-        self.steps = 0
-        self.accepted_hist = {}
-        self.k_hist = {}
-        self.draft_tried = self.draft_ok = 0
-        self.depth_tried = {}
-        self.depth_ok = {}
-        self.gated = 0
-        self.hits = self.misses = self.invalidated = 0
-        self.invalidated_by = {}
-        self.stochastic_steps = self.residual_draws = 0
-        self.adaptive_hist = {}
-        self._warm = 0                    # a new sequence: cold steps again
-        self._warm_gate = 0
-        self.plain_steps = 0
-        self._stale_drafter = False
-        # the time model and the calibration are model properties, not
-        # request properties: keep them across sequences
-        if self.trace is not None:
-            self.trace = []

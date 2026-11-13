@@ -5,8 +5,8 @@ with streamlx: trunk resident, experts streamed from SSD on demand.
 
   python examples/serve.py --budget-gib 16 \
       --model <local-model-dir> --port 8080 [--trust-remote-code] \
-      [--warmstart-trace trace.npz] [--tokenizer-config key=json ...] \
-      [--resident] [--prompt-cache-gib N] [--mlx-cache-gib N] \
+      [--tokenizer-config key=json ...] \
+      [--prompt-cache-gib N] [--mlx-cache-gib N] \
       [--kv-cache-dir DIR [--kv-cache-gib N]] \
       [--draft-head DIR [--draft-k 4] [--stream-draft-head]] \
       [--memory-gib N] [--prefill-memory-gib N]
@@ -32,7 +32,8 @@ would pass the limit. A long conversation so gives slots back as its cache
 grows, and a short one takes them again. Resizing copies the kept slots (~1 s
 for 16 GiB); outputs don't change. --prefill-memory-gib caps what a prefill
 holds beyond the arrays it uses: MLX's freed buffers (a third, at most
-0.25 GiB) and the next layer's reads in flight (the rest, at most 0.5 GiB).
+0.25 GiB) and the expert reads queued ahead of the compute (the rest, at most
+0.5 GiB).
 
 Long prefills of models whose attention head size MLX does not fuse by
 default (256 in Qwen3.5/3.6) would build heads x queries x keys of scores per
@@ -55,7 +56,7 @@ only the active request's cache. --kv-cache-gib bounds the disk use (default
 its bandwidth with expert reads.
 
 --draft-head decodes greedy requests through streamlx.pipeline (PEF): K tokens
-in flight, one layer apart, so each token's expert reads overlap the others'
+in flight, so each token's expert reads overlap the others'
 compute, with plain decoding's output. It takes what generate.py's does: the
 model directory for Qwen3.8 and DeepSeek-V4.1, an mlx-vlm drafter directory
 otherwise. With --stream-draft-head, Qwen3.8's head streams its MoE layer
@@ -87,12 +88,10 @@ from mlx_lm.models.cache import can_trim_prompt_cache
 from streamlx import attention
 from streamlx import integrate as _integrate
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
-                                pool_bytes, prefill_cache, preload_popular,
-                                resize_pools)
+                                pool_bytes, prefill_cache, resize_pools)
 from streamlx.kvcache import PagedPromptCache
 
-_CFG = {"budget_bytes": 8 * 2**30, "warmstart_trace": None, "trust": False,
-        "tokenizer_config": {}, "resident": None,
+_CFG = {"budget_bytes": 8 * 2**30, "trust": False, "tokenizer_config": {},
         "prompt_cache_bytes": 4 * 2**30, "draft_head": None, "draft_k": 4,
         "memory_bytes": 0, "mlx_cache_bytes": 2 * 2**30,
         "prefill_cache_bytes": 0, "stream_head": False}
@@ -322,8 +321,7 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
     fetch = _STATE.pop("fetch", None)
     prompt, cache, model = (kwargs.get(k)
                             for k in ("prompt", "prompt_cache", "model"))
-    if (cache is None or model is None or not isinstance(prompt, list)
-            or kwargs.get("draft_model") is not None):
+    if cache is None or model is None or not isinstance(prompt, list):
         return 0
     sfx = _STATE.get("suffix") or []
     cut = len(prompt) - (len(sfx) if sfx and prompt[-len(sfx):] == sfx
@@ -373,7 +371,6 @@ def _pipelined_decoder(kwargs: dict):
     if (_STATE.get("decoder") is None or args is None
             or args.sampling.temperature != 0 or args.logprobs
             or args.top_logprobs > 0 or kwargs.get("logits_processors")
-            or kwargs.get("draft_model") is not None
             or kwargs.get("input_embeddings") is not None
             or kwargs.get("kv_bits") is not None
             or not isinstance(kwargs.get("prompt"), list)):
@@ -546,28 +543,15 @@ class StreamingModelProvider(srv.ModelProvider):
         if adapter_path is not None or draft_model_path is not None:
             raise ValueError("adapters/draft models not supported with "
                              "expert streaming")
-        self.model_key = None
-        self.model = None
-        self.tokenizer = None
-        self.draft_model = None
-
         t0 = time.time()
         model, tokenizer, pools, reader = load_streaming_model(
             str(model_path), _CFG["budget_bytes"],
             trust_remote_code=_CFG["trust"],
-            tokenizer_config=_CFG["tokenizer_config"],
-            resident=_CFG["resident"])
+            tokenizer_config=_CFG["tokenizer_config"])
         slots = sum(p.n_slots for p in pools.values())
         print(f"[streamlx] trunk loaded in {time.time()-t0:.1f}s; "
               f"{len(pools)} pools, {slots} slots "
               f"({_CFG['budget_bytes']/2**30:.1f} GiB)", file=sys.stderr)
-        if _CFG["warmstart_trace"]:
-            t0 = time.time()
-            preload_popular(pools, _CFG["warmstart_trace"])
-            print(f"[streamlx] warm-start: {reader.bytes_read/1e9:.1f} GB "
-                  f"in {time.time()-t0:.1f}s", file=sys.stderr)
-        self.pools = pools
-        self.reader = reader
         _STATE["pools"], _STATE["reader"] = pools, reader
         _STATE["all_pools"] = dict(pools)
         _STATE["decoder"] = None
@@ -604,7 +588,6 @@ class StreamingModelProvider(srv.ModelProvider):
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
-        self.draft_model = None
         self.is_batchable = False  # batch-1 by design
 
 
@@ -620,16 +603,11 @@ def _auto_prompt_cache_bytes(ram: int, budget: int) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--budget-gib", type=float, default=8.0)
-    ap.add_argument("--warmstart-trace", default=None)
     ap.add_argument("--trust-remote-code", action="store_true")
     ap.add_argument("--tokenizer-config", action="append", default=[],
                     metavar="KEY=JSON",
                     help="extra tokenizer kwarg, repeatable "
                          "(e.g. fix_mistral_regex=true)")
-    ap.add_argument("--resident", action="store_true",
-                    help="let fully-covered MoE layers stay on the stock "
-                         "resident path (faster; trades RAM headroom that "
-                         "long contexts need for KV cache)")
     ap.add_argument("--prompt-cache-gib", type=float, default=None,
                     help="byte cap for the server's prompt-cache LRU "
                          "(default: RAM - budget - 12 GiB, clamped to "
@@ -654,9 +632,9 @@ def main() -> None:
     ap.add_argument("--prefill-memory-gib", type=float, default=None,
                     help="cap what prefill holds beyond the arrays it uses: "
                          "MLX's freed-buffer cache while prefilling (a third, "
-                         "at most 0.25 GiB) and the next layer's reads in "
-                         "flight (the rest, at most 0.5 GiB). Default: "
-                         "--mlx-cache-gib and 0.5 GiB")
+                         "at most 0.25 GiB) and the expert reads queued "
+                         "ahead of the compute (the rest, at most 0.5 GiB). "
+                         "Default: --mlx-cache-gib and 0.5 GiB")
     ap.add_argument("--memory-gib", type=float, default=None,
                     help="keep MLX's memory (active + buffer cache) under "
                          "this: before each request the expert pools are "
@@ -664,12 +642,9 @@ def main() -> None:
                          "will grow to, from earlier requests' peaks")
     ours, rest = ap.parse_known_args()
     _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
-    _CFG["warmstart_trace"] = ours.warmstart_trace
     _CFG["trust"] = ours.trust_remote_code
     _CFG["draft_head"], _CFG["draft_k"] = ours.draft_head, ours.draft_k
     _CFG["stream_head"] = ours.stream_draft_head
-    if ours.resident:
-        _CFG["resident"] = "auto"
     try:
         ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (ValueError, OSError):

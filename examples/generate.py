@@ -5,12 +5,12 @@ Streams tokens to stdout live, then prints the punchline stats
 
   python examples/generate.py --model <local-model-dir> --budget-gib 16 \
       --prompt "..." --max-tokens 200 [--trust-remote-code] \
-      [--warmstart-trace trace.npz] [--draft-head DIR [--draft-k 4]]
+      [--draft-head DIR [--draft-k 4]]
 
 --draft-head decodes through streamlx.pipeline with an mlx-vlm block
 drafter (pip install mlx-vlm), e.g. Mistral Large 4's bundled DSpark head
 split out once with `python -m mlx_vlm.split_mtp --model <checkpoint>
---output <dir> --q-bits 4`: K tokens in flight, one layer apart, so each
+--output <dir> --q-bits 4`: K tokens in flight, so each
 token's expert reads overlap the others' compute; greedy output identical
 to plain decoding. A self-gate times drafting against plain decoding and
 keeps whichever is faster. DeepSeek-V4.1 and Qwen3.8 read their heads from
@@ -21,7 +21,7 @@ V4.1 and 3 for Qwen3.8.
 from __future__ import annotations
 
 import argparse
-import subprocess
+import os
 import sys
 import time
 from pathlib import Path
@@ -31,7 +31,7 @@ from mlx_lm.generate import generation_stream, wired_limit
 from mlx_lm.models.cache import make_prompt_cache
 
 from streamlx.integrate import (aggregate_stats, load_streaming_model,
-                                prefill_cache, preload_popular, resize_pools)
+                                prefill_cache, resize_pools)
 
 PREFILL_STEP = 4096
 
@@ -41,12 +41,6 @@ def model_size_gb(model_dir: str) -> float:
                for f in Path(model_dir).glob("*.safetensors")) / 1e9
 
 
-def ram_gb() -> float:
-    out = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"],
-                         capture_output=True, text=True).stdout.strip()
-    return int(out) / 1e9
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True)
@@ -54,7 +48,6 @@ def main() -> int:
     ap.add_argument("--prompt", default="Explain, step by step, why "
                     "mixture-of-experts models can stream from SSD.")
     ap.add_argument("--max-tokens", type=int, default=200)
-    ap.add_argument("--warmstart-trace", default=None)
     ap.add_argument("--trust-remote-code", action="store_true")
     ap.add_argument("--draft-head", default=None,
                     help="mlx-vlm drafter directory: pipelined decoding")
@@ -66,7 +59,7 @@ def main() -> int:
     args = ap.parse_args()
 
     size = model_size_gb(args.model)
-    ram = ram_gb()
+    ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
     print(f"model: {Path(args.model).name}  ({size:.0f} GB weights)")
     print(f"machine RAM: {ram:.0f} GB  |  expert budget: "
           f"{args.budget_gib:.0f} GiB\n")
@@ -77,11 +70,6 @@ def main() -> int:
         trust_remote_code=args.trust_remote_code)
     print(f"[load] trunk resident in {time.time()-t0:.1f}s "
           f"(experts stay on SSD)", file=sys.stderr)
-    if args.warmstart_trace:
-        t0 = time.time()
-        preload_popular(pools, args.warmstart_trace)
-        print(f"[load] warm-start in {time.time()-t0:.1f}s "
-              f"({reader.bytes_read/1e9:.1f} GB)", file=sys.stderr)
 
     drafter = ad = None
     if args.draft_head:
