@@ -5,10 +5,10 @@ token; tokens 1..K-1 are drafts (from the host's own MTP head, or any host
 drafter). Each layer is split at the routing boundary:
 
     begin  = attention half -> gate -> routing indices (the sync)
-             -> the pool's missing experts are read asynchronously
-    finish = expert gather (resident slots + the rows read in this step)
-             -> rest of layer; the pool is updated once every stream has
-             finished the layer
+             -> the pool's missing experts are read asynchronously,
+             straight into slots the step is not using
+    finish = expert gather over the pool's slots (experts that found no
+             slot: from the arrays read for them) -> rest of layer
 
 A stream runs finish(l-1), begin(l) whenever its read has arrived and the
 stream before it has begun layer l; the least advanced such stream goes
@@ -135,7 +135,8 @@ class Stream:
 
 class _Read:
     """One read of a layer's experts, for every stream of the step that
-    routes to them."""
+    routes to them: straight into their pool slots (the future gives None),
+    or as arrays when the pool had no slot to give (rows, once viewed)."""
     __slots__ = ("fut", "ids", "rows")
 
     def __init__(self, fut, ids):
@@ -226,19 +227,22 @@ class PipelinedDecoder:
         self._t_clock = 0
         self._warm = self._warm_gate = 0          # steps since sequence start
         self._stale_drafter = False               # gated off with no feed
-        # The pools do not change during a step: a stream computes its
-        # resident experts from their slots and its misses from the rows read
-        # in this step (handed to the streaming switch as pool.call_hint), so
-        # streams in flight never evict each other's experts, whatever the
-        # budget, and an expert is read once a step however many streams
-        # route to it. Once every stream has computed a layer, its pool takes
-        # what the tokens would have left there one after another (_settle),
-        # but only after the routing sync that follows: a slot write into a
-        # slab that a gather still in flight reads cannot reuse the slab's
-        # buffer (MLX holds a command buffer's inputs until it completes), so
-        # it would copy the whole slab, every layer, every step.
+        # A stream's misses are read straight into pool slots and computed
+        # from the pool like its resident experts. A slot is given up during
+        # a step only by an expert that neither this step's streams nor the
+        # last step's used at that layer: a gather still in flight never has
+        # a slot rewritten under it, streams in flight never evict each
+        # other's experts, and what the next token is likeliest to route to
+        # stays, whatever the budget. With no such slot the expert is read
+        # as arrays instead (handed to the streaming switch as
+        # pool.call_hint). Once every stream has computed a layer and a
+        # routing sync has run it, its pool takes the order, and the experts
+        # read as arrays, that the tokens would have left there one after
+        # another (_settle). An expert is read once a step however many
+        # streams route to it.
         self._reads: dict = {}             # layer -> {expert: _Read} this step
         self._used: dict = {}              # layer -> [stream's experts, ...]
+        self._last: dict = {}              # layer -> the last step's experts
         self._fin: dict = {}               # layer -> streams finished
         self._done: list = []              # layers computed, pool not updated
         self._k_cur = 0
@@ -262,17 +266,33 @@ class PipelinedDecoder:
         s.idx = np.array(st.inds)
         uniq = list(dict.fromkeys(s.idx.reshape(-1).tolist()))
         self._used.setdefault(l, []).append(uniq)
-        s.need = need = [e for e in uniq if e not in pool.id2slot]
+        busy = self._last.get(l, set()).union(*self._used[l])
         held = self._reads.setdefault(l, {})
-        new = [e for e in need if e not in held]
-        # the pool's counts, as for the tokens one after another: an expert
-        # an earlier stream reads is there for the later one
+        new = [e for e in uniq if e not in pool.id2slot and e not in held]
+        # the pool's counts and order, as for the tokens one after another:
+        # an expert an earlier stream reads is there for the later one
         pool.hits += len(uniq) - len(new)
         pool.misses += len(new)
-        if new:
+        for e in uniq:
+            if e in pool.id2slot:
+                pool.id2slot.move_to_end(e)
+        # a slot for each new expert while one is free or the least recent
+        # expert is none this step or the last used here
+        direct = []
+        for e in new:
+            if pool.free or next(iter(pool.id2slot)) not in busy:
+                pool._take_slot_for(e)
+                direct.append(e)
+        if direct:
+            rd = _Read(self.ex.submit(self.reader.read_into,
+                                      pool.slot_requests(direct)), direct)
+            held.update(dict.fromkeys(direct, rd))
+        if len(direct) < len(new):
+            rest = [e for e in new if e not in pool.id2slot]
             rd = _Read(self.ex.submit(self.reader.read_experts_arrays,
-                                      pool.triples_loc, new), new)
-            held.update(dict.fromkeys(new, rd))
+                                      pool.triples_loc, rest), rest)
+            held.update(dict.fromkeys(rest, rd))
+        s.need = need = [e for e in uniq if e in held]
         s.reads = tuple(dict.fromkeys(held[e] for e in need))
 
     def _finish(self, s: Stream) -> None:
@@ -283,14 +303,17 @@ class PipelinedDecoder:
             s.h, s.st = self.ad.finish(l, s.st), None
             return
         t0 = time.perf_counter()
+        rows = {}
         for rd in s.reads:
             if rd.rows is None:
-                rd.rows = self.reader.experts_from_arrays(
-                    pool.triples_loc, rd.ids, rd.fut.result())
+                arrays = rd.fut.result()       # None: its experts are in slots
+                rd.rows = {} if arrays is None else (
+                    self.reader.experts_from_arrays(pool.triples_loc, rd.ids,
+                                                    arrays))
+            rows.update(rd.rows)
         self.t_adopt += time.perf_counter() - t0
-        held = self._reads.get(l)
         pool.call_hint = SimpleNamespace(
-            rows={e: held[e].rows[e] for e in s.need},
+            rows={e: rows[e] for e in s.need if e in rows},
             idx=s.idx if self._exact_routing else None)
         try:
             s.h = self.ad.finish(l, s.st)
@@ -304,33 +327,19 @@ class PipelinedDecoder:
     def _settle(self) -> None:
         """Every stream has computed these layers and a sync has run them:
         leave in each pool what the step's tokens would have left there one
-        after another (the last n_slots experts they used, the last stream's
-        most recent) and drop the step's rows."""
+        after another (their order of use, and a slot for each expert read
+        as arrays) and drop the step's reads."""
         t0 = time.perf_counter()
         for l in self._done:
             pool = self.pools[l]
-            seq = [e for uniq in self._used.pop(l, ()) for e in uniq]
-            held = self._reads.pop(l, {})
-            keep: list = []
-            for e in reversed(seq):
-                if e not in keep:
-                    keep.append(e)
-                    if len(keep) == pool.n_slots:
-                        break
-            keep.reverse()                              # oldest first
-            # residents first (made recent, so no adopt below evicts them),
-            # then the new rows into the least recent slots
-            for e in keep:
-                if e in pool.id2slot:
-                    pool.id2slot.move_to_end(e)
-            new = [e for e in keep if e not in pool.id2slot and e in held]
-            for e in new:
-                pool.adopt(e, held[e].rows[e])
-            if new:
-                # run the slot writes now: left lazy until the layer's next
-                # use, every layer would hold its old slabs and the new rows
-                mx.async_eval([a for part in pool.pool.values()
-                               for a in part.values()])
+            held, seq = self._reads.pop(l, {}), self._used.pop(l, ())
+            for uniq in seq:
+                for e in uniq:
+                    if e in pool.id2slot:
+                        pool.id2slot.move_to_end(e)
+                    elif e in held and held[e].rows:
+                        pool.adopt(e, held[e].fut.result())
+            self._last[l] = {e for uniq in seq for e in uniq}
         self._done = []
         self.t_adopt += time.perf_counter() - t0
 
