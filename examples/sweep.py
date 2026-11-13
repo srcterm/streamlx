@@ -42,6 +42,13 @@ def main() -> int:
     ap.add_argument("--out", default="sweep.csv")
     ap.add_argument("--trust-remote-code", action="store_true")
     args = ap.parse_args()
+    out = Path(args.out)
+    new = not out.exists() or out.stat().st_size == 0
+    if not new:
+        with open(out, newline="") as f:
+            if next(csv.reader(f)) != CSV_FIELDS:
+                ap.error(f"{out} has other columns than this version writes: "
+                         "move it or pass --out")
 
     budget = int(args.budget_gib * 2**30)
     t0 = time.time()
@@ -87,8 +94,6 @@ def main() -> int:
                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**30, 2),
            "mlx_peak_gb": round(mx.get_peak_memory() / 2**30, 2),
            "notes": ""}
-    out = Path(args.out)
-    new = not out.exists()
     with open(out, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         if new:
