@@ -448,11 +448,16 @@ class StreamingSwitchGLU(nn.Module):
         for bi, ids in enumerate(batches):
             t0 = time.perf_counter()
             raw = {}
-            reads = [early[e] for e in ids if e in early]
+            # what `ahead` stops counting below is let go: a read leaves
+            # `early` with the last expert it holds for this call and hands
+            # over each batch's arrays as that batch takes them
+            reads = [early.pop(e) for e in ids if e in early]
             if bi in own:
                 reads.append(own.pop(bi))
             for f in dict.fromkeys(reads):
-                raw.update(f.result())
+                arrays = f.result()
+                for key in [key for key in arrays if key[0] in ids]:
+                    raw[key] = arrays.pop(key)
             pool.sweep_fetch_s += time.perf_counter() - t0   # blocked wait
             # built on the reading threads; the dtype views (ops) here
             got = [e for e in ids if e not in resident]
