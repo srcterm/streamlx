@@ -227,8 +227,9 @@ class StreamingSwitchGLU(nn.Module):
         flat = idx.reshape(-1).tolist()
         lost = [e for e in dict.fromkeys(flat)
                 if e not in rows and not pool.resident(e)]
-        if lost:
-            pool.ensure(lost)        # a host changed the pool mid-step
+        if lost:                     # a host changed the pool mid-step
+            mx.synchronize()         # other streams' kernels leave its slots
+            pool.ensure(lost)
         res = [i for i, e in enumerate(flat) if e not in rows]
         own = [i for i, e in enumerate(flat) if e in rows]
         outs = []
