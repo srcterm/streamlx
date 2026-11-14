@@ -49,6 +49,12 @@ trim back to a divergence). Chunks are evened out, at most 1.25x
 --prefill-step-size, instead of ending in a small one: each chunk's expert
 sweep reads ~every expert.
 
+A checkpoint whose model writes its own message framing (Inkling 2: no
+generation prompt, every part of a reply opens with a content-type token)
+describes it in its tokenizer's response_template; the server sorts replies
+into reasoning, content and tool calls by it when mlx-lm has no format for
+the model.
+
 --kv-cache-dir moves prompt caches to SSD instead (streamlx.kvcache): stored
 once as segments shared by every request with the same prefix, so RAM holds
 only the active request's cache. --kv-cache-gib bounds the disk use (default
@@ -76,6 +82,7 @@ import copy
 import itertools
 import json
 import os
+import re
 import sys
 import time
 
@@ -148,6 +155,68 @@ def _gen_suffix(tokenizer, template_args: dict) -> list[int]:
     except Exception:  # noqa: BLE001 — no template, or one needing more
         return []
     return b[len(a):] if b[:len(a)] == a else []
+
+
+def _template_response_format(tokenizer) -> bool:
+    """A model that writes its own message framing (inkling2: its template
+    has no generation prompt; the reply opens each part with a content-type
+    token and closes it with an end token) describes it in tokenizer_config's
+    `response_template`: fields with an open pattern and a close. Give the
+    tokenizer mlx-lm's response format made from it, unless it has one: the
+    server's text state machine then sorts the reply into reasoning, content
+    and tool calls, and drops the framing. Returns whether it did."""
+    tpl = tokenizer.init_kwargs.get("response_template")
+    if not isinstance(tpl, dict) or tokenizer.response_transitions:
+        return False
+    states = {"reasoning_content": "reasoning", "content": "normal",
+              "tool_calls": "tool"}
+    added = list(tokenizer.get_added_vocab())
+    trans, tool = {"header": []}, None
+    for name, field in (tpl.get("fields") or {}).items():
+        state, close = states.get(name), field.get("close")
+        # a part opens with a token the pattern matches by itself (what may
+        # precede it, a message header, is dropped as header text)
+        opens = [field["open"]] if field.get("open") else []
+        if field.get("open_pattern"):
+            pattern = re.compile(field["open_pattern"])
+            opens = [t for t in added if pattern.fullmatch(t)]
+        if state is None or not close or not opens:
+            continue
+        trans["header"] += [(t, state) for t in opens]
+        trans.setdefault(state, []).append((close, "header"))
+        if state == "tool":
+            tool = (field, opens[0])
+    if len(trans) < 2:
+        return False
+    tokenizer._response_format = {"initial_state": "header",
+                                  "transitions": trans}
+    if tool is not None:
+        field, start = tool
+        shape = (field.get("transform") or {}).get("function") or {
+            "name": "{content.name}", "arguments": "{content.arguments}"}
+
+        def fill(x, content):
+            """`{content.a.b}` -> that value of the parsed call."""
+            if isinstance(x, dict):
+                return {k: fill(v, content) for k, v in x.items()}
+            m = re.fullmatch(r"\{content((?:\.\w+)*)\}", x) \
+                if isinstance(x, str) else None
+            if m is None:
+                return x
+            for key in filter(None, m.group(1).split(".")):
+                content = content[key]
+            return content
+
+        def parse_tool_call(text, tools=None):
+            content = json.loads(text) if field.get("content") == "json" \
+                else text
+            call = fill(shape, content)
+            return {"name": call["name"], "arguments": call["arguments"]}
+
+        tokenizer._tool_parser = parse_tool_call
+        tokenizer._tool_call_start = start   # has_tool_calling
+        tokenizer._tool_call_end = None      # the response format closes it
+    return True
 
 
 def _chunks(n: int, step: int) -> list[int]:
@@ -579,6 +648,9 @@ class StreamingModelProvider(srv.ModelProvider):
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
+        if _template_response_format(tokenizer):
+            print("[streamlx] reply framing from the checkpoint's "
+                  "response_template", file=sys.stderr)
         _STATE["suffix"] = _gen_suffix(tokenizer,
                                        self.cli_args.chat_template_args)
         if _STATE["suffix"]:
