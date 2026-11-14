@@ -420,6 +420,13 @@ class StreamingSwitchGLU(nn.Module):
                          for q in pool.parts} for p in PROJS}
             mx.eval(*(taken[p][q] for p in PROJS for q in pool.parts))
             pool.sweep_resident += len(resident)
+            # those of them the sweep keeps warm go to the recent end first:
+            # the adoptions below then take free slots or the slots of
+            # experts it does not keep, never one of these (which was not
+            # read, so there are no arrays to adopt it from again)
+            for e in resident:
+                if e in warm_ids:
+                    pool.id2slot.move_to_end(e)
 
         batches = [[int(e) for e in uniq[i0:i0 + self.sweep_batch]]
                    for i0 in range(0, len(uniq), self.sweep_batch)]
