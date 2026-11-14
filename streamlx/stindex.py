@@ -17,8 +17,14 @@ from pathlib import Path
 
 DTYPE_SIZE = {"U32": 4, "BF16": 2, "F16": 2, "F32": 4, "U16": 2, "U8": 1}
 PROJS = ("gate_proj", "up_proj", "down_proj")
-DS_PROJ = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj"}
-PARTS = ("weight", "scales", "biases")
+# inkling2: gate and up in one projection, gate rows even and up rows odd
+FUSED = ("gate_up_proj", "down_proj")
+DS_PROJ = {"w1": "gate_proj", "w3": "up_proj", "w2": "down_proj",
+           "w13": "gate_up_proj"}
+# global_scale: nvfp4's tensor scale, one float per expert
+PARTS = ("weight", "scales", "biases", "global_scale")
+# a float format's (bits, group size, mode) by bits x group size
+_FP_MODES = {64: (4, 16, "nvfp4"), 128: (4, 32, "mxfp4"), 256: (8, 32, "mxfp8")}
 
 
 def default_group_size(mode: str) -> int:
@@ -86,12 +92,13 @@ class SafetensorsIndex:
 
     def switch_triples(self, layer: int,
                        tag: str | None = None) -> dict[str, dict[str, TensorLoc]]:
-        """{proj: {weight/scales[/biases]: TensorLoc}} for one MoE layer.
+        """{proj: {weight/scales[/biases][/global_scale]: TensorLoc}} for
+        one MoE layer, over PROJS or, for inkling2's layout, FUSED.
 
         `tag` overrides the module path for non-trunk MoE blocks (a draft
-        head's, at `mtp.{s}` or `mtp.layers.{i}`). biases are optional (mxfp
-        modes ship weight and scales only); weight and scales are required
-        for every projection.
+        head's, at `mtp.{s}` or `mtp.layers.{i}`). biases are optional (the
+        float modes ship weight and scales only); weight and scales are
+        required for every projection.
         """
         out: dict[str, dict[str, TensorLoc]] = {}
         base = tag if tag is not None else f"layers.{layer}"
@@ -103,15 +110,21 @@ class SafetensorsIndex:
         anchored = re.compile(r"^(?:model\.)?" + re.escape(base)
                               + r"\.(?:mlp|ffn)\.switch_mlp\.")
         # DeepSeek's own names for the stacked experts (V4.1 oQ exports):
-        # `ffn.experts.w1/w3/w2` = gate / up / down
+        # `ffn.experts.w1/w3/w2` = gate / up / down; an oQ inkling2 export
+        # has `mlp.experts.w13/w2` = gate+up / down
         ds_names = re.compile(r"^(?:model\.)?" + re.escape(base)
-                              + r"\.(?:mlp|ffn)\.experts\.(w[123])\."
-                              + r"(weight|scales|biases)$")
+                              + r"\.(?:mlp|ffn)\.experts\.(w13|w[123])\."
+                              + r"(weight|scales|biases|global_scale)$")
+        # mlx-lm's inkling2: `mlp.experts.gate_up_proj / down_proj`
+        fused = re.compile(r"^(?:model\.)?(?:language_model\.)?"
+                           + re.escape(base) + r"\.mlp\.experts\."
+                           + r"(gate_up_proj|down_proj)\."
+                           + r"(weight|scales|biases|global_scale)$")
         for name, loc in self.tensors.items():
             norm = self._norm(name)
-            ds = ds_names.match(norm)
+            ds = ds_names.match(norm) or fused.match(norm)
             if ds is not None:
-                proj = DS_PROJ[ds.group(1)]
+                proj = DS_PROJ.get(ds.group(1), ds.group(1))
                 out.setdefault(proj, {})[ds.group(2)] = loc
                 continue
             if anchored.match(norm) is None:
@@ -120,11 +133,12 @@ class SafetensorsIndex:
                 for part in PARTS:
                     if name.endswith(f"{proj}.{part}"):
                         out.setdefault(proj, {})[part] = loc
-        missing = [(p, q) for p in PROJS for q in ("weight", "scales")
+        projs = FUSED if "gate_up_proj" in out else PROJS
+        missing = [(p, q) for p in projs for q in ("weight", "scales")
                    if q not in out.get(p, {})]
         if missing:
             raise KeyError(f"layer {base}: missing switch tensors {missing}")
-        return out
+        return {p: out[p] for p in projs}
 
     def layer_expert_bytes(self, layer: int, tag: str | None = None) -> int:
         """Bytes for ONE expert of one layer (all projections+parts)."""
@@ -139,13 +153,18 @@ class SafetensorsIndex:
         projection: bits/group_size/mode from the config's quantization
         table (per-path override, else top-level, else shape inference at
         the mode's group size, affine by default), verified against the
-        packed weight/scales shapes."""
+        packed weight/scales shapes. Byte scales under an affine entry are a
+        float format the table leaves out (mlx-lm's inkling2 keeps the
+        source's nvfp4 / mxfp8 experts): read off the shapes."""
         w, s = triple["weight"], triple["scales"]
         n_groups, packed = s.shape[-1], w.shape[-1]
         ov = self._quant_by_path.get(self._norm(w.name)[: -len(".weight")], {})
         bits = ov.get("bits", self._quant_default.get("bits"))
         gs = ov.get("group_size", self._quant_default.get("group_size"))
         mode = ov.get("mode", self._quant_default.get("mode", "affine"))
+        if (s.dtype == "U8" and mode == "affine"
+                and packed * 32 // n_groups in _FP_MODES):
+            bits, gs, mode = _FP_MODES[packed * 32 // n_groups]
         if gs is None:
             gs = default_group_size(mode)
         in_features = n_groups * gs
