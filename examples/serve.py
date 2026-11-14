@@ -64,8 +64,8 @@ its bandwidth with expert reads.
 --draft-head decodes greedy requests through streamlx.pipeline (PEF): K tokens
 in flight, so each token's expert reads overlap the others'
 compute, with plain decoding's output. It takes what generate.py's does: the
-model directory for Qwen3.8 and DeepSeek-V4.1, an mlx-vlm drafter directory
-otherwise. With --stream-draft-head, Qwen3.8's head streams its MoE layer
+model directory for Qwen3.8, DeepSeek-V4.1 and Inkling 2, an mlx-vlm drafter
+directory otherwise. With --stream-draft-head, Qwen3.8's head streams its MoE layer
 through a pool taken out of --budget-gib (V4.1's stages always stream, in
 pools of their own). The self-gate's verdict carries across requests.
 Requests that sample, process logits or ask for logprobs decode plainly. On a

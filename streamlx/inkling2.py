@@ -16,10 +16,20 @@ The routed experts (w13 = gate and up in one projection, w2 = down) keep
 their bytes. mlx-lm reads every module's bits, group size and mode off its
 packed shapes, so the export's quantization table needs no translation.
 Text only: the vision tower is not built and its tensors are dropped.
+
+Also the pipeline's adapter for the model (`Inkling2Adapter`): its layers
+pass the residual blocks along and store four convolution states, the last
+one after the expert call.
 """
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
+
+import mlx.core as mx
+
+from .pipeline import snapshot_cache
+from .pipeline_adapters import StandardMoEAdapter, capture_layer_outputs
 
 _LAYER = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 _ROOT = "model.language_model."
@@ -144,3 +154,176 @@ def load_inkling2(model_dir, tokenizer_config=None, model_config=None):
                                   **(model_config or {})})
     finally:
         ink.Model.sanitize = sanitize
+
+
+class _View:
+    """Layer `layer`'s entry of the prompt cache (its KV cache and its four
+    convolution states), as the pipeline's cache handle."""
+
+    def __init__(self, entry, layer: int):
+        self.entry, self.layer = entry, layer
+
+
+class Inkling2Adapter(StandardMoEAdapter):
+    """The pipeline's adapter for mlx-lm's inkling2. begin() is the layer up
+    to its router (the block's own, exact_routing), finish() the experts, the
+    post-MLP convolution and the residual; each stream carries the residual
+    blocks so far. The model's logits come from the last layer's finish()
+    (the mix over the blocks and the final norm) and logits().
+
+    Cache: a stream's begin() stores the layer's first three convolution
+    states (the next stream's begin() reads them), its finish() the fourth,
+    which may be after the next stream's begin() and so after the snapshot a
+    rollback restores: restore_cache then puts back what the stream before the
+    rejected one stored. A sliding layer's window is written in place, so its
+    snapshot holds the arrays under handles of its own.
+    """
+
+    def __init__(self, model, drafter=None):
+        import mlx_lm.models.inkling2 as stock
+
+        self._rms, self._conv_state = (stock._unweighted_rms_norm,
+                                       stock._conv_state)
+        self.model = model
+        self.lm = model.model.language_model
+        self.layers = list(model.layers)
+        text = model.args.text
+        self._cap = text.final_logit_softcapping
+        self._vocab = text.unpadded_vocab_size
+        self._keep = text.sconv_kernel_size - 1
+        self.drafter = drafter
+        # a draft head reads the residual ENTERING these layers and, for an
+        # id past the stack, the model's final normalized output
+        self.tap_layers = tuple(getattr(drafter, "tap_layers", None) or ())
+        self.taps = frozenset(self.tap_layers)
+        self._dated = {}     # layer -> the snapshot its next begin() dates
+        self._late = {}      # layer -> {position: its fourth conv state}
+
+    # -- cache handles -----------------------------------------------------
+    def views(self, cache):
+        return [_View(c, i) for i, c in enumerate(cache)]
+
+    def offset(self, views) -> int:
+        return int(views[0].entry[0].offset)
+
+    def snapshot_cache(self, v):
+        kv, conv = v.entry[0], v.entry[1]
+        ring = hasattr(kv, "_idx")
+        snap = {"kv": ({k: mx.array(x) if isinstance(x, mx.array) else x
+                        for k, x in vars(kv).items()} if ring
+                       else snapshot_cache(kv)),
+                "ring": ring, "conv": list(conv.cache),
+                "lengths": conv.lengths, "left": conv.left_padding,
+                "pos": None}
+        self._dated[v.layer] = snap
+        return snap
+
+    def restore_cache(self, v, snap) -> None:
+        kv, conv = v.entry[0], v.entry[1]
+        if snap["ring"]:
+            for k, x in snap["kv"].items():
+                setattr(kv, k, mx.array(x) if isinstance(x, mx.array) else x)
+        else:
+            for k, x in snap["kv"][0].items():
+                setattr(kv, k, x)
+        conv.cache = list(snap["conv"])
+        conv.lengths, conv.left_padding = snap["lengths"], snap["left"]
+        # the stream before the rejected one may have finished this layer
+        # after the snapshot: its fourth state is the one to keep
+        late = self._late.get(v.layer, {}).get((snap["pos"] or 0) - 1)
+        if late is not None:
+            conv.cache[3] = late
+
+    # -- token entry / exit ------------------------------------------------
+    def prep(self, tok: int, offset: int):
+        ids = mx.array([[tok]])
+        pos = SimpleNamespace(offset=offset, blocks=None, taps={})
+        return ids, self.lm.embed(ids), pos
+
+    def masks(self, h, cache):
+        return cache[0].entry[1].make_mask(h.shape[1])
+
+    def logits(self, h):
+        out = self.model.lm_head(h).astype(mx.float32)
+        out = mx.tanh(out / self._cap) * self._cap
+        return out[..., :self._vocab]
+
+    # -- the layer split ---------------------------------------------------
+    def begin(self, l, h, ids, ctx, cache, pos):
+        layer, entry = self.layers[l], cache[l].entry
+        snap = self._dated.pop(l, None)
+        if snap is not None:
+            snap["pos"] = pos.offset
+        if l in self.taps:
+            pos.taps[l] = h
+        conv, dtype = entry[1], h.dtype
+        win = list(conv.cache)
+        normed = self._rms(h.astype(mx.float32))
+        inputs = None
+        if layer.attention_input is not None:
+            inputs = layer.attention_input(pos.blocks, normed)
+        x = layer._self_attention(h, inputs, entry, win, ctx)
+        x, win[2] = layer.post_attention_convolution(x, win[2], ctx)
+        res = x = x.astype(mx.float32)
+        blocks = pos.blocks
+        if layer.is_block_boundary:
+            blk = normed[None]
+            blocks = blk if blocks is None else mx.concatenate([blocks, blk])
+        else:
+            res = x = h.astype(mx.float32) + x
+        xn = layer.mlp_input(blocks, self._rms(x))[..., 0, :]
+        xn = layer.post_attention_layernorm(xn).astype(dtype)
+        for i in range(3):
+            conv[i] = self._conv_state(win[i], conv.lengths, self._keep)
+        inds, weights = layer.mlp.gate(xn)
+        return SimpleNamespace(h=res, xn=xn, inds=inds, weights=weights,
+                               blk=layer.mlp, blocks=blocks, conv=conv,
+                               ctx=ctx, dtype=dtype, pos=pos)
+
+    def finish(self, l, st):
+        layer, pos, x = self.layers[l], st.pos, st.xn
+        y = st.blk.experts(x, st.inds).astype(mx.float32)
+        y = (y * st.weights[..., None]).sum(axis=-2).astype(x.dtype)
+        # the fourth state as the stream before this one left it (its
+        # finish() ran since this stream's begin())
+        y, win = layer.post_mlp_convolution(y, st.conv.cache[3], st.ctx)
+        state = self._conv_state(win, st.conv.lengths, self._keep)
+        st.conv[3] = state
+        st.conv.advance(x.shape[1])
+        late = self._late.setdefault(l, {})
+        late[pos.offset] = state
+        late.pop(pos.offset - 8, None)
+        h = (st.h + y.astype(mx.float32)).astype(st.dtype)
+        pos.blocks = st.blocks
+        if l == len(self.layers) - 1:
+            h = self.lm.final_input(pos.blocks, self._rms(h.astype(mx.float32)))
+            h = self.lm.norm(h[..., 0, :]).astype(st.dtype)
+        return h
+
+    def draft_hidden(self, h, pos):
+        """A stream's row of the head's context: its taps, the final output
+        last."""
+        if not self.taps:
+            return h
+        n = len(self.layers)
+        return mx.concatenate([pos.taps[i] if i < n else h
+                               for i in self.tap_layers], axis=-1)
+
+    # -- the model's own forward -------------------------------------------
+    def plain(self, tok: int, cache):
+        return self.forward_taps(mx.array([[tok]]), [v.entry for v in cache])
+
+    def forward_taps(self, ids, cache):
+        """The model's logits plus the head's context for every position: the
+        residual entering each tap layer = the output of the layer before
+        it, and the final normalized output."""
+        n = len(self.layers)
+        prev = [i - 1 for i in self.tap_layers if i < n]
+        with capture_layer_outputs(self.model, prev) as got:
+            hidden = self.lm(ids, cache=cache)
+        logits = self.logits(hidden)
+        if not self.taps:
+            return logits, None
+        return logits, mx.concatenate(
+            [mx.concatenate(got[i - 1], axis=1) if i < n else hidden
+             for i in self.tap_layers], axis=-1)

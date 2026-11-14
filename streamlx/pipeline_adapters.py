@@ -20,7 +20,7 @@ Drafting: an mlx-vlm drafter (DSpark / DFlash / MTP heads, ``pip install
 mlx-vlm``; ``load_drafter``). Without one the core runs K=1.
 
 Other layer shapes have their own adapters (``adapter_for``):
-mistral_large4 here, deepseek_v41 and qwen4_exp in their modules.
+mistral_large4 here, deepseek_v41, qwen4_exp and inkling2 in their modules.
 """
 from __future__ import annotations
 
@@ -259,6 +259,10 @@ def adapter_for(model, drafter=None):
         from .qwen4_exp import Qwen4ExpAdapter
 
         return Qwen4ExpAdapter(model, drafter)
+    if mt == "inkling2":
+        from .inkling2 import Inkling2Adapter
+
+        return Inkling2Adapter(model, drafter)
     return StandardMoEAdapter(model, drafter)
 
 
@@ -409,9 +413,10 @@ def _vlm_target(model, cfg):
 def load_drafter(path: str, model, reader=None, stream_head: bool = False):
     """A pipeline drafter for `model` from an mlx-vlm drafter directory, e.g.
     `python -m mlx_vlm.split_mtp --model <checkpoint with its draft head>
-    --output <dir> --q-bits 4` (Mistral Large 4's DSpark head). DeepSeek-V4.1
-    and Qwen3.8 read their heads from the checkpoint itself: `path` is the model
-    directory (V4.1's streams through `reader`, the model's expert reader).
+    --output <dir> --q-bits 4` (Mistral Large 4's DSpark head). DeepSeek-V4.1,
+    Qwen3.8 and Inkling 2 read their heads from the checkpoint itself: `path`
+    is the model directory (V4.1's streams through `reader`, the model's expert
+    reader; Inkling 2's is dense and resident, 4-bit).
     stream_head: Qwen3.8's head streams its MoE layer through a pool too
     (1.3 GiB less RAM; its drafts then sync on routing and wait on misses,
     ~15% slower PEF decode at equal trunk pools)."""
@@ -420,6 +425,10 @@ def load_drafter(path: str, model, reader=None, stream_head: bool = False):
         from .deepseek_v41_dspark import V41DSpark
 
         return V41DSpark(model, path, reader.index, reader)
+    if mt == "inkling2":
+        from .inkling2_dspark import Inkling2Draft
+
+        return Inkling2Draft(model, path)
     if mt == "qwen4_exp":
         from .qwen4_exp import load_head
 
