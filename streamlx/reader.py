@@ -136,6 +136,32 @@ class ExpertReader:
             harvest([fut.result()])
         return out
 
+    def read_into(self, requests, wait=None) -> None:
+        """[(path, off, n, buffer)]: each range read straight into `buffer`,
+        a writable view of the n bytes of memory it belongs in. Returns once
+        all are in; `wait` as in read_ranges."""
+        def read_bucket(bucket):
+            for path, off, n, buf in bucket:
+                got = os.preadv(self._fd(path), [buf], off)
+                if got != n:
+                    raise IOError(f"short read {got}/{n} at {off} of {path}")
+            return sum(r[2] for r in bucket), len(bucket)
+
+        # one task per worker, longest ranges first (as read_ranges)
+        buckets: list = [[] for _ in range(self._workers)]
+        loads = [0] * self._workers
+        for r in sorted(requests, key=lambda r: -r[2]):
+            i = loads.index(min(loads))
+            buckets[i].append(r)
+            loads[i] += r[2]
+        futs = [self._ex.submit(read_bucket, b) for b in buckets if b]
+        if wait is not None:
+            wait(futs)
+        for fut in futs:
+            n, reads = fut.result()
+            self.bytes_read += n
+            self.reads += reads
+
     # -- expert-level API ----------------------------------------------------
 
     @staticmethod
@@ -177,13 +203,6 @@ class ExpertReader:
                            for part in layer_triples[proj]}
                     for proj in PROJS}
                 for e in ids}
-
-    def read_experts(self, layer_triples: dict, ids: list[int],
-                     wait=None) -> dict:
-        """{expert_id: {proj: {part: mx.array}}} — one coalesced batch."""
-        return self.experts_from_arrays(
-            layer_triples, ids,
-            self.read_experts_arrays(layer_triples, ids, wait=wait))
 
     def reset_stats(self) -> None:
         self.bytes_read = 0

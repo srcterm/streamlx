@@ -71,6 +71,16 @@ def keepalive_wait(futures, first: bool = False) -> None:
     ka.wait(futures, first)
 
 
+def _storage(arr: mx.array) -> memoryview:
+    """The array's own memory as writable bytes (MLX exports an evaluated
+    array's buffer, and the GPU reads what is written there). Hold it only
+    while writing: a live view keeps MLX from updating the array in place."""
+    m = memoryview(arr)
+    if m.readonly or not m.c_contiguous or m.nbytes != arr.nbytes:
+        raise RuntimeError("array does not export its storage")
+    return m.cast("B")
+
+
 def switch_forward(x: mx.array, indices: mx.array, triples: dict,
                    qparams: dict, act=None, escales=None,
                    sorted_indices: bool = False, weights=None) -> mx.array:
@@ -195,9 +205,12 @@ class StreamingSwitchMLP:
     def ensure(self, ids: list[int], wait=None) -> list[int]:
         """Return slot ids for `ids` (touch order = given order).
 
-        Misses are slot-assigned in order (LRU) but FETCHED as one coalesced
-        batch: eviction decisions never depend on fetch timing, while the IO
-        is span-merged and threaded.
+        Misses are slot-assigned in order (LRU) but FETCHED as one threaded
+        batch, each range straight into its slot's memory (no array is built
+        and no slot copy follows): eviction decisions never depend on fetch
+        timing. The slots it takes must be none a kernel in flight reads: the
+        decode path touches its hits before calling, and a layer's earlier
+        calls are evaluated by the time its routing is known.
         `wait`, when given, blocks on the batch's read futures in place of a
         plain wait (the decode path's GPU keepalive).
         """
@@ -214,15 +227,23 @@ class StreamingSwitchMLP:
             slots.append(self.id2slot[e])
         if missing:
             t0 = time.perf_counter()
-            rows = self.reader.read_experts(self.triples_loc, missing,
-                                            wait=wait)
-            for e in missing:
-                slot = self.id2slot[e]
-                for proj in PROJS:
-                    for part in self.parts:
-                        self.pool[proj][part][slot] = rows[e][proj][part]
+            self.reader.read_into(self.slot_requests(missing), wait=wait)
             self.fetch_s += time.perf_counter() - t0
         return slots
+
+    def slot_requests(self, ids: list[int]) -> list:
+        """reader.read_into's requests for experts that have their slots:
+        each of their ranges, into its slot's memory."""
+        reqs = []
+        for proj in PROJS:
+            for part in self.parts:
+                loc, mem = (self.triples_loc[proj][part],
+                            _storage(self.pool[proj][part]))
+                for e in ids:
+                    path, off, n = loc.expert_range(e)
+                    s = self.id2slot[e] * n
+                    reqs.append((path, off, n, mem[s:s + n]))
+        return reqs
 
     def resident(self, e: int) -> bool:
         return e in self.id2slot
@@ -284,11 +305,15 @@ class StreamingSwitchMLP:
             self.hits += 1
 
     def adopt(self, e: int, arrays: dict) -> None:
-        """Place expert e's already-read rows into a slot without IO.
+        """Place expert e's already-read arrays ({(e, proj, part): array}, as
+        the reader builds them) into a slot without IO: their bytes are
+        copied into the slot's memory, as ensure() reads them there.
 
         Used by the prefill sweep to warm the pool from data that just
-        streamed through a mini-pool. LRU semantics mirror ensure() (evicts
-        the LRU head when full); no hit/miss accounting — adoptions are free.
+        streamed through a mini-pool, and by the pipeline for what a step
+        read. LRU semantics mirror ensure() (evicts the LRU head when full);
+        no hit/miss accounting — adoptions are free. As for ensure(), no
+        kernel in flight may read the slot taken.
         """
         if e in self.id2slot:
             self.id2slot.move_to_end(e)
@@ -298,7 +323,9 @@ class StreamingSwitchMLP:
         self.adopted += 1
         for proj in PROJS:
             for part in self.parts:
-                self.pool[proj][part][slot] = arrays[proj][part]
+                src = memoryview(arrays[(e, proj, part)]).cast("B")
+                s = slot * len(src)
+                _storage(self.pool[proj][part])[s:s + len(src)] = src
 
     def reset_stats(self) -> None:
         self.hits = self.misses = self.evictions = 0
