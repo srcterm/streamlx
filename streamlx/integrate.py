@@ -218,17 +218,18 @@ class StreamingSwitchGLU(nn.Module):
 
     def _stream_forward(self, x: mx.array, idx: np.ndarray,
                         rows: dict, w=None) -> mx.array:
-        """One pipelined stream's layer: experts resident in the pool (which
-        the pipeline leaves unchanged during its step) from their slots, the
-        rest one by one from `rows`, the experts the stream read itself;
-        subsets permuted back as in _overlapped, so bitwise identical to one
-        call over the pool."""
+        """One pipelined stream's layer: the experts in the pool (the
+        pipeline rewrites no slot a stream of its step uses) from their
+        slots, the rest one by one from `rows`, the experts read as arrays
+        for want of a slot; subsets permuted back as in _overlapped, so
+        bitwise identical to one call over the pool."""
         pool = self.pool
         flat = idx.reshape(-1).tolist()
         lost = [e for e in dict.fromkeys(flat)
                 if e not in rows and not pool.resident(e)]
-        if lost:
-            pool.ensure(lost)        # a host changed the pool mid-step
+        if lost:                     # a host changed the pool mid-step
+            mx.synchronize()         # other streams' kernels leave its slots
+            pool.ensure(lost)
         res = [i for i, e in enumerate(flat) if e not in rows]
         own = [i for i, e in enumerate(flat) if e in rows]
         outs = []
@@ -511,7 +512,7 @@ class StreamingSwitchGLU(nn.Module):
                     if e in pool.id2slot:   # adopt() would rewrite its bytes
                         pool.id2slot.move_to_end(e)
                     else:
-                        pool.adopt(e, rows[e])
+                        pool.adopt(e, raw)
         if warm_ids:
             for i in np.argsort(counts, kind="stable"):  # ascending count
                 e = int(uniq[i])
@@ -523,9 +524,9 @@ class StreamingSwitchGLU(nn.Module):
         inv[order] = np.arange(order.size)
         y = mx.take(y, mx.array(inv.astype(np.uint32)), axis=0)
         y = y.reshape(b, t, k, -1)
-        # One eval materializes the layer output AND adopted pool slots,
-        # freeing this layer's mini-pools before the next layer runs.
-        mx.eval(y, *(pool.pool[p][q] for p in PROJS for q in pool.parts))
+        # One eval materializes the layer output, freeing this layer's
+        # mini-pools before the next layer runs.
+        mx.eval(y)
         return y
 
     def __call__(self, x: mx.array, indices: mx.array,
