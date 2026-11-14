@@ -327,18 +327,28 @@ class PipelinedDecoder:
     def _settle(self) -> None:
         """Every stream has computed these layers and a sync has run them:
         leave in each pool what the step's tokens would have left there one
-        after another (their order of use, and a slot for each expert read
-        as arrays) and drop the step's reads."""
+        after another (the experts used last, as many as it has slots, in
+        their order of use; a slot for each of them that was read as arrays)
+        and drop the step's reads."""
         t0 = time.perf_counter()
         for l in self._done:
             pool = self.pools[l]
             held, seq = self._reads.pop(l, {}), self._used.pop(l, ())
-            for uniq in seq:
-                for e in uniq:
-                    if e in pool.id2slot:
-                        pool.id2slot.move_to_end(e)
-                    elif e in held and held[e].rows:
-                        pool.adopt(e, held[e].fut.result())
+            # the step's experts, the last used first: the ones that stay
+            keep = list(dict.fromkeys(
+                e for uniq in reversed(seq) for e in reversed(uniq)))
+            keep = keep[:pool.n_slots]
+            # those with slots go to the recent end before any adoption, so
+            # an adoption takes a free slot or the slot of an expert that
+            # does not stay, never one a later token of the step used
+            for e in keep:
+                if e in pool.id2slot:
+                    pool.id2slot.move_to_end(e)
+            for e in keep:
+                if e not in pool.id2slot:          # read as arrays
+                    pool.adopt(e, held[e].fut.result())
+            for e in reversed(keep):               # their order of use
+                pool.id2slot.move_to_end(e)
             self._last[l] = {e for uniq in seq for e in uniq}
         self._done = []
         self.t_adopt += time.perf_counter() - t0
