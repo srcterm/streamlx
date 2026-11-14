@@ -128,7 +128,9 @@ class StreamingSwitchGLU(nn.Module):
         if upto <= done:
             done = -1
         states = []
-        for c in cache[done + 1:upto + 1]:
+        # from the last layer seen: what it stored after its MoE call
+        # (inkling2's convolution states) is new to this one
+        for c in cache[max(done, 0):upto + 1]:
             try:
                 st = c.state
             except Exception:    # an entry with nothing stored yet
