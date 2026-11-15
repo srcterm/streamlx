@@ -857,6 +857,21 @@ def pool_bytes(pools: dict) -> int:
     return sum(p.n_slots * p.expert_bytes for p in pools.values())
 
 
+def memory_limit() -> int:
+    """A default limit for MLX's memory: 95% of the GPU working set the system
+    recommends. Past that set a computation can come out wrong, not only
+    slow, so hosts keep under it."""
+    return int(0.95 * mx.device_info()["max_recommended_working_set_size"])
+
+
+def budget_within(limit: int, pools: dict, reserve: int = 0) -> int:
+    """The expert budget a memory limit leaves once the model is loaded: the
+    limit less what is resident beside the pools and `reserve` (what decoding
+    and a prompt cache will add); at least 1 GiB."""
+    resident = mx.get_active_memory() - pool_bytes(pools)
+    return max(int(limit - resident - reserve), 2**30)
+
+
 def resize_pools(pools: dict, budget_bytes: float) -> int:
     """Split `budget_bytes` over `pools` the way load_streaming_model splits
     its budget (equal bytes a pool, at least its min_slots, at most its

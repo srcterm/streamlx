@@ -3,15 +3,20 @@
 Wraps stock `mlx_lm.server` (all its flags pass through) but loads the model
 with streamlx: trunk resident, experts streamed from SSD on demand.
 
-  python examples/serve.py --budget-gib 16 \
-      --model <local-model-dir> --port 8080 [--trust-remote-code] \
-      [--tokenizer-config key=json ...] \
-      [--prompt-cache-gib N] [--mlx-cache-gib N] \
-      [--kv-cache-dir DIR [--kv-cache-gib N]] \
-      [--draft-head DIR [--draft-k 4] [--stream-draft-head]] \
-      [--memory-gib N] [--prefill-memory-gib N]
+  streamlx serve <local-model-dir> [--port 8080] \
+      [--memory-gib N] [--budget-gib N] \
+      [--kv-cache-dir DIR|none [--kv-cache-gib N]] \
+      [--draft-head DIR|none [--draft-k K] [--stream-draft-head]] \
+      [--trust-remote-code] [--tokenizer-config key=json ...] \
+      [--prompt-cache-gib N] [--mlx-cache-gib N] [--prefill-memory-gib N]
 
---model must be a LOCAL directory (the byte-range reader needs the shards on
+With no options: MLX's memory is kept under 95% of the GPU working set the
+system recommends (--memory-gib), the expert pools take what that leaves
+(--budget-gib caps them), prompt caches go to ~/.cache/streamlx/kv, and a
+checkpoint that carries a draft head (Qwen3.8, DeepSeek-V4.1, Inkling 2)
+decodes pipelined with it; one without decodes plainly.
+
+The model must be a LOCAL directory (the byte-range reader needs the shards on
 disk). Requests are handled sequentially: concurrent batching multiplies the
 per-step expert working set and collapses cache hit rates.
 
@@ -27,10 +32,14 @@ of unpageable memory. Both get hard byte caps here: --prompt-cache-gib
 resizing the expert pools, never above --budget-gib: before each request,
 for the cache it starts from plus what its prompt and max_tokens will add
 (at the bytes a token has added so far), with the rest of the peak taken from
-earlier requests; between prefill chunks it shrinks them if the next chunk
-would pass the limit. A long conversation so gives slots back as its cache
-grows, and a short one takes them again. Resizing copies the kept slots (~1 s
-for 16 GiB); outputs don't change. --prefill-memory-gib caps what a prefill
+earlier requests. A long conversation so gives slots back as its cache
+grows, and a short one takes them again. A prompt chunk's prefill needs
+working memory of its own, more the longer the chunk (DeepSeek-V4.1: 4 MiB a
+token), while the pools sit idle: its experts pass through the sweep's
+buffer. So the pools are sized for each chunk as it comes, from what earlier
+chunks held a token, and grow back for decoding, which reads again what the
+smaller pools dropped. Resizing copies the kept slots (~1 s for 16 GiB);
+outputs don't change. --prefill-memory-gib caps what a prefill
 holds beyond the arrays it uses: MLX's freed buffers (a third, at most
 0.25 GiB) and the expert reads queued ahead of the compute (the rest, at most
 0.5 GiB).
@@ -49,25 +58,27 @@ trim back to a divergence). Chunks are evened out, at most 1.25x
 --prefill-step-size, instead of ending in a small one: each chunk's expert
 sweep reads ~every expert.
 
-A checkpoint whose model writes its own message framing (Inkling 2: no
-generation prompt, every part of a reply opens with a content-type token)
-describes it in its tokenizer's response_template; the server sorts replies
-into reasoning, content and tool calls by it when mlx-lm has no format for
-the model.
+Chat formats are streamlx.chat_formats': the prompt format and tool calls of
+a checkpoint that ships no template (DeepSeek-V4.1), and the reply framing of
+a model that writes its own (Inkling 2), which the server sorts into
+reasoning, content and tool calls.
 
---kv-cache-dir moves prompt caches to SSD instead (streamlx.kvcache): stored
-once as segments shared by every request with the same prefix, so RAM holds
-only the active request's cache. --kv-cache-gib bounds the disk use (default
-32; oldest segments go first). A drive other than the model's avoids sharing
-its bandwidth with expert reads.
+Prompt caches live on SSD (streamlx.kvcache; --kv-cache-dir, default
+~/.cache/streamlx/kv): stored once as segments shared by every request with
+the same prefix, so RAM holds only the active request's cache.
+--kv-cache-gib bounds the disk use (default half of what is free there, at
+most 32; oldest segments go first). A drive other than the model's avoids
+sharing its bandwidth with expert reads. --kv-cache-dir none keeps them in
+RAM, under the caps above.
 
---draft-head decodes greedy requests through streamlx.pipeline (PEF): K tokens
-in flight, so each token's expert reads overlap the others'
-compute, with plain decoding's output. It takes what generate.py's does: the
-model directory for Qwen3.8, DeepSeek-V4.1 and Inkling 2, an mlx-vlm drafter
-directory otherwise. With --stream-draft-head, Qwen3.8's head streams its MoE layer
-through a pool taken out of --budget-gib (V4.1's stages always stream, in
-pools of their own). The self-gate's verdict carries across requests.
+A draft head decodes greedy requests through streamlx.pipeline: K tokens in
+flight, so each token's expert reads overlap the others' compute, with plain
+decoding's output. A checkpoint that carries one (Qwen3.8, DeepSeek-V4.1,
+Inkling 2) uses it by default; --draft-head takes an mlx-vlm drafter
+directory for other models, or none for plain decoding. With
+--stream-draft-head, Qwen3.8's head streams its MoE layer through a pool
+taken out of the budget (V4.1's stages always stream, in pools of their
+own). The self-gate's verdict carries across requests.
 Requests that sample, process logits or ask for logprobs decode plainly. On a
 prompt-cache hit the head's context starts at the tokens this request
 prefills: drafts are verified, so that can only cost acceptance, not change
@@ -82,7 +93,7 @@ import copy
 import itertools
 import json
 import os
-import re
+import shutil
 import sys
 import time
 
@@ -92,18 +103,19 @@ from mlx_lm.generate import (GenerationResponse, generation_stream,
                              maybe_quantize_kv_cache, wired_limit)
 from mlx_lm.models.cache import can_trim_prompt_cache
 
-from streamlx import attention
+from streamlx import attention, chat_formats
 from streamlx import integrate as _integrate
-from streamlx.integrate import (aggregate_stats, load_streaming_model,
+from streamlx.integrate import (aggregate_stats, budget_within,
+                                load_streaming_model, memory_limit,
                                 pool_bytes, prefill_cache, resize_pools)
 from streamlx.kvcache import PagedPromptCache
 
-_CFG = {"budget_bytes": 8 * 2**30, "trust": False, "tokenizer_config": {},
-        "prompt_cache_bytes": 4 * 2**30, "draft_head": None, "draft_k": 4,
+_CFG = {"budget_bytes": None, "trust": False, "tokenizer_config": {},
+        "prompt_cache_bytes": 4 * 2**30, "draft_head": "auto", "draft_k": None,
         "memory_bytes": 0, "mlx_cache_bytes": 2 * 2**30,
         "prefill_cache_bytes": 0, "stream_head": False}
 _STATE = {"pools": None, "reader": None, "all_pools": None,
-          "mem": {"F": None, "slope": None}}
+          "mem": {"F": None, "slope": None, "pre": None}}
 
 
 _orig_fetch = srv.LRUPromptCache.fetch_nearest_cache
@@ -142,81 +154,6 @@ def _recording_sampler(args, tokenizer):
 
 
 srv._make_sampler = _recording_sampler
-
-
-def _gen_suffix(tokenizer, template_args: dict) -> list[int]:
-    """The tokens the chat template appends for add_generation_prompt, e.g.
-    Qwen3.6's "<|im_start|>assistant\\n<think>\\n" ([] if none)."""
-    msgs = [{"role": "user", "content": "x"}]
-    try:
-        a, b = (list(tokenizer.apply_chat_template(
-            msgs, add_generation_prompt=g, tokenize=True, **template_args))
-            for g in (False, True))
-    except Exception:  # noqa: BLE001 — no template, or one needing more
-        return []
-    return b[len(a):] if b[:len(a)] == a else []
-
-
-def _template_response_format(tokenizer) -> bool:
-    """A model that writes its own message framing (inkling2: its template
-    has no generation prompt; the reply opens each part with a content-type
-    token and closes it with an end token) describes it in tokenizer_config's
-    `response_template`: fields with an open pattern and a close. Give the
-    tokenizer mlx-lm's response format made from it, unless it has one: the
-    server's text state machine then sorts the reply into reasoning, content
-    and tool calls, and drops the framing. Returns whether it did."""
-    tpl = tokenizer.init_kwargs.get("response_template")
-    if not isinstance(tpl, dict) or tokenizer.response_transitions:
-        return False
-    states = {"reasoning_content": "reasoning", "content": "normal",
-              "tool_calls": "tool"}
-    added = list(tokenizer.get_added_vocab())
-    trans, tool = {"header": []}, None
-    for name, field in (tpl.get("fields") or {}).items():
-        state, close = states.get(name), field.get("close")
-        # a part opens with a token the pattern matches by itself (what may
-        # precede it, a message header, is dropped as header text)
-        opens = [field["open"]] if field.get("open") else []
-        if field.get("open_pattern"):
-            pattern = re.compile(field["open_pattern"])
-            opens = [t for t in added if pattern.fullmatch(t)]
-        if state is None or not close or not opens:
-            continue
-        trans["header"] += [(t, state) for t in opens]
-        trans.setdefault(state, []).append((close, "header"))
-        if state == "tool":
-            tool = (field, opens[0])
-    if len(trans) < 2:
-        return False
-    tokenizer._response_format = {"initial_state": "header",
-                                  "transitions": trans}
-    if tool is not None:
-        field, start = tool
-        shape = (field.get("transform") or {}).get("function") or {
-            "name": "{content.name}", "arguments": "{content.arguments}"}
-
-        def fill(x, content):
-            """`{content.a.b}` -> that value of the parsed call."""
-            if isinstance(x, dict):
-                return {k: fill(v, content) for k, v in x.items()}
-            m = re.fullmatch(r"\{content((?:\.\w+)*)\}", x) \
-                if isinstance(x, str) else None
-            if m is None:
-                return x
-            for key in filter(None, m.group(1).split(".")):
-                content = content[key]
-            return content
-
-        def parse_tool_call(text, tools=None):
-            content = json.loads(text) if field.get("content") == "json" \
-                else text
-            call = fill(shape, content)
-            return {"name": call["name"], "arguments": call["arguments"]}
-
-        tokenizer._tool_parser = parse_tool_call
-        tokenizer._tool_call_start = start   # has_tool_calling
-        tokenizer._tool_call_end = None      # the response format closes it
-    return True
 
 
 def _chunks(n: int, step: int) -> list[int]:
@@ -259,6 +196,9 @@ def _snapshot(fetch, n: int, cache) -> None:
 _MARGIN = 2**28   # --memory-gib keeps this much of its limit free,
 _HYST = 2**28     # shrinks the pools when they pass it by this much
 _GROW = 2**30     # and grows them back when this much is free
+_PRE_MIN = 256    # a prompt chunk from this many tokens gets room of its own:
+_PRE_PRIOR = 4 * 2**20   # bytes a chunk token until a chunk has been measured
+#                          (DeepSeek-V4.1's 4 MiB, the most of the models run)
 
 
 @contextlib.contextmanager
@@ -297,59 +237,92 @@ def _fit_pools(target: float, why: str) -> None:
         return
     t0 = time.perf_counter()
     got = resize_pools(pools, max(target, 0))
-    print(f"[streamlx] memory: pools {have / 2**30:.1f} -> "
-          f"{got / 2**30:.1f} GiB ({why}; {time.perf_counter() - t0:.1f}s)",
-          file=sys.stderr)
+    if got != have:   # (pools that hold every expert have nothing to grow)
+        print(f"[streamlx] memory: pools {have / 2**30:.1f} -> "
+              f"{got / 2**30:.1f} GiB ({why}; "
+              f"{time.perf_counter() - t0:.1f}s)", file=sys.stderr)
 
 
 def _govern_request(kwargs: dict) -> None:
     """--memory-gib, before a request: pools sized so its peak should stay
-    under the limit. The rest of a peak (trunk, draft head, working set) is
-    what earlier requests measured above their pools and caches; the cache is
-    the one the request starts from plus the bytes a token has added so far
-    times the tokens it will add (its prompt and max_tokens)."""
+    under the limit. A peak is the pools, the cache (the one the request
+    starts from plus the bytes a token has added so far times the tokens to
+    come), what decoding holds besides (trunk, draft head, working set: the
+    most earlier requests measured) and, while a prompt chunk is prefilled,
+    that chunk's working memory, which grows with its length. The pools sit
+    idle while a chunk's experts pass through the sweep's buffer, so they are
+    sized for the first chunk here, for each later one by _govern_chunk, and
+    for decoding once the prompt is in."""
     lim, m = _CFG["memory_bytes"], _STATE["mem"]
     if not lim:
         return
     cache, prompt = kwargs.get("prompt_cache"), kwargs.get("prompt")
-    n_new = (len(prompt) if isinstance(prompt, list) else 0) + max(
-        0, kwargs.get("max_tokens", 256))
+    n_prompt = len(prompt) if isinstance(prompt, list) else 0
     cb = _cache_bytes(cache)
-    pools = pool_bytes(_STATE["all_pools"] or {})
-    rest = m["F"]
-    if rest is None:   # first request: what is resident now, plus 2 GiB
-        rest = mx.get_active_memory() - pools - cb + 2 * 2**30
-    grow = (m["slope"] or 0) * n_new
-    _fit_pools(lim - _MARGIN - _buffer_reserve() - rest - cb - grow,
-               f"cache {cb / 2**30:.2f} + {grow / 2**30:.2f} GiB to come")
+    m["base"] = (mx.get_active_memory() - cb
+                 - pool_bytes(_STATE["all_pools"] or {}))
+    # decoding's share; on the first request what is resident now plus 2 GiB
+    m["rest"] = m["F"] if m["F"] is not None else m["base"] + 2 * 2**30
     m["cb0"], m["peak_rest"] = cb, 0
+    m["to_come"] = max(0, kwargs.get("max_tokens", 256))
+    chunk = (_chunks(n_prompt, kwargs.get("prefill_step_size", 2048))[0]
+             if n_prompt else 0)
+    _fit_pools(_pools_for(cb, n_prompt + m["to_come"], chunk),
+               f"a prompt chunk of {chunk} tokens" if chunk >= _PRE_MIN
+               else "decoding")
+    _reset_peak()
+
+
+def _pools_for(cb: int, tokens: int, chunk: int = 0) -> float:
+    """The pool bytes that keep a peak under --memory-gib: with a cache of
+    cb bytes, `tokens` more to come and, for chunk >= _PRE_MIN, a prompt chunk
+    of that many tokens in prefill."""
+    m = _STATE["mem"]
+    pre = 0.0
+    if chunk >= _PRE_MIN:
+        pre = (_PRE_PRIOR if m["pre"] is None else m["pre"]) * chunk
+    return (_CFG["memory_bytes"] - _MARGIN - _buffer_reserve() - m["rest"]
+            - cb - (m["slope"] or 0) * tokens - pre)
+
+
+def _reset_peak() -> None:
+    """Start a new peak measurement, keeping the request's highest so far for
+    its summary line."""
+    m = _STATE["mem"]
+    m["peak_all"] = max(m.get("peak_all", 0), mx.get_peak_memory())
     mx.reset_peak_memory()
 
 
 def _govern_mark(cache) -> None:
-    """Record the request's peak above its pools and cache so far."""
+    """Record decoding's peak above its pools and cache so far."""
     m = _STATE["mem"]
     rest = (mx.get_peak_memory() - pool_bytes(_STATE["all_pools"] or {})
             - _cache_bytes(cache))
     m["peak_rest"] = max(m.get("peak_rest", 0), rest)
 
 
-def _govern_chunk(cache, done: int, left: int) -> None:
-    """--memory-gib between prefill chunks: shrink the pools if the next
-    chunk's peak, at the peak so far plus its tokens' cache, would pass the
-    limit (the first request's estimate can be short)."""
+def _govern_chunk(cache, done: int, n: int, nxt: int, left: int) -> None:
+    """--memory-gib after a prefill chunk of n tokens. Its working memory a
+    token is what its peak held above the pools, the cache and decoding's
+    share; the most over chunks is kept. Then the pools are sized for the
+    next chunk (nxt tokens), or after the last one for decoding: they grow
+    back, and decoding reads again what the smaller pools dropped."""
     lim, m = _CFG["memory_bytes"], _STATE["mem"]
-    if not lim or done <= 0:
+    if not lim:
         return
     cb = _cache_bytes(cache)
     _measure_slope(cb, done)
-    _govern_mark(cache)
-    over = (mx.get_peak_memory() + _buffer_reserve()
-            + (m["slope"] or 0) * left - (lim - _MARGIN))
-    if over >= _HYST:
-        _fit_pools(pool_bytes(_STATE["all_pools"] or {}) - over,
-                   "prefill guard")
-        mx.reset_peak_memory()
+    if n >= _PRE_MIN:
+        held = (mx.get_peak_memory() - cb
+                - pool_bytes(_STATE["all_pools"] or {})
+                - (m["base"] if m["F"] is None else m["F"]))
+        m["pre"] = max(m["pre"] or 0.0, held / n)
+    _fit_pools(_pools_for(cb, left + m["to_come"], nxt),
+               f"a prompt chunk of {nxt} tokens" if nxt >= _PRE_MIN
+               else "decoding")
+    _reset_peak()
+    if not nxt:
+        m["peak_rest"] = 0
 
 
 def _measure_slope(cb: int, n_tokens: int) -> None:
@@ -362,8 +335,8 @@ def _measure_slope(cb: int, n_tokens: int) -> None:
 
 
 def _govern_done(cache, n_tokens: int) -> None:
-    """After a request: the bytes a token adds to the cache and the peak
-    above pools and cache (kept as the maximum over requests)."""
+    """After a request: the bytes a token adds to the cache and decoding's
+    peak above pools and cache (kept as the maximum over requests)."""
     m = _STATE["mem"]
     if not _CFG["memory_bytes"]:
         return
@@ -405,7 +378,8 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
     tokens, done = mx.array(prompt[:cut]), 0
     cb(0, len(prompt))
     with wired_limit(model, [stream]), mx.stream(stream), _prefill_buffers():
-        for n in _chunks(cut, kwargs.get("prefill_step_size", 2048)):
+        sizes = _chunks(cut, kwargs.get("prefill_step_size", 2048))
+        for i, n in enumerate(sizes):
             chunk = tokens[None, done:done + n]
             with prefill_cache(cache):
                 if adapter is None:
@@ -425,7 +399,8 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
                 paged.save_progress(base + done, cache)
             cb(done, len(prompt))
             mx.clear_cache()
-            _govern_chunk(cache, done, len(prompt) - done)
+            _govern_chunk(cache, done, n, sizes[i + 1] if i + 1 < len(sizes)
+                          else 0, len(prompt) - done)
     if paged is None and fetch is not None:
         _snapshot(fetch, base + cut, cache)
     kwargs["prompt"] = prompt[cut:]
@@ -545,6 +520,7 @@ def _instrumented(fn):
         base = aggregate_stats(pools) if pools is not None else None
         r0 = reader.bytes_read if reader else 0
         mx.reset_peak_memory()
+        _STATE["mem"]["peak_all"] = 0
         _govern_request(kwargs)
         paged = _STATE.get("paged")
         dec = _pipelined_decoder(kwargs)
@@ -587,7 +563,9 @@ def _instrumented(fn):
                     msg += (f" | drafts {dec.draft_ok - drafted[0]}/"
                             f"{dec.draft_tried - drafted[1]}, gate "
                             f"{'on' if dec.drafting else 'off'}")
-                msg += f" | peak {mx.get_peak_memory() / 2**30:.1f} GiB"
+                peak = max(_STATE["mem"].get("peak_all", 0),
+                           mx.get_peak_memory())
+                msg += f" | peak {peak / 2**30:.1f} GiB"
                 if _CFG["memory_bytes"]:
                     pb = pool_bytes(_STATE["all_pools"])
                     msg += f", pools {pb / 2**30:.1f} GiB"
@@ -612,47 +590,75 @@ class StreamingModelProvider(srv.ModelProvider):
         if adapter_path is not None or draft_model_path is not None:
             raise ValueError("adapters/draft models not supported with "
                              "expert streaming")
+        from streamlx.pipeline_adapters import default_draft
+
         t0 = time.time()
+        auto = _CFG["budget_bytes"] is None
+        # (an automatic budget is set below, once what else is resident is
+        # known: the pools start small)
         model, tokenizer, pools, reader = load_streaming_model(
-            str(model_path), _CFG["budget_bytes"],
+            str(model_path), 2**30 if auto else _CFG["budget_bytes"],
             trust_remote_code=_CFG["trust"],
             tokenizer_config=_CFG["tokenizer_config"])
-        slots = sum(p.n_slots for p in pools.values())
         print(f"[streamlx] trunk loaded in {time.time()-t0:.1f}s; "
-              f"{len(pools)} pools, {slots} slots "
-              f"({_CFG['budget_bytes']/2**30:.1f} GiB)", file=sys.stderr)
+              f"{len(pools)} pools", file=sys.stderr)
         _STATE["pools"], _STATE["reader"] = pools, reader
         _STATE["all_pools"] = dict(pools)
         _STATE["decoder"] = None
-        if _CFG["draft_head"]:
+        head, k = default_draft(model_path, _CFG["draft_head"],
+                                _CFG["draft_k"])
+        drafter = None
+        if head:
             from streamlx.pipeline import PipelinedDecoder
             from streamlx.pipeline_adapters import adapter_for, load_drafter
 
             t0 = time.time()
-            drafter = load_drafter(_CFG["draft_head"], model, reader,
-                                   stream_head=_CFG["stream_head"])
+            try:
+                drafter = load_drafter(head, model, reader,
+                                       stream_head=_CFG["stream_head"])
+            except Exception as e:
+                if _CFG["draft_head"] != "auto":   # one that was asked for
+                    raise
+                print(f"[streamlx] the checkpoint's draft head did not load "
+                      f"({type(e).__name__}: {e}): plain decoding",
+                      file=sys.stderr)
+        if drafter is not None:
             ad = adapter_for(model, drafter)
-            _STATE["decoder"] = PipelinedDecoder(ad, pools, [],
-                                                 k_max=_CFG["draft_k"],
+            _STATE["decoder"] = PipelinedDecoder(ad, pools, [], k_max=k,
                                                  plain_fn=ad.plain)
             head_pools = getattr(drafter, "budget_pools", None) or {}
-            if head_pools:
-                # the head's experts share the budget with the trunk's
-                _STATE["all_pools"] = {**pools, **head_pools}
-                resize_pools(_STATE["all_pools"], _CFG["budget_bytes"])
+            # the head's experts share the budget with the trunk's
+            _STATE["all_pools"] = {**pools, **head_pools}
             print(f"[streamlx] draft head in {time.time()-t0:.1f}s, up to "
-                  f"{_CFG['draft_k']} tokens in flight"
+                  f"{k} tokens in flight"
                   + (f", {len(head_pools)} streamed MoE layer(s) in the "
                      f"budget" if head_pools else ""), file=sys.stderr)
+        if auto:
+            # what the memory limit leaves beside the trunk and the head is
+            # the most the pools may take; they start at what the first
+            # request's estimate would give them (_govern_request)
+            lim = _CFG["memory_bytes"]
+            _CFG["budget_bytes"] = (budget_within(lim - _MARGIN,
+                                                  _STATE["all_pools"])
+                                    if lim else 8 * 2**30)
+            start = (_CFG["budget_bytes"] - _buffer_reserve() - 2 * 2**30
+                     if lim else _CFG["budget_bytes"])
+        else:
+            start = _CFG["budget_bytes"]
+        got = resize_pools(_STATE["all_pools"], max(start, 2**30))
+        slots = sum(p.n_slots for p in _STATE["all_pools"].values())
+        print(f"[streamlx] expert pools: {slots} slots, {got / 2**30:.1f} GiB"
+              f" (at most {_CFG['budget_bytes'] / 2**30:.1f})",
+              file=sys.stderr)
 
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
-        if _template_response_format(tokenizer):
+        if chat_formats.reply_framing(tokenizer):
             print("[streamlx] reply framing from the checkpoint's "
                   "response_template", file=sys.stderr)
-        _STATE["suffix"] = _gen_suffix(tokenizer,
-                                       self.cli_args.chat_template_args)
+        _STATE["suffix"] = chat_formats.generation_suffix(
+            tokenizer, self.cli_args.chat_template_args)
         if _STATE["suffix"]:
             print(f"[streamlx] history ends before "
                   f"{tokenizer.decode(_STATE['suffix'])!r}", file=sys.stderr)
@@ -674,7 +680,9 @@ def _auto_prompt_cache_bytes(ram: int, budget: int) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument("--budget-gib", type=float, default=8.0)
+    ap.add_argument("--budget-gib", type=float, default=None,
+                    help="most RAM the expert pools take (default: what "
+                         "--memory-gib leaves; 8 without a limit)")
     ap.add_argument("--trust-remote-code", action="store_true")
     ap.add_argument("--tokenizer-config", action="append", default=[],
                     metavar="KEY=JSON",
@@ -686,17 +694,21 @@ def main() -> None:
                          "[1, 8]); replaces --prompt-cache-bytes here")
     ap.add_argument("--mlx-cache-gib", type=float, default=2.0,
                     help="cap for MLX's freed-buffer cache (default 2; "
-                         "MLX's own default hoards ~95% of RAM)")
-    ap.add_argument("--kv-cache-dir", default=None,
-                    help="keep prompt caches on SSD in this directory "
-                         "(paged; replaces the RAM prompt cache)")
-    ap.add_argument("--kv-cache-gib", type=float, default=32.0,
-                    help="disk space for --kv-cache-dir (default 32)")
-    ap.add_argument("--draft-head", default=None,
-                    help="draft head (generate.py's --draft-head): pipelined "
-                         "decoding of greedy requests")
-    ap.add_argument("--draft-k", type=int, default=4,
-                    help="tokens in flight with --draft-head (default 4)")
+                         "MLX's own default hoards ~95%% of RAM)")
+    ap.add_argument("--kv-cache-dir", default="~/.cache/streamlx/kv",
+                    help="prompt caches on SSD in this directory (default "
+                         "~/.cache/streamlx/kv); none: in RAM")
+    ap.add_argument("--kv-cache-gib", type=float, default=None,
+                    help="disk space for --kv-cache-dir (default: half of "
+                         "what is free there, at most 32)")
+    ap.add_argument("--draft-head", default="auto",
+                    help="draft head: pipelined decoding of greedy requests. "
+                         "Default: the checkpoint's own if it carries one, "
+                         "else plain decoding; a directory; none: plain")
+    ap.add_argument("--draft-k", type=int, default=None,
+                    help="tokens in flight with a draft head (default: 3 "
+                         "for Qwen3.8 and Inkling 2, 6 for DeepSeek-V4.1, "
+                         "else 4)")
     ap.add_argument("--stream-draft-head", action="store_true",
                     help="stream the draft head's MoE experts through a pool "
                          "in --budget-gib instead of loading them (Qwen3.8: "
@@ -709,11 +721,19 @@ def main() -> None:
                          "Default: --mlx-cache-gib and 0.5 GiB")
     ap.add_argument("--memory-gib", type=float, default=None,
                     help="keep MLX's memory (active + buffer cache) under "
-                         "this: before each request the expert pools are "
-                         "resized (at most --budget-gib) for the cache it "
-                         "will grow to, from earlier requests' peaks")
+                         "this by resizing the expert pools (at most "
+                         "--budget-gib): for each prompt chunk, then for "
+                         "decoding. Default: 95%% of the GPU working set the "
+                         "system recommends; 0: no limit")
     ours, rest = ap.parse_known_args()
-    _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
+    if {"-h", "--help"} & set(rest):   # ours, then mlx_lm.server's own
+        print("streamlx serve <model dir> [options]\n\nstreamlx options:")
+        print(ap.format_help().split("options:", 1)[-1].rstrip())
+        print("\nmlx_lm.server options:\n", flush=True)
+        sys.argv = [sys.argv[0]] + rest
+        srv.main()
+    if ours.budget_gib is not None:
+        _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
     _CFG["trust"] = ours.trust_remote_code
     _CFG["draft_head"], _CFG["draft_k"] = ours.draft_head, ours.draft_k
     _CFG["stream_head"] = ours.stream_draft_head
@@ -725,11 +745,11 @@ def main() -> None:
         _CFG["prompt_cache_bytes"] = int(ours.prompt_cache_gib * 2**30)
     else:
         _CFG["prompt_cache_bytes"] = _auto_prompt_cache_bytes(
-            ram, _CFG["budget_bytes"])
+            ram, _CFG["budget_bytes"] or 8 * 2**30)
     _CFG["mlx_cache_bytes"] = int(ours.mlx_cache_gib * 2**30)
     mx.set_cache_limit(_CFG["mlx_cache_bytes"])
-    if ours.memory_gib:
-        _CFG["memory_bytes"] = int(ours.memory_gib * 2**30)
+    _CFG["memory_bytes"] = (memory_limit() if ours.memory_gib is None
+                            else int(ours.memory_gib * 2**30))
     if ours.prefill_memory_gib:
         cap = int(ours.prefill_memory_gib * 2**30)
         _CFG["prefill_cache_bytes"] = min(_CFG["mlx_cache_bytes"],
@@ -737,20 +757,28 @@ def main() -> None:
         reads = cap - _CFG["prefill_cache_bytes"]
         _integrate._NEXT_BYTES = max(2**26, min(_integrate._NEXT_BYTES, reads))
     attention.install()
-    if ours.kv_cache_dir:
+    if ours.kv_cache_dir and ours.kv_cache_dir != "none":
+        kv_dir = os.path.expanduser(ours.kv_cache_dir)
+        os.makedirs(kv_dir, exist_ok=True)
+        kv_gib = ours.kv_cache_gib
+        if kv_gib is None:   # half of what the volume has free, at most 32
+            kv_gib = max(1.0, min(32.0,
+                                  shutil.disk_usage(kv_dir).free / 2**31))
+
         def paged(*_args, **_kwargs):
-            _STATE["paged"] = PagedPromptCache(
-                ours.kv_cache_dir, int(ours.kv_cache_gib * 2**30))
+            _STATE["paged"] = PagedPromptCache(kv_dir, int(kv_gib * 2**30))
             return _STATE["paged"]
 
         srv.LRUPromptCache = paged
-        where = (f"prompt caches on SSD at {ours.kv_cache_dir} "
-                 f"(<= {ours.kv_cache_gib:.0f} GiB)")
+        where = (f"prompt caches on SSD at {kv_dir} "
+                 f"(<= {kv_gib:.0f} GiB)")
     else:
         where = (f"prompt-cache cap "
                  f"{_CFG['prompt_cache_bytes'] / 2**30:.1f} GiB")
-    print(f"[streamlx] ram guard: {ram / 2**30:.0f} GiB RAM, {where}, "
-          f"mlx buffer-cache cap {ours.mlx_cache_gib:.1f} GiB",
+    lim = _CFG["memory_bytes"]
+    print(f"[streamlx] ram guard: {ram / 2**30:.0f} GiB RAM, "
+          + (f"MLX memory <= {lim / 2**30:.1f} GiB, " if lim else "")
+          + f"{where}, mlx buffer-cache cap {ours.mlx_cache_gib:.1f} GiB",
           file=sys.stderr)
     for pair in ours.tokenizer_config:
         key, sep, val = pair.partition("=")

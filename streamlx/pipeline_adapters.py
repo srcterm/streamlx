@@ -410,6 +410,59 @@ def _vlm_target(model, cfg):
         args=vlm_args, model=model.model, lm_head=model.lm_head))
 
 
+# Model types whose checkpoints carry their own draft head, and the tokens in
+# flight that suit it.
+HEAD_K = {"qwen4_exp": 3, "deepseek_v41": 6, "inkling2": 3}
+
+
+def checkpoint_head(model_dir) -> str | None:
+    """The model directory if its checkpoint carries a draft head this
+    module loads (HEAD_K's model types: `mtp.` tensors in the shards, or an
+    mtp.safetensors beside them), else None."""
+    import json
+    from pathlib import Path
+
+    root = Path(model_dir)
+    try:
+        mt = json.loads((root / "config.json").read_text()).get("model_type")
+    except OSError:
+        return None
+    if mt not in HEAD_K:
+        return None
+    if (root / "mtp.safetensors").exists():
+        return str(root)
+    try:
+        names = json.loads(
+            (root / "model.safetensors.index.json").read_text())["weight_map"]
+    except (OSError, KeyError, ValueError):
+        return None
+    if any(k.startswith("mtp.") or ".mtp." in k for k in names):
+        return str(root)
+    return None
+
+
+def default_draft(model_dir, head: str | None = "auto", k: int | None = None):
+    """(draft head directory or None, tokens in flight) for a --draft-head and
+    --draft-k: "auto" is the checkpoint's own head when it carries one, "none"
+    plain decoding, anything else a directory; k defaults to the model type's
+    in HEAD_K, else 4."""
+    import json
+    from pathlib import Path
+
+    if head == "auto":
+        head = checkpoint_head(model_dir)
+    elif head == "none":
+        head = None
+    if not head:
+        return None, 0
+    try:
+        mt = json.loads((Path(model_dir) / "config.json").read_text()).get(
+            "model_type")
+    except OSError:
+        mt = None
+    return head, k or HEAD_K.get(mt, 4)
+
+
 def load_drafter(path: str, model, reader=None, stream_head: bool = False):
     """A pipeline drafter for `model` from an mlx-vlm drafter directory, e.g.
     `python -m mlx_vlm.split_mtp --model <checkpoint with its draft head>

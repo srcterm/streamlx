@@ -3,24 +3,30 @@
 Streams tokens to stdout live, then prints the punchline stats
 (model size vs machine RAM vs resident memory, tok/s).
 
-  python examples/generate.py --model <local-model-dir> --budget-gib 16 \
-      --prompt "..." --max-tokens 200 [--trust-remote-code] \
-      [--draft-head DIR [--draft-k 4]]
+  streamlx generate <local-model-dir> --prompt "..." [--max-tokens 200] \
+      [--budget-gib N] [--raw] [--chat-template-args JSON] \
+      [--draft-head DIR|none [--draft-k K]] [--trust-remote-code]
 
---draft-head decodes through streamlx.pipeline with an mlx-vlm block
-drafter (pip install mlx-vlm), e.g. Mistral Large 4's bundled DSpark head
-split out once with `python -m mlx_vlm.split_mtp --model <checkpoint>
---output <dir> --q-bits 4`: K tokens in flight, so each
+With no options the expert pools take what the memory limit leaves (95% of
+the GPU working set the system recommends, less the model's resident part
+and 4 GiB), the prompt goes through the checkpoint's chat template (--raw:
+as it is), and a checkpoint that carries a draft head (Qwen3.8,
+DeepSeek-V4.1, Inkling 2) decodes pipelined with it.
+
+A draft head decodes through streamlx.pipeline: K tokens in flight, so each
 token's expert reads overlap the others' compute; greedy output identical
 to plain decoding. A self-gate times drafting against plain decoding and
-keeps whichever is faster. DeepSeek-V4.1, Qwen3.8 and Inkling 2 read their
-heads from the checkpoint: --draft-head is the model directory, with
---draft-k 6 for V4.1 and 3 for Qwen3.8 and Inkling 2.
+keeps whichever is faster. DeepSeek-V4.1, Qwen3.8 and Inkling 2 carry their
+heads in the checkpoint (--draft-head <model dir> where it is not the
+default); otherwise --draft-head is an mlx-vlm block drafter's directory,
+e.g. Mistral Large 4's DSpark head split out once with `python -m
+mlx_vlm.split_mtp --model <checkpoint> --output <dir> --q-bits 4`.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -30,7 +36,8 @@ import mlx.core as mx
 from mlx_lm.generate import generation_stream, wired_limit
 from mlx_lm.models.cache import make_prompt_cache
 
-from streamlx.integrate import (aggregate_stats, load_streaming_model,
+from streamlx.integrate import (aggregate_stats, budget_within,
+                                load_streaming_model, memory_limit,
                                 prefill_cache, resize_pools)
 
 PREFILL_STEP = 4096
@@ -44,50 +51,83 @@ def model_size_gb(model_dir: str) -> float:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True)
-    ap.add_argument("--budget-gib", type=float, default=16.0)
+    ap.add_argument("--budget-gib", type=float, default=None,
+                    help="RAM for the expert pools (default: what the "
+                         "memory limit leaves)")
     ap.add_argument("--prompt", default="Explain, step by step, why "
                     "mixture-of-experts models can stream from SSD.")
     ap.add_argument("--max-tokens", type=int, default=200)
     ap.add_argument("--trust-remote-code", action="store_true")
-    ap.add_argument("--draft-head", default=None,
-                    help="mlx-vlm drafter directory: pipelined decoding")
+    ap.add_argument("--raw", action="store_true",
+                    help="the prompt is the model's input as it is (default: "
+                         "inside the checkpoint's chat template)")
+    ap.add_argument("--chat-template-args", type=json.loads, default={},
+                    help="JSON for the chat template, e.g. "
+                         "'{\"enable_thinking\": false}'")
+    ap.add_argument("--draft-head", default="auto",
+                    help="draft head: pipelined decoding. Default: the "
+                         "checkpoint's own if it carries one, else plain "
+                         "decoding; a directory; none: plain")
     ap.add_argument("--stream-draft-head", action="store_true",
                     help="stream the draft head's MoE experts through a pool "
                          "in --budget-gib instead of loading them")
-    ap.add_argument("--draft-k", type=int, default=4,
-                    help="tokens in flight with --draft-head (default 4)")
+    ap.add_argument("--draft-k", type=int, default=None,
+                    help="tokens in flight with a draft head (default: 3 "
+                         "for Qwen3.8 and Inkling 2, 6 for DeepSeek-V4.1, "
+                         "else 4)")
     args = ap.parse_args()
+    from streamlx.pipeline_adapters import default_draft
 
     size = model_size_gb(args.model)
     ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
     print(f"model: {Path(args.model).name}  ({size:.0f} GB weights)")
-    print(f"machine RAM: {ram:.0f} GB  |  expert budget: "
-          f"{args.budget_gib:.0f} GiB\n")
+    mx.set_cache_limit(2 * 2**30)   # MLX's own would keep ~all freed buffers
 
     t0 = time.time()
+    auto = args.budget_gib is None   # sized below, once the rest is resident
     model, tokenizer, pools, reader = load_streaming_model(
-        args.model, int(args.budget_gib * 2**30),
+        args.model, 2**30 if auto else int(args.budget_gib * 2**30),
         trust_remote_code=args.trust_remote_code)
     print(f"[load] trunk resident in {time.time()-t0:.1f}s "
           f"(experts stay on SSD)", file=sys.stderr)
 
     drafter = ad = None
-    if args.draft_head:
+    all_pools = dict(pools)
+    head, draft_k = default_draft(args.model, args.draft_head, args.draft_k)
+    if head:
         from streamlx.pipeline_adapters import adapter_for, load_drafter
 
         t0 = time.time()
-        drafter = load_drafter(args.draft_head, model, reader,
-                               stream_head=args.stream_draft_head)
+        try:
+            drafter = load_drafter(head, model, reader,
+                                   stream_head=args.stream_draft_head)
+        except Exception as e:  # noqa: BLE001
+            if args.draft_head != "auto":   # one that was asked for
+                raise
+            print(f"[load] the checkpoint's draft head did not load "
+                  f"({type(e).__name__}: {e}): plain decoding",
+                  file=sys.stderr)
+    if drafter is not None:
         ad = adapter_for(model, drafter)
-        head_pools = getattr(drafter, "budget_pools", None) or {}
-        if head_pools:   # the head's experts share the budget with the trunk's
-            resize_pools({**pools, **head_pools}, int(args.budget_gib * 2**30))
+        # the head's experts share the budget with the trunk's
+        all_pools.update(getattr(drafter, "budget_pools", None) or {})
         print(f"[load] draft head in {time.time()-t0:.1f}s", file=sys.stderr)
+    # the memory limit, less what is resident, MLX's buffer cache and 2 GiB
+    budget = (budget_within(memory_limit(), all_pools, reserve=4 * 2**30)
+              if auto else int(args.budget_gib * 2**30))
+    budget = resize_pools(all_pools, budget)
+    print(f"machine RAM: {ram:.0f} GB  |  expert budget: "
+          f"{budget / 2**30:.1f} GiB\n")
 
     # what stream_generate holds while it runs: MLX's buffers stay wired
     # instead of pageable, so a large trunk is not compressed or swapped
     with wired_limit(model, [generation_stream]):
-        ids = tokenizer.encode(args.prompt)
+        if args.raw or not getattr(tokenizer, "has_chat_template", False):
+            ids = tokenizer.encode(args.prompt)
+        else:
+            ids = list(tokenizer.apply_chat_template(
+                [{"role": "user", "content": args.prompt}],
+                add_generation_prompt=True, **args.chat_template_args))
         cache = make_prompt_cache(model)
         context = []
         for i in range(0, len(ids), PREFILL_STEP):
@@ -125,7 +165,7 @@ def main() -> int:
                                 mx.array([ids[1:]], dtype=mx.int32))
             # plain_fn arms the self-gate: drafting only while it is faster
             dec = PipelinedDecoder(ad, pools, ad.views(cache),
-                                   k_max=args.draft_k, plain_fn=ad.plain)
+                                   k_max=draft_k, plain_fn=ad.plain)
             emit(first)
             out = dec.generate(first, hidden[:, -1:], len(ids),
                                args.max_tokens, on_token=emit, stop=eos)
