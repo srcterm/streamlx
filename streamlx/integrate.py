@@ -22,7 +22,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .pool import KEEPALIVE, StreamingSwitchMLP, keepalive_wait, switch_forward
+from .pool import (KEEPALIVE, StreamingSwitchMLP, gpu_hold, keepalive_wait,
+                   switch_forward)
 from .reader import ExpertReader
 from .stindex import PROJS, SafetensorsIndex
 
@@ -554,8 +555,11 @@ class StreamingSwitchGLU(nn.Module):
             idx = (np.array(indices) if hint.idx is None
                    else hint.idx.reshape(indices.shape))
             return self._stream_forward(x, idx, hint.rows, w)
+        t0 = time.perf_counter()
         idx = np.array(indices)  # materializes the gate's selection (sync)
-        if not decode and _PREFILL["cache"] is not None:
+        if decode:
+            gpu_hold(time.perf_counter() - t0)   # see pool._GpuHold
+        elif _PREFILL["cache"] is not None:
             self._own_cache_states()
         uniq = list(dict.fromkeys(idx.reshape(-1).tolist()))
         if len(uniq) > self.pool.n_slots:
