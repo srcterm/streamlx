@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 import mlx.core as mx
 import numpy as np
 
-from .stindex import PROJS, SafetensorsIndex, TensorLoc
+from .stindex import SafetensorsIndex, TensorLoc
 
 F_NOCACHE = getattr(fcntl, "F_NOCACHE", 48)
 F_RDAHEAD = getattr(fcntl, "F_RDAHEAD", 45)
@@ -57,6 +57,7 @@ class ExpertReader:
         self._ex = ThreadPoolExecutor(max_workers=workers)
         self.bytes_read = 0      # actual bytes off the device (incl. gap waste)
         self.reads = 0           # preads issued (post-merge)
+        self._vectors: dict[str, np.ndarray] = {}   # tensor name -> its values
 
     def _fd(self, path: str) -> int:
         with self._fd_lock:
@@ -183,25 +184,41 @@ class ExpertReader:
         batch, each tensor built from its bytes on the thread that read them,
         so the copy overlaps the other reads instead of following them on the
         compute thread. Safe from any thread (no ops are created)."""
-        requests, locs = [], {}
+        requests, locs, small = [], {}, {}
         for e in ids:
-            for proj in PROJS:
-                for part in layer_triples[proj]:
-                    loc = layer_triples[proj][part]
+            for proj, parts in layer_triples.items():
+                for part, loc in parts.items():
+                    if len(loc.shape) == 1:
+                        small[(e, proj, part)] = mx.array(self._vector(loc)[e])
+                        continue
                     path, off, n = loc.expert_range(e)
                     requests.append(((e, proj, part), path, off, n))
                     locs[(e, proj, part)] = loc
-        return self.read_ranges(
+        out = self.read_ranges(
             requests, lambda key, view: self._stored(view, locs[key]), wait)
+        out.update(small)
+        return out
+
+    def _vector(self, loc: TensorLoc) -> np.ndarray:
+        """A tensor with one value per expert (nvfp4's global_scale), read
+        whole the first time and kept."""
+        v = self._vectors.get(loc.name)
+        if v is None:
+            n = loc.shape[0] * loc.row_stride
+            raw = os.pread(self._fd(loc.path), n, loc.abs_start)
+            if len(raw) != n:
+                raise IOError(f"short read of {loc.name}")
+            v = self._vectors[loc.name] = np.frombuffer(
+                raw, dtype=_NP_VIEW[loc.dtype])
+        return v
 
     def experts_from_arrays(self, layer_triples: dict, ids: list[int],
                             arrays: dict) -> dict:
         """{e: {proj: {part: mx.array}}} from read_experts_arrays: the dtype
         views only. Must run on the thread that will build the compute graph."""
-        return {e: {proj: {part: self._viewed(arrays[(e, proj, part)],
-                                              layer_triples[proj][part])
-                           for part in layer_triples[proj]}
-                    for proj in PROJS}
+        return {e: {proj: {part: self._viewed(arrays[(e, proj, part)], loc)
+                           for part, loc in parts.items()}
+                    for proj, parts in layer_triples.items()}
                 for e in ids}
 
     def reset_stats(self) -> None:

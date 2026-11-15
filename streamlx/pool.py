@@ -24,7 +24,7 @@ import numpy as np
 from mlx_lm.models.activations import swiglu
 
 from .reader import ExpertReader
-from .stindex import PARTS, PROJS, SafetensorsIndex
+from .stindex import PARTS, SafetensorsIndex
 
 # STREAMLX_KEEPALIVE=0 turns off the decode-time GPU keepalive and state job
 # below and the wrapper's early output dispatch (integrate.py).
@@ -187,8 +187,9 @@ def switch_forward(x: mx.array, indices: mx.array, triples: dict,
     """Mirror of SwitchGLU.__call__ decode path (indices.size < 64, no bias).
 
     x: [B, T, D]; indices: [B, T, k] (expert ids for the full tensors, or
-    slot ids for pool tensors). triples: {proj: {weight, scales[, biases]}}
-    (mxfp modes ship no biases). qparams: {proj: (in_features,
+    slot ids for pool tensors). triples: {proj: {weight, scales[, biases]
+    [, global_scale]}} (the float modes ship no biases; nvfp4 may carry a
+    scale per expert). qparams: {proj: (in_features,
     out_features, bits, group_size, mode)}. act: the model's activation
     module when it is not plain SwiGLU, called with SwitchGLU's (up, gate)
     order. escales: optional (gate_vec[E], out_vec[E], eidx) per-expert
@@ -197,6 +198,9 @@ def switch_forward(x: mx.array, indices: mx.array, triples: dict,
     hold pool slot ids, a different numbering). weights: routing weights
     shaped like `indices`, for an activation that applies them itself
     before the down projection (deepseek_v41), called act(up, gate, w).
+
+    With gate and up in one projection (inkling2: gate rows even, up rows
+    odd) the call mirrors that model's Experts: act(gate, up), its own.
     """
     x = mx.expand_dims(x, -2 if sorted_indices else (-2, -3))
 
@@ -206,7 +210,12 @@ def switch_forward(x: mx.array, indices: mx.array, triples: dict,
         return mx.gather_qmm(inp, t["weight"], t["scales"], t.get("biases"),
                              rhs_indices=indices, transpose=True,
                              group_size=gs, bits=bits, mode=mode,
+                             global_scale=t.get("global_scale"),
                              sorted_indices=sorted_indices)
+
+    if "gate_up_proj" in triples:
+        gu = qmm(x, "gate_up_proj")
+        return qmm(act(gu[..., 0::2], gu[..., 1::2]), "down_proj").squeeze(-2)
 
     def esc(vec, eidx, like):
         sc = vec[eidx].astype(like.dtype)
@@ -238,12 +247,15 @@ class StreamingSwitchMLP:
         self.layer = layer
         self.tag = tag              # module path of a non-trunk block
         self.triples_loc = self.index.switch_triples(layer, tag=tag)
+        # the layer's projections: gate / up / down, or gate+up / down
+        self.projs = projs = tuple(self.triples_loc)
         self.qparams = {p: self.index.quant_params(self.triples_loc[p])
-                        for p in PROJS}
-        # parts present in this layer's tensors (affine: W/S/B; mxfp: W/S)
+                        for p in projs}
+        # parts present in this layer's tensors (affine: W/S/B; mxfp: W/S;
+        # nvfp4 with a scale per expert: W/S/G)
         self.parts = tuple(pt for pt in PARTS
-                           if pt in self.triples_loc["gate_proj"])
-        k_any = self.triples_loc["gate_proj"]["weight"]
+                           if pt in self.triples_loc[projs[0]])
+        k_any = self.triples_loc[projs[0]]["weight"]
         self.n_experts = k_any.shape[0]
         self.expert_bytes = sum(loc.row_stride
                                 for parts in self.triples_loc.values()
@@ -270,7 +282,7 @@ class StreamingSwitchMLP:
             return mx.zeros((n_slots,) + loc.shape[1:], dtype=dt)
 
         self.pool = {p: {part: alloc(self.triples_loc[p][part])
-                         for part in self.parts} for p in PROJS}
+                         for part in self.parts} for p in projs}
         # expert -> slot, the least recently used first (the next to go)
         self.id2slot: OrderedDict[int, int] = OrderedDict()
         self.free = list(range(n_slots))
@@ -333,12 +345,20 @@ class StreamingSwitchMLP:
 
     def slot_requests(self, ids: list[int]) -> list:
         """reader.read_into's requests for experts that have their slots:
-        each of their ranges, into its slot's memory."""
+        each of their ranges, into its slot's memory. A part with one value
+        an expert (nvfp4's global_scale) is copied from RAM here."""
         reqs = []
-        for proj in PROJS:
+        for proj in self.projs:
             for part in self.parts:
                 loc, mem = (self.triples_loc[proj][part],
                             _storage(self.pool[proj][part]))
+                n = loc.row_stride
+                if len(loc.shape) == 1:
+                    vec = memoryview(self.reader._vector(loc)).cast("B")
+                    for e in ids:
+                        s = self.id2slot[e] * n
+                        mem[s:s + n] = vec[e * n:(e + 1) * n]
+                    continue
                 for e in ids:
                     path, off, n = loc.expert_range(e)
                     s = self.id2slot[e] * n
@@ -373,14 +393,14 @@ class StreamingSwitchMLP:
                     self.id2slot[e] = t    # keeps its place in the LRU order
                     self.slot_table[e] = t
             idx = mx.array(src, dtype=mx.uint32)
-            for proj in PROJS:
+            for proj in self.projs:
                 for part in self.parts:
                     a = mx.take(self.pool[proj][part], idx, axis=0)
                     mx.eval(a)
                     self.pool[proj][part] = a
             self.free = free
         else:
-            for proj in PROJS:
+            for proj in self.projs:
                 for part in self.parts:
                     old = self.pool[proj][part]
                     a = mx.concatenate(
@@ -421,7 +441,7 @@ class StreamingSwitchMLP:
         else:
             slot = self._take_slot_for(e)
         self.adopted += 1
-        for proj in PROJS:
+        for proj in self.projs:
             for part in self.parts:
                 src = memoryview(arrays[(e, proj, part)]).cast("B")
                 s = slot * len(src)

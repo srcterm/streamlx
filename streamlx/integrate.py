@@ -25,7 +25,7 @@ import numpy as np
 from .pool import (KEEPALIVE, StreamingSwitchMLP, gpu_hold, keepalive_wait,
                    switch_forward)
 from .reader import ExpertReader
-from .stindex import PROJS, SafetensorsIndex
+from .stindex import SafetensorsIndex
 
 
 _PF_EX = None   # the prefill sweeps' read queue: two batches in flight
@@ -129,7 +129,9 @@ class StreamingSwitchGLU(nn.Module):
         if upto <= done:
             done = -1
         states = []
-        for c in cache[done + 1:upto + 1]:
+        # from the last layer seen: what it stored after its MoE call
+        # (inkling2's convolution states) is new to this one
+        for c in cache[max(done, 0):upto + 1]:
             try:
                 st = c.state
             except Exception:    # an entry with nothing stored yet
@@ -248,7 +250,7 @@ class StreamingSwitchGLU(nn.Module):
             for i in own:
                 e = flat[i]
                 one = {p: {q: rows[e][p][q][None] for q in pool.parts}
-                       for p in PROJS}
+                       for p in pool.projs}
                 outs.append(switch_forward(x, zero, one, pool.qparams,
                                            pool.act,
                                            escales=self._esc([[[e]]]),
@@ -418,8 +420,8 @@ class StreamingSwitchGLU(nn.Module):
             res_pos = {e: j for j, e in enumerate(resident)}
             sl = mx.array(list(resident.values()), dtype=mx.uint32)
             taken = {p: {q: mx.take(pool.pool[p][q], sl, axis=0)
-                         for q in pool.parts} for p in PROJS}
-            mx.eval(*(taken[p][q] for p in PROJS for q in pool.parts))
+                         for q in pool.parts} for p in pool.projs}
+            mx.eval(*(taken[p][q] for p in pool.projs for q in pool.parts))
             pool.sweep_resident += len(resident)
             # those of them the sweep keeps warm go to the recent end first:
             # the adoptions below then take free slots or the slots of
@@ -476,10 +478,10 @@ class StreamingSwitchGLU(nn.Module):
             for e in ids:
                 if e in resident:
                     rows[e] = {p: {q: taken[p][q][res_pos[e]]
-                                   for q in pool.parts} for p in PROJS}
+                                   for q in pool.parts} for p in pool.projs}
             pool.sweep_experts += len(got)
             mini = {p: {q: mx.stack([rows[e][p][q] for e in ids])
-                        for q in pool.parts} for p in PROJS}
+                        for q in pool.parts} for p in pool.projs}
             i0 = bi * self.sweep_batch
             i1 = min(i0 + self.sweep_batch, len(uniq))
             sel = order[bounds[i0]:bounds[i1]]
@@ -585,12 +587,23 @@ class StreamingSwitchGLU(nn.Module):
         return y
 
 
+def _switch_name(mlp) -> str | None:
+    """A MoE block's stacked experts: `switch_mlp`, or inkling2's `experts`
+    (gate and up in one projection)."""
+    if hasattr(mlp, "switch_mlp"):
+        return "switch_mlp"
+    sw = getattr(mlp, "experts", None)
+    if hasattr(sw, "gate_up_proj") or isinstance(sw, StreamingSwitchGLU):
+        return "experts"
+    return None
+
+
 def _moe_block(layer):
-    """The submodule holding switch_mlp: `mlp` in most mlx-lm MoE models,
-    `ffn` in deepseek_v4."""
+    """The submodule holding the stacked experts: `mlp` in most mlx-lm MoE
+    models, `ffn` in deepseek_v4."""
     for attr in ("mlp", "ffn"):
         m = getattr(layer, attr, None)
-        if m is not None and hasattr(m, "switch_mlp"):
+        if m is not None and _switch_name(m) is not None:
             return m
     return None
 
@@ -616,11 +629,15 @@ def _n_args(fn) -> int:
 
 
 def _wrap(layer, mlp, pool) -> None:
-    """Swap a block's switch_mlp for the streaming wrapper, carrying over
-    what the stock module computed besides the gathers."""
-    # A non-default activation (deepseek_v4's LimitedSwiGLU) must survive
-    # the swap; plain SwiGLU stays on the fused default.
-    act = getattr(mlp.switch_mlp, "activation", None)
+    """Swap a block's stacked experts for the streaming wrapper, carrying
+    over what the stock module computed besides the gathers."""
+    name = _switch_name(mlp)
+    sw = getattr(mlp, name)
+    # A non-default activation (deepseek_v4's LimitedSwiGLU, inkling2's
+    # act_fn) must survive the swap; plain SwiGLU stays on the fused default.
+    act = getattr(sw, "activation", None)
+    if act is None:
+        act = getattr(sw, "act_fn", None)
     if type(act).__name__ != "SwiGLU":
         pool.act = act
         # deepseek_v41 weights each expert's activation before its down
@@ -629,14 +646,14 @@ def _wrap(layer, mlp, pool) -> None:
     # Per-expert output scales are tiny [E] vectors riding the module being
     # dropped: materialize them now (expert tensors stay lazy). Trivial
     # all-ones stays None so models without them pay nothing.
-    gsv = getattr(mlp.switch_mlp, "gate_scale", None)
-    osv = getattr(mlp.switch_mlp, "out_scale", None)
+    gsv = getattr(sw, "gate_scale", None)
+    osv = getattr(sw, "out_scale", None)
     if gsv is not None and osv is not None:
         mx.eval(gsv, osv)
         if not (mx.all(gsv == 1) & mx.all(osv == 1)).item():
             pool.escales = (gsv, osv)
     _uncompile_ffn(layer)
-    mlp.switch_mlp = StreamingSwitchGLU(pool)
+    setattr(mlp, name, StreamingSwitchGLU(pool))
 
 
 def install_streaming(model, model_dir: str, n_slots: int):
@@ -664,7 +681,8 @@ def install_streaming(model, model_dir: str, n_slots: int):
 def _link_next_layers(model, pools: dict) -> None:
     """Point each streamed layer at the next streamed one for prefill
     next-layer reads (dense layers between them see the same tokens too)."""
-    ws = [_moe_block(model.layers[i]).switch_mlp for i in sorted(pools)]
+    blocks = [_moe_block(model.layers[i]) for i in sorted(pools)]
+    ws = [getattr(m, _switch_name(m)) for m in blocks]
     for a, b in zip(ws, ws[1:]):
         a._next = b
 
@@ -738,7 +756,8 @@ def _routed_topk(model_dir: str, default: int = 8) -> int:
 
 def _checkpoint_loader(model_dir: str):
     """The loader for a checkpoint mlx-lm can't run: DeepSeek-V4.1 with Engram
-    layers (mlx-lm refuses them) and Qwen3.8 (not in mlx-lm): mlx-vlm has both."""
+    layers (mlx-lm refuses them) and Qwen3.8 (not in mlx-lm): mlx-vlm has both.
+    Also for an oQ export of Inkling 2, which mlx-lm runs under its own layout."""
     import json
     from pathlib import Path
 
@@ -760,6 +779,11 @@ def _checkpoint_loader(model_dir: str):
         except ImportError as e:
             raise ImportError("Qwen3.8 needs mlx-vlm: pip install mlx-vlm") from e
         return load_qwen4_exp
+    if cfg.get("model_type") == "inkling2":
+        from .inkling2 import is_oq_export, load_inkling2
+
+        if is_oq_export(cfg):
+            return load_inkling2
     return None
 
 

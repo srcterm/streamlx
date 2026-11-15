@@ -13,9 +13,9 @@ split out once with `python -m mlx_vlm.split_mtp --model <checkpoint>
 --output <dir> --q-bits 4`: K tokens in flight, so each
 token's expert reads overlap the others' compute; greedy output identical
 to plain decoding. A self-gate times drafting against plain decoding and
-keeps whichever is faster. DeepSeek-V4.1 and Qwen3.8 read their heads from
-the checkpoint: --draft-head is the model directory, with --draft-k 6 for
-V4.1 and 3 for Qwen3.8.
+keeps whichever is faster. DeepSeek-V4.1, Qwen3.8 and Inkling 2 read their
+heads from the checkpoint: --draft-head is the model directory, with
+--draft-k 6 for V4.1 and 3 for Qwen3.8 and Inkling 2.
 """
 
 from __future__ import annotations
