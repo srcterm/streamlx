@@ -11,8 +11,9 @@ drafter). Each layer is split at the routing boundary:
              slot: from the arrays read for them) -> rest of layer
 
 A stream runs finish(l-1), begin(l) whenever its read has arrived and the
-stream before it has begun layer l; the least advanced such stream goes
-first, and only when none can run does the step wait for a read. So a
+stream before it has begun layer l (its last finish: once that stream is
+through the stack); the least advanced such stream goes first, and only when
+none can run does the step wait for a read. So a
 stream's read is in flight across the other streams' GPU phases, and a late
 read holds back its own stream, not the ones ahead of it. A begin is handed
 to the GPU and its routing read back only once the next ready stream's
@@ -368,8 +369,11 @@ class PipelinedDecoder:
     def _ready(self, streams: list, skip):
         """(the stream to run next, the reads still awaited): the least
         advanced stream, `skip` aside (its routing is not read back yet),
-        whose reads have arrived and, for a layer to begin, whose
-        predecessor has begun it (the cache takes the tokens in order)."""
+        whose reads have arrived and whose predecessor is a layer ahead: it
+        has begun the layer this one begins next, or, for the last layer's
+        finish, gone through the stack. The cache takes the tokens in order
+        in begin and in finish (Inkling 2 stores a convolution state in
+        finish that the next token's finish reads)."""
         n = self.n_layers
         best, late = None, []
         for s in streams:
@@ -378,7 +382,7 @@ class PipelinedDecoder:
             pending = [r.fut for r in s.reads if not r.fut.done()]
             if pending:
                 late += pending
-            elif ((s.l == n or s.i == 0 or streams[s.i - 1].l > s.l)
+            elif ((s.i == 0 or streams[s.i - 1].l > s.l)
                   and (best is None or s.l < best.l)):
                 best = s
         return best, late
