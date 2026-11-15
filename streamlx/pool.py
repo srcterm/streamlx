@@ -26,9 +26,10 @@ from mlx_lm.models.activations import swiglu
 from .reader import ExpertReader
 from .stindex import PARTS, PROJS, SafetensorsIndex
 
-# STREAMLX_KEEPALIVE=0 turns off the decode-time GPU keepalive below and the
-# wrapper's early output dispatch (integrate.py).
+# STREAMLX_KEEPALIVE=0 turns off the decode-time GPU keepalive and state job
+# below and the wrapper's early output dispatch (integrate.py).
 KEEPALIVE = os.environ.get("STREAMLX_KEEPALIVE", "1") != "0"
+GPU_HOLD = KEEPALIVE
 _KEEPALIVE_PERIOD_S = 50e-6
 _KEEPALIVE_LOCAL = threading.local()
 
@@ -60,6 +61,105 @@ class _GpuKeepalive:
             self._inflight.append(y)
             if len(self._inflight) > 2:
                 mx.eval(self._inflight.pop(0))
+
+
+class _GpuHold:
+    """Holds the GPU's performance state up through a decode that syncs on
+    every layer's routing.
+
+    Such a decode gives the GPU sub-millisecond bursts with the host in
+    between, and once another thread is busy next to it (one CPU-bound
+    thread in any process is enough) the system can run the same work at a
+    lower performance state (on an M4: 2x, at times 3.7x the time) for
+    seconds on end; on a quiet machine it does not. One sustained GPU job
+    of some tens of milliseconds raises the state for about two seconds;
+    short jobs and the keepalive's tiny kernels do not. So the switch reports
+    how long each routing sync of a one-token call took (a round trip of
+    one layer, no read in it); when their recent mean runs well above the
+    level seen right after a job, one job is run, a second apart at least.
+    With nothing to go by, a job says where the level is: at a thread's
+    first decode, then ten seconds after the last job, and twice as long
+    each time such a job changed nothing. One per thread, as the keepalive.
+    Pipelined steps do not report: their state drops when they read much,
+    and then the reads bound the step, not the GPU (the job cost them its
+    own time); the decoder's plain steps do.
+    """
+    WINDOW = 16        # routing syncs to a mean
+    SLOW = 1.25        # a mean this many times the level: run a job
+    PERIOD = 1.0       # seconds between jobs, at least
+    PROBE = 10.0       # seconds without a job before one is run anyway
+    MIN_JOB = 0.03     # seconds a job should last: its matmuls double below
+
+    def __init__(self):
+        self._a = None
+        self._mats = 6
+        self._n, self._sum = 0, 0.0
+        self._level = None             # the mean when the state is up
+        self._before = None            # the mean the last job followed,
+        self._probing = False          # until the next mean; it was a probe
+        self._probe = self.PROBE       # seconds to the next probe
+        self._last = 0.0               # (long ago: the first job comes soon)
+
+    def note(self, dt: float) -> None:
+        self._sum += dt
+        self._n += 1
+        if self._n < self.WINDOW:
+            return
+        mean, self._n, self._sum = self._sum / self._n, 0, 0.0
+        if self._before is not None:   # the first mean after a job
+            if self._probing:          # did the probe change anything?
+                self._probe = (self.PROBE if self._before > 1.1 * mean
+                               else min(2 * self._probe, 8 * self.PROBE))
+            self._level, self._before = mean, None
+            return
+        if self._level is None or mean < self._level:
+            self._level = mean         # as good as it gets now
+            return
+        self._level *= 1.001           # a longer context costs a little more
+        idle = time.perf_counter() - self._last
+        slow = mean > self.SLOW * self._level and idle >= self.PERIOD
+        if not slow and idle < self._probe:
+            return
+        self._before, self._probing = mean, not slow
+        if slow:
+            self._probe = self.PROBE
+        self.run()
+
+    def run(self) -> None:
+        if self._a is None:
+            self._a = mx.full((2048, 2048), 1 / 2048)
+        t0 = time.perf_counter()
+        y = self._a
+        for _ in range(self._mats):
+            y = y @ self._a
+        mx.eval(y)
+        self._last = time.perf_counter()
+        if self._last - t0 < self.MIN_JOB and self._mats < 96:
+            self._mats *= 2
+        with _HOLD_LOCK:
+            _HOLD_TOTAL[0] += 1
+            _HOLD_TOTAL[1] += self._last - t0
+
+
+# Jobs run and their seconds over every decode thread. A hold itself (and
+# its matrix on the GPU) is its thread's alone and goes when the thread does.
+_HOLD_LOCK = threading.Lock()
+_HOLD_TOTAL = [0, 0.0]
+
+
+def gpu_hold(dt: float) -> None:
+    """A one-token decode's routing sync took dt seconds (see _GpuHold)."""
+    if not GPU_HOLD:
+        return
+    h = getattr(_KEEPALIVE_LOCAL, "hold", None)
+    if h is None:
+        h = _KEEPALIVE_LOCAL.hold = _GpuHold()
+    h.note(dt)
+
+
+def gpu_hold_stats() -> tuple:
+    """(jobs run, their seconds) over every decode thread."""
+    return _HOLD_TOTAL[0], _HOLD_TOTAL[1]
 
 
 def keepalive_wait(futures, first: bool = False) -> None:
