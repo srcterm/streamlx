@@ -48,21 +48,27 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
+from mlx import nn
 from mlx.utils import tree_flatten
 from mlx_vlm.models.cache import cache_nbytes
-from mlx_vlm.models.deepseek_v41.engram import (OffloadedEngramEmbedding,
-                                                _engram_apply_gate,
-                                                _engram_gate_score)
+from mlx_vlm.models.deepseek_v41.engram import (
+    OffloadedEngramEmbedding,
+    _engram_apply_gate,
+    _engram_gate_score,
+)
 from mlx_vlm.models.deepseek_v41.fakequant import fake_quant_fp8_ue8m0
-from mlx_vlm.models.deepseek_v41.language import (DeepseekV41Block,
-                                                  DeepseekV41Cache, hc_expand,
-                                                  make_identity_pre_mix)
+from mlx_vlm.models.deepseek_v41.language import (
+    DeepseekV41Block,
+    DeepseekV41Cache,
+    hc_expand,
+    make_identity_pre_mix,
+)
 
 from . import chat_formats
 from .pipeline_adapters import StandardMoEAdapter, capture_layer_outputs
-from .stindex import DS_PROJ as _W, default_group_size
+from .stindex import DS_PROJ as _W
+from .stindex import default_group_size
 
 # what the server's prompt cache bounds itself with
 DeepseekV41Cache.nbytes = property(lambda c: cache_nbytes(c.state))

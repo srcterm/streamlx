@@ -36,9 +36,14 @@ import mlx.core as mx
 from mlx_lm.generate import generation_stream, wired_limit
 from mlx_lm.models.cache import make_prompt_cache
 
-from streamlx.integrate import (aggregate_stats, budget_within,
-                                load_streaming_model, memory_limit,
-                                prefill_cache, resize_pools)
+from streamlx.integrate import (
+    aggregate_stats,
+    budget_within,
+    load_streaming_model,
+    memory_limit,
+    prefill_cache,
+    resize_pools,
+)
 
 PREFILL_STEP = 4096
 
@@ -96,7 +101,7 @@ def main() -> int:
         t0 = time.time()
         try:
             drafter = load_drafter(head, model, reader)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             if args.draft_head != "auto":   # one that was asked for
                 raise
             print(f"[load] the checkpoint's draft head did not load "

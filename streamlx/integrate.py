@@ -13,19 +13,24 @@ dependency of expert streaming.
 
 from __future__ import annotations
 
+import itertools
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
+from mlx import nn
 
-from .pool import (KEEPALIVE, StreamingSwitchMLP, gpu_hold, keepalive_wait,
-                   switch_forward)
+from .pool import (
+    KEEPALIVE,
+    StreamingSwitchMLP,
+    gpu_hold,
+    keepalive_wait,
+    switch_forward,
+)
 from .reader import ExpertReader
 from .stindex import SafetensorsIndex
-
 
 _PF_EX = None   # the prefill sweeps' read queue: two batches in flight
 
@@ -127,7 +132,7 @@ class StreamingSwitchGLU(nn.Module):
         for c in cache[max(done, 0):upto + 1]:
             try:
                 st = c.state
-            except Exception:    # an entry with nothing stored yet
+            except Exception:  # noqa: BLE001, S112 — nothing stored yet
                 continue
             todo = [st]
             while todo:
@@ -661,7 +666,7 @@ def _link_next_layers(model, pools: dict) -> None:
     next-layer reads (dense layers between them see the same tokens too)."""
     blocks = [_moe_block(model.layers[i]) for i in sorted(pools)]
     ws = [getattr(m, _switch_name(m)) for m in blocks]
-    for a, b in zip(ws, ws[1:]):
+    for a, b in itertools.pairwise(ws):
         a._next = b
 
 

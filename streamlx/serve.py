@@ -88,13 +88,23 @@ import time
 
 import mlx.core as mx
 import mlx_lm.server as srv
-from mlx_lm.generate import (GenerationResponse, generation_stream,
-                             maybe_quantize_kv_cache, wired_limit)
+from mlx_lm.generate import (
+    GenerationResponse,
+    generation_stream,
+    maybe_quantize_kv_cache,
+    wired_limit,
+)
 
 from streamlx import attention, chat_formats
-from streamlx.integrate import (aggregate_stats, budget_within,
-                                load_streaming_model, memory_limit,
-                                pool_bytes, prefill_cache, resize_pools)
+from streamlx.integrate import (
+    aggregate_stats,
+    budget_within,
+    load_streaming_model,
+    memory_limit,
+    pool_bytes,
+    prefill_cache,
+    resize_pools,
+)
 from streamlx.kvcache import PagedPromptCache
 
 _CFG = {"budget_bytes": None, "trust": False, "tokenizer_config": {},
@@ -561,9 +571,9 @@ class StreamingModelProvider(srv.ModelProvider):
               f" (at most {_CFG['budget_bytes'] / 2**30:.1f})",
               file=sys.stderr)
 
-        if self.cli_args.use_default_chat_template:
-            if tokenizer.chat_template is None:
-                tokenizer.chat_template = tokenizer.default_chat_template
+        if (self.cli_args.use_default_chat_template
+                and tokenizer.chat_template is None):
+            tokenizer.chat_template = tokenizer.default_chat_template
         if chat_formats.reply_framing(tokenizer):
             print("[streamlx] reply framing from the checkpoint's "
                   "response_template", file=sys.stderr)

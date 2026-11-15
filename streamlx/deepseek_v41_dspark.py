@@ -29,15 +29,19 @@ import re
 from pathlib import Path
 
 import mlx.core as mx
-import mlx.nn as nn
+from mlx import nn
 from mlx.utils import tree_flatten
 from mlx_vlm.models.deepseek_v41.fakequant import fake_quant_fp8_ue8m0 as fq8
-from mlx_vlm.models.deepseek_v41.language import (DeepseekV41Block,
-                                                  DeepseekV41MoE, hc_expand)
+from mlx_vlm.models.deepseek_v41.language import (
+    DeepseekV41Block,
+    DeepseekV41MoE,
+    hc_expand,
+)
 
 from .integrate import _wrap
 from .pool import StreamingSwitchMLP
-from .stindex import DS_PROJ as _W, default_group_size
+from .stindex import DS_PROJ as _W
+from .stindex import default_group_size
 
 _HEADS = ("main_proj", "main_norm", "norm", "markov_head", "confidence_head")
 
@@ -183,9 +187,9 @@ class V41DSpark:
             for mod, qs in spec.items():
                 m = re.match(rf"language_model\.mtp\.{s}\.(.+)$", mod)
                 if m is not None and ".ffn.experts." not in mod:
-                    q[name_of(m.group(1))] = dict(
-                        group_size=_group(qs), bits=int(qs["bits"]),
-                        mode=qs.get("mode", "affine"))
+                    q[name_of(m.group(1))] = {
+                        "group_size": _group(qs), "bits": int(qs["bits"]),
+                        "mode": qs.get("mode", "affine")}
 
             def pred(path, mod, q=q):
                 return q.get(path, False) if hasattr(mod, "to_quantized") else False

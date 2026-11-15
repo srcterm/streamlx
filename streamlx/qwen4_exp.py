@@ -31,14 +31,17 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
-from mlx_vlm.models.qwen3_5_moe.language import \
-    Qwen3_5MoeSparseMoeBlock as _MoeBlock
+from mlx import nn
+from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock as _MoeBlock
 from mlx_vlm.models.qwen4_exp.language import (
-    _create_qwen3_5_ssm_mask, _create_qwen4_exp_attention_mask)
-from mlx_vlm.models.qwen4_exp.ple_storage import (PLE_MARKER,
-                                                  build_quantized_ple_manifest)
+    _create_qwen3_5_ssm_mask,
+    _create_qwen4_exp_attention_mask,
+)
+from mlx_vlm.models.qwen4_exp.ple_storage import (
+    PLE_MARKER,
+    build_quantized_ple_manifest,
+)
 
 from .pipeline_adapters import StandardMoEAdapter, _find_switch
 from .reader import open_nocache
@@ -264,10 +267,10 @@ def load_qwen4_exp(model_dir, tokenizer_config=None, model_config=None):
 def load_head(model_dir, model):
     """mlx-vlm's drafter on the checkpoint's `mtp.*` tensors, resident."""
     from mlx_vlm.models.qwen4_exp.fp8 import convert_qwen4_exp_fp8_weights
-    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.config import \
-        Qwen4ExpMTPConfig
-    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.qwen4_exp_mtp import \
-        Qwen4ExpMTPDraftModel
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.config import Qwen4ExpMTPConfig
+    from mlx_vlm.speculative.drafters.qwen4_exp_mtp.qwen4_exp_mtp import (
+        Qwen4ExpMTPDraftModel,
+    )
 
     root = Path(model_dir)
     cfg = json.loads((root / "config.json").read_text())
@@ -283,9 +286,10 @@ def load_head(model_dir, model):
     weights = head.sanitize(convert_qwen4_exp_fp8_weights(weights))
     record = cfg["quantization"]
     default = {k: record[k] for k in ("bits", "group_size", "mode")}
+    quantized = {k[:-len(".scales")] for k in weights if k.endswith(".scales")}
 
     def predicate(path, _module):
-        if f"{path}.scales" not in weights:
+        if path not in quantized:
             return False
         return dict(record.get(f"mtp.{path}", default))
 
