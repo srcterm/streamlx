@@ -14,10 +14,12 @@ A stream runs finish(l-1), begin(l) whenever its read has arrived and the
 stream before it has begun layer l; the least advanced such stream goes
 first, and only when none can run does the step wait for a read. So a
 stream's read is in flight across the other streams' GPU phases, and a late
-read holds back its own stream, not the ones ahead of it. Because the
-streams still touch each layer's cache in sequence order, the computation
-IS the sequential decode; the only new machinery is undoing the cache
-writes of drafts that turn out wrong.
+read holds back its own stream, not the ones ahead of it. A begin is handed
+to the GPU and its routing read back only once the next ready stream's
+begin is handed over too: the GPU has a routing to run while the host
+builds the next graph. Because the streams still touch each layer's cache
+in sequence order, the computation IS the sequential decode; the only new
+machinery is undoing the cache writes of drafts that turn out wrong.
 
 The model-specific pieces are a host ADAPTER (the same pattern as
 load_streaming_model's `loader=`): how to embed a token, split a layer,
@@ -56,7 +58,7 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -131,6 +133,8 @@ class Stream:
     need: tuple = ()            # the routed experts its pool lacks
     reads: tuple = ()           # the reads that hold them
     out: object = None          # its logits, once through the stack
+    done: list = field(default_factory=list)   # layers its finish was the
+    #                             last to compute, their pools not settled
 
 
 class _Read:
@@ -235,16 +239,15 @@ class PipelinedDecoder:
         # other's experts, and what the next token is likeliest to route to
         # stays, whatever the budget. With no such slot the expert is read
         # as arrays instead (handed to the streaming switch as
-        # pool.call_hint). Once every stream has computed a layer and a
-        # routing sync has run it, its pool takes the order, and the experts
-        # read as arrays, that the tokens would have left there one after
-        # another (_settle). An expert is read once a step however many
-        # streams route to it.
+        # pool.call_hint). Once every stream has computed a layer and an
+        # eval has run it, its pool takes the order, and the experts read as
+        # arrays, that the tokens would have left there one after another
+        # (_settle). An expert is read once a step however many streams
+        # route to it.
         self._reads: dict = {}             # layer -> {expert: _Read} this step
         self._used: dict = {}              # layer -> [stream's experts, ...]
         self._last: dict = {}              # layer -> the last step's experts
         self._fin: dict = {}               # layer -> streams finished
-        self._done: list = []              # layers computed, pool not updated
         self._k_cur = 0
         # an adapter whose begin() routes with the block's own code lets the
         # switch reuse that routing instead of syncing on it a second time
@@ -252,14 +255,20 @@ class PipelinedDecoder:
 
     # -- layer halves over the pools ---------------------------------------
     def _begin(self, s: Stream) -> None:
-        """The stream's next layer up to its routing; the routed experts no
-        pool slot nor read of this step holds start reading."""
+        """The stream's next layer up to its routing, handed to the GPU: the
+        host goes on meanwhile, _route reads the routing back."""
         l = s.l
-        s.st = st = self.ad.begin(l, s.h, s.ids, s.ctx, self.cache, s.pos)
+        s.st = self.ad.begin(l, s.h, s.ids, s.ctx, self.cache, s.pos)
+        mx.async_eval(s.st.inds)
+        s.l, s.need, s.reads = l + 1, (), ()
+
+    def _route(self, s: Stream) -> None:
+        """The routing of the layer the stream began (the sync); the routed
+        experts no pool slot nor read of this step holds start reading."""
+        l, st = s.l - 1, s.st
         t0 = time.perf_counter()
         mx.eval(st.inds)                                   # routing sync
         self.t_sync += time.perf_counter() - t0
-        s.l, s.need, s.reads = l + 1, (), ()
         pool = self.pools.get(l)
         if pool is None:
             return
@@ -322,16 +331,19 @@ class PipelinedDecoder:
         s.st = None
         self._fin[l] = self._fin.get(l, 0) + 1
         if self._fin[l] == self._k_cur:
-            self._done.append(l)
+            s.done.append(l)
 
-    def _settle(self) -> None:
-        """Every stream has computed these layers and a sync has run them:
-        leave in each pool what the step's tokens would have left there one
-        after another (the experts used last, as many as it has slots, in
-        their order of use; a slot for each of them that was read as arrays)
-        and drop the step's reads."""
+    def _settle(self, s: Stream) -> None:
+        """Every stream has computed the layers the stream's finish
+        completed and an eval has run them (the stream's next routing, or
+        the step's logits): leave in each pool what the step's tokens would
+        have left there one after another (the experts used last, as many
+        as it has slots, in their order of use; a slot for each of them
+        that was read as arrays) and drop the step's reads."""
+        if not s.done:
+            return
         t0 = time.perf_counter()
-        for l in self._done:
+        for l in s.done:
             pool = self.pools[l]
             held, seq = self._reads.pop(l, {}), self._used.pop(l, ())
             # the step's experts, the last used first: the ones that stay
@@ -350,34 +362,26 @@ class PipelinedDecoder:
             for e in reversed(keep):               # their order of use
                 pool.id2slot.move_to_end(e)
             self._last[l] = {e for uniq in seq for e in uniq}
-        self._done = []
+        s.done = []
         self.t_adopt += time.perf_counter() - t0
 
-    def _pick(self, streams: list):
-        """The stream to run next: the least advanced one whose reads have
-        arrived and, for a layer to begin, whose predecessor has begun it
-        (the cache takes the tokens in order). Waits for a read while none
-        can run; None once every stream is through the stack."""
+    def _ready(self, streams: list, skip):
+        """(the stream to run next, the reads still awaited): the least
+        advanced stream, `skip` aside (its routing is not read back yet),
+        whose reads have arrived and, for a layer to begin, whose
+        predecessor has begun it (the cache takes the tokens in order)."""
         n = self.n_layers
-        while True:
-            best, pending = None, []
-            for s in streams:
-                if s.l > n:
-                    continue
-                late = [r.fut for r in s.reads if not r.fut.done()]
-                if late:
-                    pending += late
-                elif ((s.l == n or s.i == 0 or streams[s.i - 1].l > s.l)
-                      and (best is None or s.l < best.l)):
-                    best = s
-            if best is not None or not pending:
-                return best
-            t0 = time.perf_counter()
-            if KEEPALIVE:
-                keepalive_wait(pending, first=True)         # GPU kept busy
-            else:
-                wait(pending, return_when=FIRST_COMPLETED)
-            self.t_io += time.perf_counter() - t0
+        best, late = None, []
+        for s in streams:
+            if s.l > n or s is skip:
+                continue
+            pending = [r.fut for r in s.reads if not r.fut.done()]
+            if pending:
+                late += pending
+            elif ((s.l == n or s.i == 0 or streams[s.i - 1].l > s.l)
+                  and (best is None or s.l < best.l)):
+                best = s
+        return best, late
 
     # -- one step: K tokens in flight ----------------------------------------
     def step(self, toks: list[int], offset: int):
@@ -385,7 +389,7 @@ class PipelinedDecoder:
         stream i, hiddens[i] = its final (pre-head) hidden, snaps[l][i] =
         layer-l cache snapshot taken before stream i wrote it."""
         K, n = len(toks), self.n_layers
-        self._reads, self._used, self._fin, self._done = {}, {}, {}, []
+        self._reads, self._used, self._fin = {}, {}, {}
         self._k_cur = K
         streams = [Stream(i, t, *self.ad.prep(t, offset + i))
                    for i, t in enumerate(toks)]
@@ -393,7 +397,24 @@ class PipelinedDecoder:
         for s in streams:
             s.ctx = ctx
         snaps = [[None] * K for _ in range(n)]
-        while (s := self._pick(streams)) is not None:
+        pend = None        # the stream whose routing the GPU is running
+        while True:
+            s, late = self._ready(streams, pend)
+            if s is None:
+                if pend is not None:         # no graph to build meanwhile
+                    self._route(pend)
+                    self._settle(pend)
+                    pend = None
+                elif late:                   # nothing can run: a read
+                    t0 = time.perf_counter()
+                    if KEEPALIVE:
+                        keepalive_wait(late, first=True)    # GPU kept busy
+                    else:
+                        wait(late, return_when=FIRST_COMPLETED)
+                    self.t_io += time.perf_counter() - t0
+                else:
+                    break                    # every stream through the stack
+                continue
             if s.st is not None:
                 self._finish(s)
             if s.l == n:
@@ -406,10 +427,13 @@ class PipelinedDecoder:
                 snaps[s.l][s.i] = self._snap(self.cache[s.l])
                 self.t_snap += time.perf_counter() - t0
             self._begin(s)
-            if self._done:                   # its sync ran their last gather
-                self._settle()
+            if pend is not None:             # the routing handed over before
+                self._route(pend)            # this one: read back now, with
+                self._settle(pend)           # this one queued behind it
+            pend = s
         mx.eval(*(s.out for s in streams))
-        self._settle()
+        for s in streams:                    # the layers the logits ran last
+            self._settle(s)
         outs = [int(mx.argmax(s.out[0, -1]).item()) for s in streams]
         dh = getattr(self.ad, "draft_hidden", None)
         return outs, [dh(s.h, s.pos) if dh else s.h for s in streams], snaps
