@@ -1,9 +1,12 @@
 """Inkling 2 through mlx-lm's inkling2: the loader for an oQ export.
 
-mlx-lm builds the model and loads its own layout as it is (the source
-checkpoint, mlx-community's conversions): those need nothing from here. An oQ
-export stores the same weights under oMLX's runtime layout, which
-`load_inkling2` maps onto mlx-lm's parameter tree without requantizing:
+mlx-lm builds the model. A checkpoint saved in mlx-lm's own layout
+(mlx-community's conversions) needs nothing from here. The published source
+checkpoint does not stream: mlx-lm loads it, but its expert tensors
+(`w13_weight` / `w2_weight`, their scales derived at load) are not what the
+shard index reads, so convert it with mlx-lm first. An oQ export stores the
+same weights under oMLX's runtime layout, which `load_inkling2` maps onto
+mlx-lm's parameter tree without requantizing:
   - renames (attn -> self_attn, mlp.router_weight -> mlp.gate.weight, ...);
   - the attention projections oQ stacks row-wise into one quantized matrix,
     split back by rows (a row keeps its own scales and biases, so a slice
