@@ -60,6 +60,7 @@ from mlx_vlm.models.deepseek_v41.language import (DeepseekV41Block,
                                                   DeepseekV41Cache, hc_expand,
                                                   make_identity_pre_mix)
 
+from . import chat_formats
 from .pipeline_adapters import StandardMoEAdapter, capture_layer_outputs
 from .stindex import DS_PROJ as _W, default_group_size
 
@@ -223,8 +224,10 @@ def load_v41(model_dir, tokenizer_config=None, model_config=None):
     if missing:
         raise ValueError(f"{len(missing)} language-model parameters not in "
                          f"the checkpoint: {missing[:8]}")
+    # the checkpoint ships no chat template: chat_formats has V4.1's
     tok = load_tokenizer(Path(model_dir),
-                         tokenizer_config_extra=tokenizer_config or {})
+                         tokenizer_config_extra=tokenizer_config or {},
+                         defaults=chat_formats.defaults("deepseek_v41"))
     return V41Text(lm), tok
 
 
