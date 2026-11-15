@@ -4,6 +4,4 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-sweep.csv
-*.npz
 .DS_Store

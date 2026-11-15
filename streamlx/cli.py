@@ -2,6 +2,8 @@
 
     streamlx serve <model dir> [options]       an OpenAI-compatible server
     streamlx generate <model dir> [options]    one prompt, with its figures
+    streamlx validate <model dir> [options]    streaming against the model
+                                               in RAM, token for token
 
 The model may also be given as --model. Each command's own --help lists its
 options (`streamlx serve` adds mlx_lm.server's).
@@ -12,7 +14,8 @@ from __future__ import annotations
 import importlib
 import sys
 
-COMMANDS = {"serve": "streamlx.serve", "generate": "streamlx.generate"}
+COMMANDS = {"serve": "streamlx.serve", "generate": "streamlx.generate",
+            "validate": "streamlx.validate"}
 
 
 def main() -> None:

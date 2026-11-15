@@ -5,7 +5,7 @@ covers the prefill sweep too. For >RAM models (no reference possible), run
 twice at two budgets instead — outputs must be identical (pool-size
 invariance).
 
-  python examples/validate.py --model <local-dir> --slots 16 --tokens 256 \
+  streamlx validate <local-model-dir> [--slots 16] [--tokens 256] \
       [--prompt-tokens 512]
 """
 

@@ -68,9 +68,6 @@ def main() -> int:
                     help="draft head: pipelined decoding. Default: the "
                          "checkpoint's own if it carries one, else plain "
                          "decoding; a directory; none: plain")
-    ap.add_argument("--stream-draft-head", action="store_true",
-                    help="stream the draft head's MoE experts through a pool "
-                         "in --budget-gib instead of loading them")
     ap.add_argument("--draft-k", type=int, default=None,
                     help="tokens in flight with a draft head (default: 3 "
                          "for Qwen3.8 and Inkling 2, 6 for DeepSeek-V4.1, "
@@ -92,15 +89,13 @@ def main() -> int:
           f"(experts stay on SSD)", file=sys.stderr)
 
     drafter = ad = None
-    all_pools = dict(pools)
     head, draft_k = default_draft(args.model, args.draft_head, args.draft_k)
     if head:
         from streamlx.pipeline_adapters import adapter_for, load_drafter
 
         t0 = time.time()
         try:
-            drafter = load_drafter(head, model, reader,
-                                   stream_head=args.stream_draft_head)
+            drafter = load_drafter(head, model, reader)
         except Exception as e:  # noqa: BLE001
             if args.draft_head != "auto":   # one that was asked for
                 raise
@@ -109,13 +104,11 @@ def main() -> int:
                   file=sys.stderr)
     if drafter is not None:
         ad = adapter_for(model, drafter)
-        # the head's experts share the budget with the trunk's
-        all_pools.update(getattr(drafter, "budget_pools", None) or {})
         print(f"[load] draft head in {time.time()-t0:.1f}s", file=sys.stderr)
     # the memory limit, less what is resident, MLX's buffer cache and 2 GiB
-    budget = (budget_within(memory_limit(), all_pools, reserve=4 * 2**30)
+    budget = (budget_within(memory_limit(), pools, reserve=4 * 2**30)
               if auto else int(args.budget_gib * 2**30))
-    budget = resize_pools(all_pools, budget)
+    budget = resize_pools(pools, budget)
     print(f"machine RAM: {ram:.0f} GB  |  expert budget: "
           f"{budget / 2**30:.1f} GiB\n")
 

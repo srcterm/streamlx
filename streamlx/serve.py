@@ -4,11 +4,10 @@ Wraps stock `mlx_lm.server` (all its flags pass through) but loads the model
 with streamlx: trunk resident, experts streamed from SSD on demand.
 
   streamlx serve <local-model-dir> [--port 8080] \
-      [--memory-gib N] [--budget-gib N] \
-      [--kv-cache-dir DIR|none [--kv-cache-gib N]] \
-      [--draft-head DIR|none [--draft-k K] [--stream-draft-head]] \
-      [--trust-remote-code] [--tokenizer-config key=json ...] \
-      [--prompt-cache-gib N] [--mlx-cache-gib N] [--prefill-memory-gib N]
+      [--memory-gib N] [--budget-gib N] [--mlx-cache-gib N] \
+      [--kv-cache-dir DIR [--kv-cache-gib N]] \
+      [--draft-head DIR|none [--draft-k K]] \
+      [--trust-remote-code] [--tokenizer-config key=json ...]
 
 With no options: MLX's memory is kept under 95% of the GPU working set the
 system recommends (--memory-gib), the expert pools take what that leaves
@@ -20,15 +19,13 @@ The model must be a LOCAL directory (the byte-range reader needs the shards on
 disk). Requests are handled sequentially: concurrent batching multiplies the
 per-step expert working set and collapses cache hit rates.
 
-RAM guard: the stock server bounds its prompt-cache LRU by sequence count
-only (bytes are enforced on the batch path we don't use) and MLX's default
-buffer-cache limit is ~95% of RAM, so freed buffers are hoarded forever.
-With most of that wired for Metal, a long agent session runs the machine out
-of unpageable memory. Both get hard byte caps here: --prompt-cache-gib
-(default: RAM - budget - 12 GiB, clamped to [1, 8]) and --mlx-cache-gib
-(default 2).
+MLX's default buffer-cache limit is ~95% of RAM, so freed buffers are
+hoarded forever; with most of that wired for Metal, a long agent session
+runs the machine out of unpageable memory. It gets a hard cap here:
+--mlx-cache-gib (default 2).
 
---memory-gib keeps MLX's memory (active + buffer cache) under a limit by
+--memory-gib (default: 95% of the GPU working set the system recommends; 0:
+no limit) keeps MLX's memory (active + buffer cache) under a limit by
 resizing the expert pools, never above --budget-gib: before each request,
 for the cache it starts from plus what its prompt and max_tokens will add
 (at the bytes a token has added so far), with the rest of the peak taken from
@@ -39,10 +36,7 @@ token), while the pools sit idle: its experts pass through the sweep's
 buffer. So the pools are sized for each chunk as it comes, from what earlier
 chunks held a token, and grow back for decoding, which reads again what the
 smaller pools dropped. Resizing copies the kept slots (~1 s for 16 GiB);
-outputs don't change. --prefill-memory-gib caps what a prefill
-holds beyond the arrays it uses: MLX's freed buffers (a third, at most
-0.25 GiB) and the expert reads queued ahead of the compute (the rest, at most
-0.5 GiB).
+outputs don't change.
 
 Long prefills of models whose attention head size MLX does not fuse by
 default (256 in Qwen3.5/3.6) would build heads x queries x keys of scores per
@@ -68,17 +62,14 @@ Prompt caches live on SSD (streamlx.kvcache; --kv-cache-dir, default
 the same prefix, so RAM holds only the active request's cache.
 --kv-cache-gib bounds the disk use (default half of what is free there, at
 most 32; oldest segments go first). A drive other than the model's avoids
-sharing its bandwidth with expert reads. --kv-cache-dir none keeps them in
-RAM, under the caps above.
+sharing its bandwidth with expert reads.
 
 A draft head decodes greedy requests through streamlx.pipeline: K tokens in
 flight, so each token's expert reads overlap the others' compute, with plain
 decoding's output. A checkpoint that carries one (Qwen3.8, DeepSeek-V4.1,
 Inkling 2) uses it by default; --draft-head takes an mlx-vlm drafter
-directory for other models, or none for plain decoding. With
---stream-draft-head, Qwen3.8's head streams its MoE layer through a pool
-taken out of the budget (V4.1's stages always stream, in pools of their
-own). The self-gate's verdict carries across requests.
+directory for other models, or none for plain decoding. The self-gate's
+verdict carries across requests.
 Requests that sample, process logits or ask for logprobs decode plainly. On a
 prompt-cache hit the head's context starts at the tokens this request
 prefills: drafts are verified, so that can only cost acceptance, not change
@@ -88,8 +79,6 @@ the text.
 from __future__ import annotations
 
 import argparse
-import contextlib
-import copy
 import itertools
 import json
 import os
@@ -101,47 +90,18 @@ import mlx.core as mx
 import mlx_lm.server as srv
 from mlx_lm.generate import (GenerationResponse, generation_stream,
                              maybe_quantize_kv_cache, wired_limit)
-from mlx_lm.models.cache import can_trim_prompt_cache
 
 from streamlx import attention, chat_formats
-from streamlx import integrate as _integrate
 from streamlx.integrate import (aggregate_stats, budget_within,
                                 load_streaming_model, memory_limit,
                                 pool_bytes, prefill_cache, resize_pools)
 from streamlx.kvcache import PagedPromptCache
 
 _CFG = {"budget_bytes": None, "trust": False, "tokenizer_config": {},
-        "prompt_cache_bytes": 4 * 2**30, "draft_head": "auto", "draft_k": None,
-        "memory_bytes": 0, "mlx_cache_bytes": 2 * 2**30,
-        "prefill_cache_bytes": 0, "stream_head": False}
-_STATE = {"pools": None, "reader": None, "all_pools": None,
+        "draft_head": "auto", "draft_k": None, "memory_bytes": 0,
+        "mlx_cache_bytes": 2 * 2**30}
+_STATE = {"pools": None, "reader": None,
           "mem": {"F": None, "slope": None, "pre": None}}
-
-
-_orig_fetch = srv.LRUPromptCache.fetch_nearest_cache
-
-
-def _recording_fetch(self, model, tokens):
-    # Stash the request's full token key for the history snapshot.
-    _STATE["fetch"] = (self, model, list(tokens))
-    return _orig_fetch(self, model, tokens)
-
-
-srv.LRUPromptCache.fetch_nearest_cache = _recording_fetch
-
-
-_orig_lru_init = srv.LRUPromptCache.__init__
-
-
-def _bounded_lru_init(self, *args, **kwargs):
-    # The stock server only enforces --prompt-cache-bytes on its batch path;
-    # ours is sequential, where inserts are bounded by sequence count alone.
-    # Setting max_bytes makes the stock insert_cache evict on every path.
-    _orig_lru_init(self, *args, **kwargs)
-    self.max_bytes = min(self.max_bytes, _CFG["prompt_cache_bytes"])
-
-
-srv.LRUPromptCache.__init__ = _bounded_lru_init
 
 
 _orig_sampler = srv._make_sampler
@@ -168,31 +128,6 @@ def _chunks(n: int, step: int) -> list[int]:
     return [q + 1] * r + [q] * (k - r)
 
 
-def _snapshot(fetch, n: int, cache) -> None:
-    """RAM prompt cache: store a copy of the live cache at tokens[:n].
-
-    Skipped when the cache is still trimmable (the stock trim path already
-    reuses those; a copy would only double memory) and when the copy alone
-    would exceed half the LRU byte cap (storing it would evict everything
-    else and then be evicted itself). Disable with STREAMLX_PROMPT_SNAPSHOT=0.
-    """
-    lru, model, tokens = fetch
-    if (os.environ.get("STREAMLX_PROMPT_SNAPSHOT", "1") == "0" or n < 256
-            or can_trim_prompt_cache(cache)):
-        return
-    snap = sum(c.nbytes for c in cache)
-    if snap > lru.max_bytes // 2:
-        print(f"[streamlx] prompt snapshot skipped: {snap / 2**30:.2f} GiB "
-              f"copy vs {lru.max_bytes / 2**30:.1f} GiB cache cap",
-              file=sys.stderr)
-        return
-    t0 = time.perf_counter()
-    lru.insert_cache(model, tokens[:n], copy.deepcopy(cache),
-                     cache_type="user")
-    print(f"[streamlx] prompt snapshot: {n} tok "
-          f"({time.perf_counter() - t0:.2f}s)", file=sys.stderr)
-
-
 _MARGIN = 2**28   # --memory-gib keeps this much of its limit free,
 _HYST = 2**28     # shrinks the pools when they pass it by this much
 _GROW = 2**30     # and grows them back when this much is free
@@ -201,22 +136,9 @@ _PRE_PRIOR = 4 * 2**20   # bytes a chunk token until a chunk has been measured
 #                          (DeepSeek-V4.1's 4 MiB, the most of the models run)
 
 
-@contextlib.contextmanager
-def _prefill_buffers():
-    """--prefill-memory-gib: MLX's freed-buffer cap while prefilling."""
-    lim = _CFG["prefill_cache_bytes"]
-    if lim:
-        mx.set_cache_limit(lim)
-    try:
-        yield
-    finally:
-        if lim:
-            mx.set_cache_limit(_CFG["mlx_cache_bytes"])
-
-
 def _buffer_reserve() -> int:
-    """The buffer cache a peak can hold: prefill's cap, where peaks are."""
-    return _CFG["prefill_cache_bytes"] or _CFG["mlx_cache_bytes"]
+    """The buffer cache a peak can hold."""
+    return _CFG["mlx_cache_bytes"]
 
 
 def _cache_bytes(cache) -> int:
@@ -230,7 +152,7 @@ def _fit_pools(target: float, why: str) -> None:
     """Resize every expert pool (trunk and draft head) to `target` bytes in
     all, at most --budget-gib: down by _HYST or more, up by _GROW or more
     (a resize copies every kept slot, ~1 s for 16 GiB)."""
-    pools = _STATE["all_pools"] or {}
+    pools = _STATE["pools"] or {}
     have = pool_bytes(pools)
     target = min(target, _CFG["budget_bytes"])
     if not pools or not (have - target >= _HYST or target - have >= _GROW):
@@ -260,7 +182,7 @@ def _govern_request(kwargs: dict) -> None:
     n_prompt = len(prompt) if isinstance(prompt, list) else 0
     cb = _cache_bytes(cache)
     m["base"] = (mx.get_active_memory() - cb
-                 - pool_bytes(_STATE["all_pools"] or {}))
+                 - pool_bytes(_STATE["pools"] or {}))
     # decoding's share; on the first request what is resident now plus 2 GiB
     m["rest"] = m["F"] if m["F"] is not None else m["base"] + 2 * 2**30
     m["cb0"], m["peak_rest"] = cb, 0
@@ -296,7 +218,7 @@ def _reset_peak() -> None:
 def _govern_mark(cache) -> None:
     """Record decoding's peak above its pools and cache so far."""
     m = _STATE["mem"]
-    rest = (mx.get_peak_memory() - pool_bytes(_STATE["all_pools"] or {})
+    rest = (mx.get_peak_memory() - pool_bytes(_STATE["pools"] or {})
             - _cache_bytes(cache))
     m["peak_rest"] = max(m.get("peak_rest", 0), rest)
 
@@ -314,7 +236,7 @@ def _govern_chunk(cache, done: int, n: int, nxt: int, left: int) -> None:
     _measure_slope(cb, done)
     if n >= _PRE_MIN:
         held = (mx.get_peak_memory() - cb
-                - pool_bytes(_STATE["all_pools"] or {})
+                - pool_bytes(_STATE["pools"] or {})
                 - (m["base"] if m["F"] is None else m["F"]))
         m["pre"] = max(m["pre"] or 0.0, held / n)
     _fit_pools(_pools_for(cb, left + m["to_come"], nxt),
@@ -356,11 +278,10 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
     always beyond (a thinking template renders a past answer without the
     "<think>" it was prompted with), and hybrid caches (recurrent state,
     rotating KV) cannot trim back, so a cache stored any later is of no use
-    to it. Stored there (a segment with --kv-cache-dir, else a RAM copy), the
-    next turn restores it and prefills only its new tokens. Prompts without
+    to it. Stored there (a segment of the SSD prompt cache), the next turn
+    restores it and prefills only its new tokens. Prompts without
     that suffix stop one token short of their end.
     """
-    fetch = _STATE.pop("fetch", None)
     prompt, cache, model = (kwargs.get(k)
                             for k in ("prompt", "prompt_cache", "model"))
     if cache is None or model is None or not isinstance(prompt, list):
@@ -371,13 +292,12 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
     if cut < 1:
         return 0
     paged = _STATE.get("paged")
-    base = (paged.last[0] if paged is not None
-            else len(fetch[2]) - len(prompt) if fetch else 0)
+    base = paged.last[0] if paged is not None else 0
     cb = kwargs.get("prompt_progress_callback") or (lambda *_: None)
     stream = kwargs.get("stream", generation_stream)
     tokens, done = mx.array(prompt[:cut]), 0
     cb(0, len(prompt))
-    with wired_limit(model, [stream]), mx.stream(stream), _prefill_buffers():
+    with wired_limit(model, [stream]), mx.stream(stream):
         sizes = _chunks(cut, kwargs.get("prefill_step_size", 2048))
         for i, n in enumerate(sizes):
             chunk = tokens[None, done:done + n]
@@ -401,8 +321,6 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
             mx.clear_cache()
             _govern_chunk(cache, done, n, sizes[i + 1] if i + 1 < len(sizes)
                           else 0, len(prompt) - done)
-    if paged is None and fetch is not None:
-        _snapshot(fetch, base + cut, cache)
     kwargs["prompt"] = prompt[cut:]
     kwargs["prompt_progress_callback"] = lambda p, t: cb(cut + p, cut + t)
     return cut
@@ -449,22 +367,21 @@ def _pipelined(dec, kwargs: dict):
         # in prefill-size chunks, then the last alone (a model can compute a
         # token differently in a chunk than alone, so this keeps plain's text)
         step, done = kwargs.get("prefill_step_size", 2048), 0
-        with _prefill_buffers():
-            while len(prompt) - done > 1:
-                k = min(step, len(prompt) - done - 1)
-                with prefill_cache(cache):
-                    _, rows = ad.forward_taps(
-                        mx.array([prompt[done:done + k]]), cache)
-                mx.eval(rows, [c.state for c in cache])
-                ad.prime_pairs(rows, mx.array(
-                    [prompt[done + 1:done + k + 1]], dtype=mx.int32))
-                done += k
-                cb(done, len(prompt))
-                mx.clear_cache()
+        while len(prompt) - done > 1:
+            k = min(step, len(prompt) - done - 1)
             with prefill_cache(cache):
-                logits, rows = ad.forward_taps(mx.array([prompt[done:]]),
-                                               cache)
-            mx.eval(logits, rows, [c.state for c in cache])
+                _, rows = ad.forward_taps(
+                    mx.array([prompt[done:done + k]]), cache)
+            mx.eval(rows, [c.state for c in cache])
+            ad.prime_pairs(rows, mx.array(
+                [prompt[done + 1:done + k + 1]], dtype=mx.int32))
+            done += k
+            cb(done, len(prompt))
+            mx.clear_cache()
+        with prefill_cache(cache):
+            logits, rows = ad.forward_taps(mx.array([prompt[done:]]),
+                                           cache)
+        mx.eval(logits, rows, [c.state for c in cache])
         cb(len(prompt), len(prompt))
         token = first = int(mx.argmax(logits[0, -1]).item())
         dec.cache = ad.views(cache)
@@ -567,7 +484,7 @@ def _instrumented(fn):
                            mx.get_peak_memory())
                 msg += f" | peak {peak / 2**30:.1f} GiB"
                 if _CFG["memory_bytes"]:
-                    pb = pool_bytes(_STATE["all_pools"])
+                    pb = pool_bytes(_STATE["pools"])
                     msg += f", pools {pb / 2**30:.1f} GiB"
                 print(msg, file=sys.stderr)
     return gen
@@ -603,7 +520,6 @@ class StreamingModelProvider(srv.ModelProvider):
         print(f"[streamlx] trunk loaded in {time.time()-t0:.1f}s; "
               f"{len(pools)} pools", file=sys.stderr)
         _STATE["pools"], _STATE["reader"] = pools, reader
-        _STATE["all_pools"] = dict(pools)
         _STATE["decoder"] = None
         head, k = default_draft(model_path, _CFG["draft_head"],
                                 _CFG["draft_k"])
@@ -614,8 +530,7 @@ class StreamingModelProvider(srv.ModelProvider):
 
             t0 = time.time()
             try:
-                drafter = load_drafter(head, model, reader,
-                                       stream_head=_CFG["stream_head"])
+                drafter = load_drafter(head, model, reader)
             except Exception as e:
                 if _CFG["draft_head"] != "auto":   # one that was asked for
                     raise
@@ -626,27 +541,22 @@ class StreamingModelProvider(srv.ModelProvider):
             ad = adapter_for(model, drafter)
             _STATE["decoder"] = PipelinedDecoder(ad, pools, [], k_max=k,
                                                  plain_fn=ad.plain)
-            head_pools = getattr(drafter, "budget_pools", None) or {}
-            # the head's experts share the budget with the trunk's
-            _STATE["all_pools"] = {**pools, **head_pools}
             print(f"[streamlx] draft head in {time.time()-t0:.1f}s, up to "
-                  f"{k} tokens in flight"
-                  + (f", {len(head_pools)} streamed MoE layer(s) in the "
-                     f"budget" if head_pools else ""), file=sys.stderr)
+                  f"{k} tokens in flight", file=sys.stderr)
         if auto:
             # what the memory limit leaves beside the trunk and the head is
             # the most the pools may take; they start at what the first
             # request's estimate would give them (_govern_request)
             lim = _CFG["memory_bytes"]
             _CFG["budget_bytes"] = (budget_within(lim - _MARGIN,
-                                                  _STATE["all_pools"])
+                                                  _STATE["pools"])
                                     if lim else 8 * 2**30)
             start = (_CFG["budget_bytes"] - _buffer_reserve() - 2 * 2**30
                      if lim else _CFG["budget_bytes"])
         else:
             start = _CFG["budget_bytes"]
-        got = resize_pools(_STATE["all_pools"], max(start, 2**30))
-        slots = sum(p.n_slots for p in _STATE["all_pools"].values())
+        got = resize_pools(_STATE["pools"], max(start, 2**30))
+        slots = sum(p.n_slots for p in _STATE["pools"].values())
         print(f"[streamlx] expert pools: {slots} slots, {got / 2**30:.1f} GiB"
               f" (at most {_CFG['budget_bytes'] / 2**30:.1f})",
               file=sys.stderr)
@@ -669,15 +579,6 @@ class StreamingModelProvider(srv.ModelProvider):
         self.is_batchable = False  # batch-1 by design
 
 
-def _auto_prompt_cache_bytes(ram: int, budget: int) -> int:
-    """Whatever RAM the budget leaves after ~12 GiB for trunk, OS, the
-    active generation's cache and the per-turn copy transients — clamped
-    to [1, 8] GiB. Fallback 4 GiB if RAM can't be detected."""
-    if not ram:
-        return 4 * 2**30
-    return min(max(ram - budget - 12 * 2**30, 1 * 2**30), 8 * 2**30)
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--budget-gib", type=float, default=None,
@@ -688,16 +589,12 @@ def main() -> None:
                     metavar="KEY=JSON",
                     help="extra tokenizer kwarg, repeatable "
                          "(e.g. fix_mistral_regex=true)")
-    ap.add_argument("--prompt-cache-gib", type=float, default=None,
-                    help="byte cap for the server's prompt-cache LRU "
-                         "(default: RAM - budget - 12 GiB, clamped to "
-                         "[1, 8]); replaces --prompt-cache-bytes here")
     ap.add_argument("--mlx-cache-gib", type=float, default=2.0,
                     help="cap for MLX's freed-buffer cache (default 2; "
                          "MLX's own default hoards ~95%% of RAM)")
     ap.add_argument("--kv-cache-dir", default="~/.cache/streamlx/kv",
                     help="prompt caches on SSD in this directory (default "
-                         "~/.cache/streamlx/kv); none: in RAM")
+                         "~/.cache/streamlx/kv)")
     ap.add_argument("--kv-cache-gib", type=float, default=None,
                     help="disk space for --kv-cache-dir (default: half of "
                          "what is free there, at most 32)")
@@ -709,16 +606,6 @@ def main() -> None:
                     help="tokens in flight with a draft head (default: 3 "
                          "for Qwen3.8 and Inkling 2, 6 for DeepSeek-V4.1, "
                          "else 4)")
-    ap.add_argument("--stream-draft-head", action="store_true",
-                    help="stream the draft head's MoE experts through a pool "
-                         "in --budget-gib instead of loading them (Qwen3.8: "
-                         "1.3 GiB less RAM, ~15%% slower pipelined decode)")
-    ap.add_argument("--prefill-memory-gib", type=float, default=None,
-                    help="cap what prefill holds beyond the arrays it uses: "
-                         "MLX's freed-buffer cache while prefilling (a third, "
-                         "at most 0.25 GiB) and the expert reads queued "
-                         "ahead of the compute (the rest, at most 0.5 GiB). "
-                         "Default: --mlx-cache-gib and 0.5 GiB")
     ap.add_argument("--memory-gib", type=float, default=None,
                     help="keep MLX's memory (active + buffer cache) under "
                          "this by resizing the expert pools (at most "
@@ -736,45 +623,27 @@ def main() -> None:
         _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
     _CFG["trust"] = ours.trust_remote_code
     _CFG["draft_head"], _CFG["draft_k"] = ours.draft_head, ours.draft_k
-    _CFG["stream_head"] = ours.stream_draft_head
     try:
         ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (ValueError, OSError):
         ram = 0
-    if ours.prompt_cache_gib is not None:
-        _CFG["prompt_cache_bytes"] = int(ours.prompt_cache_gib * 2**30)
-    else:
-        _CFG["prompt_cache_bytes"] = _auto_prompt_cache_bytes(
-            ram, _CFG["budget_bytes"] or 8 * 2**30)
     _CFG["mlx_cache_bytes"] = int(ours.mlx_cache_gib * 2**30)
     mx.set_cache_limit(_CFG["mlx_cache_bytes"])
     _CFG["memory_bytes"] = (memory_limit() if ours.memory_gib is None
                             else int(ours.memory_gib * 2**30))
-    if ours.prefill_memory_gib:
-        cap = int(ours.prefill_memory_gib * 2**30)
-        _CFG["prefill_cache_bytes"] = min(_CFG["mlx_cache_bytes"],
-                                          max(2**26, min(2**28, cap // 3)))
-        reads = cap - _CFG["prefill_cache_bytes"]
-        _integrate._NEXT_BYTES = max(2**26, min(_integrate._NEXT_BYTES, reads))
     attention.install()
-    if ours.kv_cache_dir and ours.kv_cache_dir != "none":
-        kv_dir = os.path.expanduser(ours.kv_cache_dir)
-        os.makedirs(kv_dir, exist_ok=True)
-        kv_gib = ours.kv_cache_gib
-        if kv_gib is None:   # half of what the volume has free, at most 32
-            kv_gib = max(1.0, min(32.0,
-                                  shutil.disk_usage(kv_dir).free / 2**31))
+    kv_dir = os.path.expanduser(ours.kv_cache_dir)
+    os.makedirs(kv_dir, exist_ok=True)
+    kv_gib = ours.kv_cache_gib
+    if kv_gib is None:   # half of what the volume has free, at most 32
+        kv_gib = max(1.0, min(32.0, shutil.disk_usage(kv_dir).free / 2**31))
 
-        def paged(*_args, **_kwargs):
-            _STATE["paged"] = PagedPromptCache(kv_dir, int(kv_gib * 2**30))
-            return _STATE["paged"]
+    def paged(*_args, **_kwargs):
+        _STATE["paged"] = PagedPromptCache(kv_dir, int(kv_gib * 2**30))
+        return _STATE["paged"]
 
-        srv.LRUPromptCache = paged
-        where = (f"prompt caches on SSD at {kv_dir} "
-                 f"(<= {kv_gib:.0f} GiB)")
-    else:
-        where = (f"prompt-cache cap "
-                 f"{_CFG['prompt_cache_bytes'] / 2**30:.1f} GiB")
+    srv.LRUPromptCache = paged
+    where = f"prompt caches on SSD at {kv_dir} (<= {kv_gib:.0f} GiB)"
     lim = _CFG["memory_bytes"]
     print(f"[streamlx] ram guard: {ram / 2**30:.0f} GiB RAM, "
           + (f"MLX memory <= {lim / 2**30:.1f} GiB, " if lim else "")
