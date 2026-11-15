@@ -99,7 +99,6 @@ class _GpuHold:
         self._probing = False          # until the next mean; it was a probe
         self._probe = self.PROBE       # seconds to the next probe
         self._last = 0.0               # (long ago: the first job comes soon)
-        self.jobs, self.seconds = 0, 0.0
 
     def note(self, dt: float) -> None:
         self._sum += dt
@@ -137,11 +136,15 @@ class _GpuHold:
         self._last = time.perf_counter()
         if self._last - t0 < self.MIN_JOB and self._mats < 96:
             self._mats *= 2
-        self.jobs += 1
-        self.seconds += self._last - t0
+        with _HOLD_LOCK:
+            _HOLD_TOTAL[0] += 1
+            _HOLD_TOTAL[1] += self._last - t0
 
 
-_HOLDS: list = []
+# Jobs run and their seconds over every decode thread. A hold itself (and
+# its matrix on the GPU) is its thread's alone and goes when the thread does.
+_HOLD_LOCK = threading.Lock()
+_HOLD_TOTAL = [0, 0.0]
 
 
 def gpu_hold(dt: float) -> None:
@@ -151,13 +154,12 @@ def gpu_hold(dt: float) -> None:
     h = getattr(_KEEPALIVE_LOCAL, "hold", None)
     if h is None:
         h = _KEEPALIVE_LOCAL.hold = _GpuHold()
-        _HOLDS.append(h)
     h.note(dt)
 
 
 def gpu_hold_stats() -> tuple:
     """(jobs run, their seconds) over every decode thread."""
-    return sum(h.jobs for h in _HOLDS), sum(h.seconds for h in _HOLDS)
+    return _HOLD_TOTAL[0], _HOLD_TOTAL[1]
 
 
 def keepalive_wait(futures, first: bool = False) -> None:
