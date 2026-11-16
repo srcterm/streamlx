@@ -17,6 +17,7 @@ That is an OpenAI-compatible server on `http://localhost:8080/v1`: point a codin
 - MLX's memory is kept under 95% of what the system recommends for the GPU, and the expert pools take what that leaves beside the model's dense part.
 - A checkpoint that carries a draft head (Qwen3.8, DeepSeek-V4.1, Inkling 2) decodes pipelined with it; any other decodes plainly.
 - Prompt caches are kept on the SSD, under `~/.cache/streamlx/kv`.
+- Models think before they answer. `--chat-template-args '{"enable_thinking": false}'` turns it off (Inkling 2: `'{"reasoning_effort": "none"}'`).
 
 `streamlx generate /path/to/model --prompt "..."` runs one prompt and prints speed and memory figures.
 
@@ -50,7 +51,7 @@ mlx-vlm text-only exports (tensors prefixed `language_model.`) are detected and 
 
 ## Serving numbers
 
-M4 MacBook Air, 32 GB. `streamlx serve <model>` with its defaults, driven by a coding agent (pi): its first request is a cold prompt of about 1,600 tokens, and the task takes two or three requests. Checkpoints on a USB4 SSD, except Qwen3.6 on the internal one.
+M4 MacBook Air, 32 GB. `streamlx serve <model>` with its defaults and thinking off, driven by a coding agent (pi): its first request is a cold prompt of about 1,600 tokens, and the task takes two or three requests. Checkpoints on a USB4 SSD, except Qwen3.6 on the internal one.
 
 | Model | Checkpoint | Pools | Prefill | Decode | Peak memory |
 |---|---|---|---|---|---|
