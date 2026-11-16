@@ -200,7 +200,7 @@ def render_v41(messages, tools=None, thinking: bool = False, effort=None,
 
 
 def _v41_template(messages, tools=None, add_generation_prompt=False,
-                  continue_final_message=False, enable_thinking=False,
+                  continue_final_message=False, enable_thinking=True,
                   reasoning_effort=None, **_) -> str:
     out = render_v41(list(messages), tools, bool(enable_thinking),
                      reasoning_effort, add_generation_prompt)
