@@ -55,7 +55,9 @@ sweep reads ~every expert.
 Chat formats are streamlx.chat_formats': the prompt format and tool calls of
 a checkpoint that ships no template (DeepSeek-V4.1), and the reply framing of
 a model that writes its own (Inkling 2), which the server sorts into
-reasoning, content and tool calls.
+reasoning, content and tool calls. A past reply's thinking that a client
+returns as `reasoning`, the field the server streams it in, reaches the
+template as `reasoning_content`, where templates read it.
 
 Prompt caches live on SSD (streamlx.kvcache; --kv-cache-dir, default
 ~/.cache/streamlx/kv): stored once as segments shared by every request with
@@ -124,6 +126,24 @@ def _recording_sampler(args, tokenizer):
 
 
 srv._make_sampler = _recording_sampler
+
+
+def _reasoning_back(fn):
+    """A client returns a past reply's thinking in the field the server
+    streamed it in, `reasoning` (pi does); chat templates (Qwen3.x, Inkling 2)
+    read it from `reasoning_content`. Without this a thinking model's earlier
+    reasoning drops out of its history, and the next prompt no longer extends
+    the stored reply, so the reply is prefilled again."""
+    def wrapped(messages, *args, **kwargs):
+        for m in messages:
+            if (isinstance(m, dict) and m.get("role") == "assistant"
+                    and m.get("reasoning") and not m.get("reasoning_content")):
+                m["reasoning_content"] = m["reasoning"]
+        return fn(messages, *args, **kwargs)
+    return wrapped
+
+
+srv.process_message_content = _reasoning_back(srv.process_message_content)
 
 
 def _chunks(n: int, step: int) -> list[int]:
