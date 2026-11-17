@@ -364,9 +364,6 @@ class VlmMtpDrafter:
 
     def __init__(self, head, model):
         self.head = head.bind(model)
-        # the head's streamed MoE layers (qwen4_exp.load_head with a reader):
-        # hosts share the expert budget with them (integrate.resize_pools)
-        self.budget_pools = getattr(head, "streamlx_pools", None) or {}
 
     def reset(self) -> None:
         self.head._cache = self.head.make_cache()
@@ -410,16 +407,66 @@ def _vlm_target(model, cfg):
         args=vlm_args, model=model.model, lm_head=model.lm_head))
 
 
-def load_drafter(path: str, model, reader=None, stream_head: bool = False):
+# Model types whose checkpoints carry their own draft head, and the tokens in
+# flight that suit it.
+HEAD_K = {"qwen4_exp": 3, "deepseek_v41": 6, "inkling2": 3}
+
+
+def checkpoint_head(model_dir) -> str | None:
+    """The model directory if its checkpoint carries a draft head this
+    module loads (HEAD_K's model types: `mtp.` tensors in the shards, or an
+    mtp.safetensors beside them), else None."""
+    import json
+    from pathlib import Path
+
+    root = Path(model_dir)
+    try:
+        mt = json.loads((root / "config.json").read_text()).get("model_type")
+    except OSError:
+        return None
+    if mt not in HEAD_K:
+        return None
+    if (root / "mtp.safetensors").exists():
+        return str(root)
+    try:
+        names = json.loads(
+            (root / "model.safetensors.index.json").read_text())["weight_map"]
+    except (OSError, KeyError, ValueError):
+        return None
+    if any(k.startswith("mtp.") or ".mtp." in k for k in names):
+        return str(root)
+    return None
+
+
+def default_draft(model_dir, head: str | None = "auto", k: int | None = None):
+    """(draft head directory or None, tokens in flight) for a --draft-head and
+    --draft-k: "auto" is the checkpoint's own head when it carries one, "none"
+    plain decoding, anything else a directory; k defaults to the model type's
+    in HEAD_K, else 4."""
+    import json
+    from pathlib import Path
+
+    if head == "auto":
+        head = checkpoint_head(model_dir)
+    elif head == "none":
+        head = None
+    if not head:
+        return None, 0
+    try:
+        mt = json.loads((Path(model_dir) / "config.json").read_text()).get(
+            "model_type")
+    except OSError:
+        mt = None
+    return head, k or HEAD_K.get(mt, 4)
+
+
+def load_drafter(path: str, model, reader=None):
     """A pipeline drafter for `model` from an mlx-vlm drafter directory, e.g.
     `python -m mlx_vlm.split_mtp --model <checkpoint with its draft head>
     --output <dir> --q-bits 4` (Mistral Large 4's DSpark head). DeepSeek-V4.1,
     Qwen3.8 and Inkling 2 read their heads from the checkpoint itself: `path`
     is the model directory (V4.1's streams through `reader`, the model's expert
-    reader; Inkling 2's is dense and resident, 4-bit).
-    stream_head: Qwen3.8's head streams its MoE layer through a pool too
-    (1.3 GiB less RAM; its drafts then sync on routing and wait on misses,
-    ~15% slower PEF decode at equal trunk pools)."""
+    reader; Inkling 2's is dense and resident, 4-bit)."""
     mt = getattr(getattr(model, "args", None), "model_type", None)
     if mt == "deepseek_v41":
         from .deepseek_v41_dspark import V41DSpark
@@ -432,8 +479,7 @@ def load_drafter(path: str, model, reader=None, stream_head: bool = False):
     if mt == "qwen4_exp":
         from .qwen4_exp import load_head
 
-        return VlmMtpDrafter(
-            load_head(path, model, reader if stream_head else None), model)
+        return VlmMtpDrafter(load_head(path, model), model)
     try:
         from mlx_vlm.speculative.drafters import load_drafter as _load
     except ImportError as e:

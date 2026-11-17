@@ -96,7 +96,7 @@ class ExpertReader:
             path, off, n, members = span
             buf = os.pread(self._fd(path), n, off)
             if len(buf) != n:
-                raise IOError(f"short read {len(buf)}/{n} at {off} of {path}")
+                raise OSError(f"short read {len(buf)}/{n} at {off} of {path}")
             view = memoryview(buf)             # the bytes go once converted
             return n, {key: convert(key, view[rel:rel + m])
                        for key, rel, m in members}
@@ -145,7 +145,7 @@ class ExpertReader:
             for path, off, n, buf in bucket:
                 got = os.preadv(self._fd(path), [buf], off)
                 if got != n:
-                    raise IOError(f"short read {got}/{n} at {off} of {path}")
+                    raise OSError(f"short read {got}/{n} at {off} of {path}")
             return sum(r[2] for r in bucket), len(bucket)
 
         # one task per worker, longest ranges first (as read_ranges)
@@ -207,7 +207,7 @@ class ExpertReader:
             n = loc.shape[0] * loc.row_stride
             raw = os.pread(self._fd(loc.path), n, loc.abs_start)
             if len(raw) != n:
-                raise IOError(f"short read of {loc.name}")
+                raise OSError(f"short read of {loc.name}")
             v = self._vectors[loc.name] = np.frombuffer(
                 raw, dtype=_NP_VIEW[loc.dtype])
         return v

@@ -8,5 +8,5 @@ from .pool import StreamingSwitchMLP, switch_forward
 from .reader import ExpertReader
 from .stindex import SafetensorsIndex
 
-__all__ = ["SafetensorsIndex", "ExpertReader", "StreamingSwitchMLP",
+__all__ = ["ExpertReader", "SafetensorsIndex", "StreamingSwitchMLP",
            "switch_forward"]

@@ -17,6 +17,13 @@ cut at any token when every layer is such a cache. Other layers (recurrent
 ArraysCache, rotating windows) store their whole state at the segment's end,
 so models with them restore at segment ends only.
 
+Each model's segments sit in a directory of its own under the root, and one
+budget covers them all: past it the least recently used of the other models'
+caches go first, a model's whole cache at a time (a server still running on
+that model then misses, nothing else), then the served model's least recently
+used segments. A segment is not written when it would leave the volume with
+less than 1 GiB free.
+
 Drop-in for mlx_lm's LRUPromptCache in the sequential server (one request at
 a time): the same fetch_nearest_cache / insert_cache interface, plus
 save_progress(n, cache) when the active request's prefill reaches token n.
@@ -33,6 +40,8 @@ import json
 import logging
 import os
 import queue
+import re
+import shutil
 import struct
 import threading
 import time
@@ -53,7 +62,42 @@ _TAGS = {mx.bfloat16: "BF16", mx.float16: "F16", mx.float32: "F32",
          mx.int32: "I32", mx.uint32: "U32", mx.int64: "I64",
          mx.uint8: "U8", mx.bool_: "BOOL"}
 
+_MODEL_DIR = re.compile(r"[0-9a-f]{16}")   # root/<model fingerprint>
+_FREE_FLOOR = 2**30   # what a segment write leaves free on the volume at least
+
 log = logging.getLogger(__name__)
+
+
+def _files(d: Path) -> list[Path]:
+    """A model directory's segment files."""
+    try:
+        return list(d.glob("*.safetensors"))
+    except OSError:   # gone meanwhile
+        return []
+
+
+def _model_dirs(root: Path) -> list[Path]:
+    try:
+        return [d for d in root.iterdir()
+                if d.is_dir() and _MODEL_DIR.fullmatch(d.name)]
+    except OSError:
+        return []
+
+
+def _size_and_used(files: list[Path]) -> tuple[int, float]:
+    n, used = 0, 0.0
+    for p in files:
+        try:
+            st = p.stat()
+        except OSError:   # gone meanwhile
+            continue
+        n, used = n + st.st_size, max(used, st.st_mtime)
+    return n, used
+
+
+def stored_bytes(root) -> int:
+    """The bytes every model's prompt caches hold under root."""
+    return sum(_size_and_used(_files(d))[0] for d in _model_dirs(Path(root)))
 
 
 def _sliced(c) -> bool:
@@ -119,6 +163,8 @@ class PagedPromptCache:
         self._next: dict[str, set] = {}  # prev key -> keys extending it
         self._ends: list[int] = []       # sorted distinct segment ends
         self._bytes = 0
+        self._others: list = []   # other models' caches: (last used, bytes, dir)
+        self._other_bytes = 0
         self._sliced_only: bool | None = None
         self._lock = threading.Lock()
         self._cv = threading.Condition()
@@ -161,8 +207,17 @@ class PagedPromptCache:
                 self._sliced_only = all(x["sliced"] for x in meta["layers"])
         for s in [s for s in self._segs.values() if self._walk(s) is None]:
             self._drop(s)    # its prefix is gone (deleted, torn write)
-        log.info("kv cache %s: %d segments, %.1f GB", self._dir,
-                 len(self._segs), self._bytes / 1e9)
+        for d in _model_dirs(self.root):
+            if d != self._dir:
+                n, used = _size_and_used(_files(d))
+                self._others.append((used, n, d))
+        self._others.sort(key=lambda o: o[0])   # least recently used first
+        self._other_bytes = sum(o[1] for o in self._others)
+        with self._lock:
+            self._evict()    # e.g. a smaller budget than the last server's
+        log.info("kv cache %s: %d segments, %.1f GB (%.1f GB of other models)",
+                 self._dir, len(self._segs), self._bytes / 1e9,
+                 self._other_bytes / 1e9)
 
     def _chain(self, tokens) -> tuple[list[bytes], np.ndarray]:
         a = np.asarray(tokens, dtype=np.int32)
@@ -199,14 +254,24 @@ class PagedPromptCache:
         s.path.unlink(missing_ok=True)
 
     def _evict(self) -> None:
-        """Least recently used first, leaves only: a segment goes once
-        nothing extends it, so no stored chain ever loses its prefix."""
-        if self._bytes <= self.max_bytes:
+        """Other models' caches first, least recently used first and each
+        whole; then this model's, least recently used first, leaves only: a
+        segment goes once nothing extends it, so no stored chain ever loses
+        its prefix."""
+        while self._others and self._bytes + self._other_bytes > self.max_bytes:
+            _, n, d = self._others.pop(0)
+            for p in _files(d):
+                p.unlink(missing_ok=True)
+            self._other_bytes -= n
+            log.info("kv cache: %s dropped (%.1f GB, another model's)", d,
+                     n / 1e9)
+        limit = self.max_bytes - self._other_bytes
+        if self._bytes <= limit:
             return
         heap = [(s.used, s.key) for s in self._segs.values()
                 if not self._next.get(s.key)]
         heapq.heapify(heap)
-        while heap and self._bytes > self.max_bytes:
+        while heap and self._bytes > limit:
             _, k = heapq.heappop(heap)
             s = self._segs.get(k)
             if s is None or self._next.get(k):
@@ -249,7 +314,13 @@ class PagedPromptCache:
     def _writer(self) -> None:
         while True:
             seg, host, meta, nbytes = self._q.get()
+            tmp = seg.path.with_suffix(".tmp")
             try:
+                free = shutil.disk_usage(seg.path.parent).free
+                if free - nbytes < _FREE_FLOOR:
+                    log.warning("kv cache: segment not stored, %.1f GB free",
+                                free / 1e9)
+                    continue
                 header, off = {}, 0
                 for name, (tag, arr) in host.items():
                     header[name] = {"dtype": tag, "shape": list(arr.shape),
@@ -258,7 +329,6 @@ class PagedPromptCache:
                 header["__metadata__"] = {"streamlx": json.dumps(meta)}
                 hb = json.dumps(header).encode()
                 hb += b" " * (-len(hb) % 8)
-                tmp = seg.path.with_suffix(".tmp")
                 with open(tmp, "wb") as f:
                     f.write(struct.pack("<Q", len(hb)))
                     f.write(hb)
@@ -271,6 +341,7 @@ class PagedPromptCache:
                     self._evict()
             except Exception:  # a failed write is a cache miss
                 log.exception("kv cache: segment write failed")
+                tmp.unlink(missing_ok=True)
             finally:
                 with self._cv:
                     self._pending -= nbytes

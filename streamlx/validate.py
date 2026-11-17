@@ -5,7 +5,7 @@ covers the prefill sweep too. For >RAM models (no reference possible), run
 twice at two budgets instead — outputs must be identical (pool-size
 invariance).
 
-  python examples/validate.py --model <local-dir> --slots 16 --tokens 256 \
+  streamlx validate <local-model-dir> [--slots 16] [--tokens 256] \
       [--prompt-tokens 512]
 """
 
@@ -16,7 +16,6 @@ import sys
 import time
 
 import mlx.core as mx
-
 from mlx_lm import load
 from mlx_lm.models.cache import make_prompt_cache
 
@@ -56,7 +55,7 @@ def main() -> int:
     model, tokenizer = load(args.model)
     print(f"[validate] reference model loaded in {time.time()-t0:.1f}s",
           file=sys.stderr)
-    cache_factory = lambda: make_prompt_cache(model)  # noqa: E731
+    cache_factory = lambda: make_prompt_cache(model)
     prompt_ids = tokenizer.encode(PROMPT)
     prompt_ids = (prompt_ids * (args.prompt_tokens // len(prompt_ids) + 1)
                   )[:args.prompt_tokens]

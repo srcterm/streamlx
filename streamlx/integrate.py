@@ -13,20 +13,24 @@ dependency of expert streaming.
 
 from __future__ import annotations
 
-import os
+import itertools
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
+from mlx import nn
 
-from .pool import (KEEPALIVE, StreamingSwitchMLP, gpu_hold, keepalive_wait,
-                   switch_forward)
+from .pool import (
+    KEEPALIVE,
+    StreamingSwitchMLP,
+    gpu_hold,
+    keepalive_wait,
+    switch_forward,
+)
 from .reader import ExpertReader
 from .stindex import SafetensorsIndex
-
 
 _PF_EX = None   # the prefill sweeps' read queue: two batches in flight
 
@@ -97,13 +101,7 @@ class StreamingSwitchGLU(nn.Module):
         self.pool = pool
         # A chunk that routes more experts than the pool holds is swept
         # (_expert_sweep), this many experts a batch.
-        self.sweep_batch = int(os.environ.get("STREAMLX_SWEEP_BATCH", "16"))
-        self.sweep_warm = os.environ.get("STREAMLX_SWEEP_WARM", "1") != "0"
-        # What a sweep adopts: "fill" (its most-routed experts into the free
-        # slots only, the experts the pool holds left where decoding put
-        # them) or "count" (its n_slots most-routed, evicting and retouching:
-        # decode after a prefill then misses a third more).
-        self.warm_policy = os.environ.get("STREAMLX_WARM_POLICY", "fill")
+        self.sweep_batch = 16
         # Next-layer reads: the next streamed layer's wrapper (linked at
         # load), what a sweep may still queue for it (expert ids), the reads
         # the previous layer started for this layer's next sweep ({expert id:
@@ -134,7 +132,7 @@ class StreamingSwitchGLU(nn.Module):
         for c in cache[max(done, 0):upto + 1]:
             try:
                 st = c.state
-            except Exception:    # an entry with nothing stored yet
+            except Exception:  # noqa: BLE001, S112 — nothing stored yet
                 continue
             todo = [st]
             while todo:
@@ -176,7 +174,7 @@ class StreamingSwitchGLU(nn.Module):
         outputs *before* the router's weighted sum: each row depends only on x
         and its own expert, so computing two subsets and permuting back is
         bitwise identical (verified against the stock model by
-        examples/validate.py).
+        `streamlx validate`).
 
         Returns None when there is nothing to overlap (no misses, or no hits).
         `wait` is handed to the pool's fetch (the GPU keepalive).
@@ -375,12 +373,12 @@ class StreamingSwitchGLU(nn.Module):
         tail and the next one's attention; that sweep takes the ones it
         routes. sweep_fetch_s counts only time blocked on IO.
 
-        With sweep_warm (default on), the chunk's most-routed experts are
-        adopted into the pool's free slots as their batch streams by (no
-        extra IO), most-frequent most-recently-used; the experts the pool
-        holds stay as decoding left them, since decode after the prefill
-        routes more like the decode before it than like the prompt
-        (warm_policy "count" fills the whole pool from the chunk).
+        The chunk's most-routed experts are adopted into the pool's free
+        slots as their batch streams by (no extra IO), most-frequent
+        most-recently-used; the experts the pool holds stay as decoding left
+        them, since decode after the prefill routes more like the decode
+        before it than like the prompt (filling the whole pool from the
+        chunk made that decode miss a third more).
         """
         pool = self.pool
         b, t, k = idx.shape
@@ -400,19 +398,14 @@ class StreamingSwitchGLU(nn.Module):
             self._hist = np.zeros(pool.n_experts, np.float32)
         self._hist *= 0.5
         self._hist[uniq] += counts
-        warm_ids: set = set()
-        if self.sweep_warm:
-            top = np.argsort(counts, kind="stable")[::-1]
-            if self.warm_policy == "fill":
-                room = pool.n_slots - len(pool.id2slot)
-                top = [i for i in top.tolist()
-                       if not pool.resident(int(uniq[i]))][:max(0, room)]
-            else:
-                top = top[:pool.n_slots]
-            warm_ids = {int(uniq[i]) for i in top}
+        # the chunk's most-routed experts the pool does not hold, as many as
+        # it has free slots
+        room = pool.n_slots - len(pool.id2slot)
+        top = [i for i in np.argsort(counts, kind="stable")[::-1].tolist()
+               if not pool.resident(int(uniq[i]))][:max(0, room)]
+        warm_ids = {int(uniq[i]) for i in top}
         # the routed experts the pool holds: copies of their slots (a gather
-        # into new buffers, no view of a slab), made before an adoption can
-        # evict one and rewrite its slot
+        # into new buffers, no view of a slab the adoptions below write into)
         resident = {int(e): pool.id2slot[int(e)] for e in uniq
                     if pool.resident(int(e))}
         taken, res_pos = None, {}
@@ -423,13 +416,6 @@ class StreamingSwitchGLU(nn.Module):
                          for q in pool.parts} for p in pool.projs}
             mx.eval(*(taken[p][q] for p in pool.projs for q in pool.parts))
             pool.sweep_resident += len(resident)
-            # those of them the sweep keeps warm go to the recent end first:
-            # the adoptions below then take free slots or the slots of
-            # experts it does not keep, never one of these (which was not
-            # read, so there are no arrays to adopt it from again)
-            for e in resident:
-                if e in warm_ids:
-                    pool.id2slot.move_to_end(e)
 
         batches = [[int(e) for e in uniq[i0:i0 + self.sweep_batch]]
                    for i0 in range(0, len(uniq), self.sweep_batch)]
@@ -518,11 +504,8 @@ class StreamingSwitchGLU(nn.Module):
             mx.async_eval(y)       # GPU busy while the next batch is read
             outs.append(y)
             for e in ids:
-                if e in warm_ids:
-                    if e in pool.id2slot:   # adopt() would rewrite its bytes
-                        pool.id2slot.move_to_end(e)
-                    else:
-                        pool.adopt(e, raw)
+                if e in warm_ids:          # into a free slot
+                    pool.adopt(e, raw)
         if warm_ids:
             for i in np.argsort(counts, kind="stable"):  # ascending count
                 e = int(uniq[i])
@@ -683,7 +666,7 @@ def _link_next_layers(model, pools: dict) -> None:
     next-layer reads (dense layers between them see the same tokens too)."""
     blocks = [_moe_block(model.layers[i]) for i in sorted(pools)]
     ws = [getattr(m, _switch_name(m)) for m in blocks]
-    for a, b in zip(ws, ws[1:]):
+    for a, b in itertools.pairwise(ws):
         a._next = b
 
 
@@ -857,6 +840,60 @@ def pool_bytes(pools: dict) -> int:
     return sum(p.n_slots * p.expert_bytes for p in pools.values())
 
 
+def pool_floor(pools: dict) -> int:
+    """The bytes the pools hold at their smallest (each pool's min_slots)."""
+    return sum(p.min_slots * p.expert_bytes for p in pools.values())
+
+
+PREFILL_MIN = 256   # a prompt chunk from this many tokens gets room of its own
+PREFILL_TOKEN_BYTES = 4 * 2**20   # its working memory a token until measured
+#                                   (DeepSeek-V4.1's 4 MiB, the most of the models run)
+
+
+def prefill_chunks(n: int, step: int, most: int = 0) -> list[int]:
+    """Prefill chunk sizes for n tokens: as many as step-size chunks take,
+    one fewer when the last would be under a quarter step, more when a chunk
+    would pass `most` tokens, evened out. Each chunk's expert sweep reads
+    ~every expert, so a small last chunk costs as many bytes as a full one."""
+    k = -(-n // step)
+    if k > 1 and n - (k - 1) * step < step // 4:
+        k -= 1
+    if most:
+        k = max(k, -(-n // most))
+    q, r = divmod(n, k)
+    return [q + 1] * r + [q] * (k - r)
+
+
+def prefill_plan(n: int, budget: float, floor: float,
+                 step: int) -> tuple[list[int], float]:
+    """A prompt of n tokens prefilled inside a pool budget: its chunks
+    (prefill_chunks: none needing more working memory, PREFILL_TOKEN_BYTES a
+    token, than the budget leaves beside pools of `floor` bytes) and the
+    pool bytes that leave room for the largest. The pools sit idle while a
+    chunk's experts pass through the sweep's buffer, so they shrink for
+    prefill and grow back for decoding."""
+    most = max(PREFILL_MIN, int((budget - floor) / PREFILL_TOKEN_BYTES))
+    sizes = prefill_chunks(n, step, most)
+    if sizes[0] < PREFILL_MIN:
+        return sizes, budget
+    return sizes, max(floor, budget - sizes[0] * PREFILL_TOKEN_BYTES)
+
+
+def memory_limit() -> int:
+    """A default limit for MLX's memory: 95% of the GPU working set the system
+    recommends. Past that set a computation can come out wrong, not only
+    slow, so hosts keep under it."""
+    return int(0.95 * mx.device_info()["max_recommended_working_set_size"])
+
+
+def budget_within(limit: int, pools: dict, reserve: int = 0) -> int:
+    """The expert budget a memory limit leaves once the model is loaded: the
+    limit less what is resident beside the pools and `reserve` (what decoding
+    and a prompt cache will add); at least 1 GiB."""
+    resident = mx.get_active_memory() - pool_bytes(pools)
+    return max(int(limit - resident - reserve), 2**30)
+
+
 def resize_pools(pools: dict, budget_bytes: float) -> int:
     """Split `budget_bytes` over `pools` the way load_streaming_model splits
     its budget (equal bytes a pool, at least its min_slots, at most its
@@ -871,34 +908,6 @@ def resize_pools(pools: dict, budget_bytes: float) -> int:
         pools[i].resize(want[i])
     mx.clear_cache()
     return pool_bytes(pools)
-
-
-def stream_moe_blocks(module, index: SafetensorsIndex, reader: ExpertReader,
-                      key0: int, prefix: str = "", slots: int = 1,
-                      k: int | None = None) -> dict:
-    """Pools for the MoE blocks of a module outside the trunk (a draft head):
-    block i of module.layers, whose switch tensors are at
-    `{prefix}layers.{i}` in the index's checkpoint, streams through a pool
-    keyed key0 + i, as a trunk layer does. Call it before the module's
-    parameters are evaluated: the replaced switch weights then never load.
-    Returns {key: pool}; size them with resize_pools."""
-    pools = {}
-    for i, layer in enumerate(getattr(module, "layers", None) or []):
-        mlp = _moe_block(layer)
-        if mlp is None:
-            continue
-        tag = f"{prefix}layers.{i}"
-        try:
-            index.layer_expert_bytes(key0 + i, tag=tag)
-        except KeyError:
-            continue                # no streamable switch tensors there
-        pool = StreamingSwitchMLP(index.model_dir, key0 + i,
-                                  max(slots, k or 1), index=index,
-                                  reader=reader, tag=tag)
-        pool.min_slots = min(k or 1, pool.n_experts)
-        _wrap(layer, mlp, pool)
-        pools[key0 + i] = pool
-    return pools
 
 
 def aggregate_stats(pools: dict) -> dict:

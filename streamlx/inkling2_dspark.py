@@ -28,7 +28,7 @@ import json
 from pathlib import Path
 
 import mlx.core as mx
-import mlx.nn as nn
+from mlx import nn
 
 BITS = 4     # the head's projections in RAM: 1.0 GiB (8: 1.7, None = bf16: 3.2)
 _PART = 512  # context positions projected at a time
