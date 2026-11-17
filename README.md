@@ -71,7 +71,7 @@ A larger-than-RAM model is bound by the drive: tokens per second is about the dr
 | `--memory-gib` | 95% of the recommended GPU working set | keep MLX's memory under this by resizing the pools: for each prompt chunk, then for decoding; `0` turns it off |
 | `--budget-gib` | what the memory limit leaves | the most RAM the expert pools take |
 | `--draft-head`, `--draft-k` | the checkpoint's own head | pipelined decoding of greedy requests, tokens in flight; `none` for plain decoding |
-| `--kv-cache-dir`, `--kv-cache-gib` | `~/.cache/streamlx/kv`, half the free space up to 32 | prompt caches on SSD and their disk limit |
+| `--kv-cache-dir`, `--kv-cache-gib` | `~/.cache/streamlx/kv`, half of the free space and what the caches hold, up to 32 | prompt caches on SSD and their disk limit, all models' caches together |
 | `--mlx-cache-gib` | 2 | cap for MLX's freed-buffer cache |
 | `--prefill-step-size` | 4096 | prefill chunk; larger chunks read fewer bytes per prompt |
 | `--tokenizer-config`, `--trust-remote-code` | | passed to the tokenizer |

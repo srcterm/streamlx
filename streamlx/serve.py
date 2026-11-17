@@ -111,7 +111,7 @@ from streamlx.integrate import (
     prefill_chunks,
     resize_pools,
 )
-from streamlx.kvcache import PagedPromptCache
+from streamlx.kvcache import PagedPromptCache, stored_bytes
 
 _CFG = {"budget_bytes": None, "trust": False, "tokenizer_config": {},
         "draft_head": "auto", "draft_k": None, "memory_bytes": 0,
@@ -643,6 +643,14 @@ class StreamingModelProvider(srv.ModelProvider):
         self.is_batchable = False  # batch-1 by design
 
 
+def _kv_budget(kv_dir: str) -> int:
+    """--kv-cache-gib's default: half of the space the prompt caches could
+    have there (what the volume has free and what they hold already), at
+    most 32 GiB."""
+    room = shutil.disk_usage(kv_dir).free + stored_bytes(kv_dir)
+    return int(min(32 * 2**30, room / 2))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--budget-gib", type=float, default=None,
@@ -660,8 +668,9 @@ def main() -> None:
                     help="prompt caches on SSD in this directory (default "
                          "~/.cache/streamlx/kv)")
     ap.add_argument("--kv-cache-gib", type=float, default=None,
-                    help="disk space for --kv-cache-dir (default: half of "
-                         "what is free there, at most 32)")
+                    help="disk space for --kv-cache-dir, every model's "
+                         "caches there together (default: half of what is "
+                         "free there and what they hold, at most 32)")
     ap.add_argument("--draft-head", default="auto",
                     help="draft head: pipelined decoding of greedy requests. "
                          "Default: the checkpoint's own if it carries one, "
@@ -698,16 +707,15 @@ def main() -> None:
     attention.install()
     kv_dir = os.path.expanduser(ours.kv_cache_dir)
     os.makedirs(kv_dir, exist_ok=True)
-    kv_gib = ours.kv_cache_gib
-    if kv_gib is None:   # half of what the volume has free, at most 32
-        kv_gib = max(1.0, min(32.0, shutil.disk_usage(kv_dir).free / 2**31))
+    kv_bytes = (_kv_budget(kv_dir) if ours.kv_cache_gib is None
+                else int(ours.kv_cache_gib * 2**30))
 
     def paged(*_args, **_kwargs):
-        _STATE["paged"] = PagedPromptCache(kv_dir, int(kv_gib * 2**30))
+        _STATE["paged"] = PagedPromptCache(kv_dir, kv_bytes)
         return _STATE["paged"]
 
     srv.LRUPromptCache = paged
-    where = f"prompt caches on SSD at {kv_dir} (<= {kv_gib:.0f} GiB)"
+    where = f"prompt caches on SSD at {kv_dir} (<= {kv_bytes / 2**30:.1f} GiB)"
     lim = _CFG["memory_bytes"]
     print(f"[streamlx] ram guard: {ram / 2**30:.0f} GiB RAM, "
           + (f"MLX memory <= {lim / 2**30:.1f} GiB, " if lim else "")
