@@ -20,8 +20,8 @@ so models with them restore at segment ends only.
 Each model's segments sit in a directory of its own under the root, and one
 budget covers them all: past it the least recently used of the other models'
 caches go first, a model's whole cache at a time (a server still running on
-that model then misses, nothing else), then the served model's least recently
-used segments. A segment is not written when it would leave the volume with
+that model then misses and stores it again), then the served model's least
+recently used segments. A segment is not written when it would leave the volume with
 less than 1 GiB free.
 
 Drop-in for mlx_lm's LRUPromptCache in the sequential server (one request at
@@ -253,6 +253,21 @@ class PagedPromptCache:
         self._bytes -= s.nbytes
         s.path.unlink(missing_ok=True)
 
+    def _forget_gone(self) -> bool:
+        """Forget the segments whose files are gone (another server's budget
+        removed this model's cache), so that they are stored again instead of
+        being taken for stored. True when there were any."""
+        with self._lock:
+            gone = [s for s in self._segs.values() if not s.path.exists()]
+            for s in gone:
+                self._drop(s)
+            alive = {s.end for s in self._segs.values()}
+            self._ends = [e for e in self._ends if e in alive]
+        if gone:
+            log.info("kv cache: %d segments gone from disk, forgotten",
+                     len(gone))
+        return bool(gone)
+
     def _evict(self) -> None:
         """Other models' caches first, least recently used first and each
         whole; then this model's, least recently used first, leaves only: a
@@ -483,14 +498,22 @@ class PagedPromptCache:
         if not best and partial is None:
             self._cur = (tokens, 0, "")
             return None, tokens
+        used = best + ([partial[0]] if partial else [])
+        if (not all(s.path.exists() for s in used)
+                and self._forget_gone()):   # look again without them
+            return self.fetch_nearest_cache(model_key, tokens)
         try:
             cache, n = self._restore(best, partial)
-        except Exception:  # unreadable segments = a miss
+        except Exception:  # unreadable segments = a miss, stored again
             log.exception("kv cache: restore failed")
+            with self._lock:
+                for s in used:
+                    if self._segs.get(s.key) is s:
+                        self._drop(s)
             self._cur = (tokens, 0, "")
             return None, tokens
         now = time.time()
-        for s in best + ([partial[0]] if partial else []):
+        for s in used:
             s.used = now
             try:
                 os.utime(s.path, (now, now))
