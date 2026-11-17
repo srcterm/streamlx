@@ -47,7 +47,7 @@ That is an OpenAI-compatible server on `http://localhost:8080/v1`: point a codin
 | DeepSeek-V4.1-Flash | mlx-vlm | in the checkpoint, 6 tokens in flight |
 | Inkling 2 | mlx-lm with its `inkling2` model (mlx-lm PR #2061) | in the checkpoint, 3 tokens in flight |
 
-mlx-vlm text-only exports (tensors prefixed `language_model.`) are detected and remapped. DeepSeek-V4.1 checkpoints ship no chat template; streamlx brings its prompt format and tool-call parser.
+Inkling 2 needs mlx-lm with that pull request: `pip install git+https://github.com/ml-explore/mlx-lm@refs/pull/2061/head`. mlx-vlm text-only exports (tensors prefixed `language_model.`) are detected and remapped. DeepSeek-V4.1 checkpoints ship no chat template; streamlx brings its prompt format and tool-call parser.
 
 ## Serving numbers
 
@@ -105,7 +105,7 @@ print(aggregate_stats(pools))      # hits, misses, fetch time
 
 ## Limits
 
-- Apple Silicon, one request at a time, local checkpoint directories.
+- Apple Silicon with macOS 14 or later (MLX's requirement), one request at a time, local checkpoint directories.
 - Pipelined decoding covers greedy requests; requests that sample or ask for logprobs decode plainly.
 
-v0.1; interfaces may change.
+v0.2; interfaces may change.
