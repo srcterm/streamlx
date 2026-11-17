@@ -840,6 +840,30 @@ def pool_bytes(pools: dict) -> int:
     return sum(p.n_slots * p.expert_bytes for p in pools.values())
 
 
+def pool_floor(pools: dict) -> int:
+    """The bytes the pools hold at their smallest (each pool's min_slots)."""
+    return sum(p.min_slots * p.expert_bytes for p in pools.values())
+
+
+PREFILL_MIN = 256   # a prompt chunk from this many tokens gets room of its own
+PREFILL_TOKEN_BYTES = 4 * 2**20   # its working memory a token until measured
+#                                   (DeepSeek-V4.1's 4 MiB, the most of the models run)
+
+
+def prefill_chunks(n: int, step: int, most: int = 0) -> list[int]:
+    """Prefill chunk sizes for n tokens: as many as step-size chunks take,
+    one fewer when the last would be under a quarter step, more when a chunk
+    would pass `most` tokens, evened out. Each chunk's expert sweep reads
+    ~every expert, so a small last chunk costs as many bytes as a full one."""
+    k = -(-n // step)
+    if k > 1 and n - (k - 1) * step < step // 4:
+        k -= 1
+    if most:
+        k = max(k, -(-n // most))
+    q, r = divmod(n, k)
+    return [q + 1] * r + [q] * (k - r)
+
+
 def memory_limit() -> int:
     """A default limit for MLX's memory: 95% of the GPU working set the system
     recommends. Past that set a computation can come out wrong, not only

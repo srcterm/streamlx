@@ -99,12 +99,16 @@ from mlx_lm.generate import (
 
 from streamlx import attention, chat_formats
 from streamlx.integrate import (
+    PREFILL_MIN,
+    PREFILL_TOKEN_BYTES,
     aggregate_stats,
     budget_within,
     load_streaming_model,
     memory_limit,
     pool_bytes,
+    pool_floor,
     prefill_cache,
+    prefill_chunks,
     resize_pools,
 )
 from streamlx.kvcache import PagedPromptCache
@@ -146,24 +150,9 @@ def _reasoning_back(fn):
 srv.process_message_content = _reasoning_back(srv.process_message_content)
 
 
-def _chunks(n: int, step: int) -> list[int]:
-    """Prefill chunk sizes for n tokens: as many as step-size chunks take,
-    one fewer when the last would be under a quarter step, evened out. Each
-    chunk's expert sweep reads ~every expert, so a small last chunk costs as
-    many bytes as a full one."""
-    k = -(-n // step)
-    if k > 1 and n - (k - 1) * step < step // 4:
-        k -= 1
-    q, r = divmod(n, k)
-    return [q + 1] * r + [q] * (k - r)
-
-
 _MARGIN = 2**28   # --memory-gib keeps this much of its limit free,
 _HYST = 2**28     # shrinks the pools when they pass it by this much
 _GROW = 2**30     # and grows them back when this much is free
-_PRE_MIN = 256    # a prompt chunk from this many tokens gets room of its own:
-_PRE_PRIOR = 4 * 2**20   # bytes a chunk token until a chunk has been measured
-#                          (DeepSeek-V4.1's 4 MiB, the most of the models run)
 
 
 def _buffer_reserve() -> int:
@@ -204,9 +193,11 @@ def _govern_request(kwargs: dict) -> None:
     that chunk's working memory, which grows with its length. The pools sit
     idle while a chunk's experts pass through the sweep's buffer, so they are
     sized for the first chunk here, for each later one by _govern_chunk, and
-    for decoding once the prompt is in."""
+    for decoding once the prompt is in. The chunks are decided here too
+    (_plan), so the first one sized for is the first one prefilled."""
     lim, m = _CFG["memory_bytes"], _STATE["mem"]
     if not lim:
+        _STATE["plan"] = _plan(kwargs)
         return
     cache, prompt = kwargs.get("prompt_cache"), kwargs.get("prompt")
     n_prompt = len(prompt) if isinstance(prompt, list) else 0
@@ -217,22 +208,54 @@ def _govern_request(kwargs: dict) -> None:
     m["rest"] = m["F"] if m["F"] is not None else m["base"] + 2 * 2**30
     m["cb0"], m["peak_rest"] = cb, 0
     m["to_come"] = max(0, kwargs.get("max_tokens", 256))
-    chunk = (_chunks(n_prompt, kwargs.get("prefill_step_size", 2048))[0]
-             if n_prompt else 0)
+    _STATE["plan"] = sizes = _plan(kwargs)
+    chunk = sizes[0] if sizes else 0
     _fit_pools(_pools_for(cb, n_prompt + m["to_come"], chunk),
-               f"a prompt chunk of {chunk} tokens" if chunk >= _PRE_MIN
+               f"a prompt chunk of {chunk} tokens" if chunk >= PREFILL_MIN
                else "decoding")
     _reset_peak()
 
 
+def _history_cut(prompt: list) -> int:
+    """Where the prompt's history ends (_prefill_history): before the
+    generation suffix the chat template appends, else one token short."""
+    sfx = _STATE.get("suffix") or []
+    return len(prompt) - (len(sfx) if sfx and prompt[-len(sfx):] == sfx
+                          else 1)
+
+
+def _plan(kwargs: dict) -> list[int]:
+    """The chunks _prefill_history prefills the request's history in:
+    --prefill-step-size chunks evened out, under --memory-gib none longer
+    than _most allows (_govern_chunk plans the rest again from what the
+    chunks before measured)."""
+    prompt = kwargs.get("prompt")
+    cut = _history_cut(prompt) if isinstance(prompt, list) else 0
+    if cut < 1:
+        return []
+    most = (_most(_cache_bytes(kwargs.get("prompt_cache")),
+                  len(prompt) + _STATE["mem"]["to_come"])
+            if _CFG["memory_bytes"] else 0)
+    return prefill_chunks(cut, kwargs.get("prefill_step_size", 2048), most)
+
+
+def _most(cb: int, tokens: int) -> int:
+    """The longest prompt chunk whose working memory fits what --memory-gib
+    leaves with a cache of cb bytes, `tokens` more to come and the pools at
+    their smallest (DeepSeek-V4.1 on a 32 GB Mac: ~1.9K tokens)."""
+    m = _STATE["mem"]
+    room = _pools_for(cb, tokens) - pool_floor(_STATE["pools"] or {})
+    return max(PREFILL_MIN, int(room / (m["pre"] or PREFILL_TOKEN_BYTES)))
+
+
 def _pools_for(cb: int, tokens: int, chunk: int = 0) -> float:
     """The pool bytes that keep a peak under --memory-gib: with a cache of
-    cb bytes, `tokens` more to come and, for chunk >= _PRE_MIN, a prompt chunk
-    of that many tokens in prefill."""
+    cb bytes, `tokens` more to come and, for chunk >= PREFILL_MIN, a prompt
+    chunk of that many tokens in prefill."""
     m = _STATE["mem"]
     pre = 0.0
-    if chunk >= _PRE_MIN:
-        pre = (_PRE_PRIOR if m["pre"] is None else m["pre"]) * chunk
+    if chunk >= PREFILL_MIN:
+        pre = (PREFILL_TOKEN_BYTES if m["pre"] is None else m["pre"]) * chunk
     return (_CFG["memory_bytes"] - _MARGIN - _buffer_reserve() - m["rest"]
             - cb - (m["slope"] or 0) * tokens - pre)
 
@@ -253,28 +276,37 @@ def _govern_mark(cache) -> None:
     m["peak_rest"] = max(m.get("peak_rest", 0), rest)
 
 
-def _govern_chunk(cache, done: int, n: int, nxt: int, left: int) -> None:
-    """--memory-gib after a prefill chunk of n tokens. Its working memory a
+def _govern_chunk(cache, done: int, n: int, later: list[int], left: int,
+                  step: int) -> list[int]:
+    """--memory-gib after a prefill chunk of n tokens, before the chunks
+    `later`; returns the chunks to run instead. The chunk's working memory a
     token is what its peak held above the pools, the cache and decoding's
-    share; the most over chunks is kept. Then the pools are sized for the
-    next chunk (nxt tokens), or after the last one for decoding: they grow
-    back, and decoding reads again what the smaller pools dropped."""
+    share; the most over chunks is kept, and the later chunks are planned
+    again with it (fewer when it is below the first chunk's estimate, more
+    when above). Then the pools are sized for the next chunk, or after the
+    last one for decoding: they grow back, and decoding reads again what the
+    smaller pools dropped."""
     lim, m = _CFG["memory_bytes"], _STATE["mem"]
     if not lim:
-        return
+        return later
     cb = _cache_bytes(cache)
     _measure_slope(cb, done)
-    if n >= _PRE_MIN:
+    if n >= PREFILL_MIN:
         held = (mx.get_peak_memory() - cb
                 - pool_bytes(_STATE["pools"] or {})
                 - (m["base"] if m["F"] is None else m["F"]))
         m["pre"] = max(m["pre"] or 0.0, held / n)
+    if later:
+        later = prefill_chunks(sum(later), step,
+                               _most(cb, left + m["to_come"]))
+    nxt = later[0] if later else 0
     _fit_pools(_pools_for(cb, left + m["to_come"], nxt),
-               f"a prompt chunk of {nxt} tokens" if nxt >= _PRE_MIN
+               f"a prompt chunk of {nxt} tokens" if nxt >= PREFILL_MIN
                else "decoding")
     _reset_peak()
     if not nxt:
         m["peak_rest"] = 0
+    return later
 
 
 def _measure_slope(cb: int, n_tokens: int) -> None:
@@ -316,11 +348,13 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
                             for k in ("prompt", "prompt_cache", "model"))
     if cache is None or model is None or not isinstance(prompt, list):
         return 0
-    sfx = _STATE.get("suffix") or []
-    cut = len(prompt) - (len(sfx) if sfx and prompt[-len(sfx):] == sfx
-                         else 1)
+    cut = _history_cut(prompt)
     if cut < 1:
         return 0
+    step = kwargs.get("prefill_step_size", 2048)
+    sizes = _STATE.pop("plan", None)
+    if not sizes or sum(sizes) != cut:   # (a request _govern_request missed)
+        sizes = prefill_chunks(cut, step)
     paged = _STATE.get("paged")
     base = paged.last[0] if paged is not None else 0
     cb = kwargs.get("prompt_progress_callback") or (lambda *_: None)
@@ -328,8 +362,8 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
     tokens, done = mx.array(prompt[:cut]), 0
     cb(0, len(prompt))
     with wired_limit(model, [stream]), mx.stream(stream):
-        sizes = _chunks(cut, kwargs.get("prefill_step_size", 2048))
-        for i, n in enumerate(sizes):
+        while sizes:
+            n, sizes = sizes[0], sizes[1:]
             chunk = tokens[None, done:done + n]
             with prefill_cache(cache):
                 if adapter is None:
@@ -349,8 +383,8 @@ def _prefill_history(kwargs: dict, adapter=None) -> int:
                 paged.save_progress(base + done, cache)
             cb(done, len(prompt))
             mx.clear_cache()
-            _govern_chunk(cache, done, n, sizes[i + 1] if i + 1 < len(sizes)
-                          else 0, len(prompt) - done)
+            sizes = _govern_chunk(cache, done, n, sizes, len(prompt) - done,
+                                  step)
     kwargs["prompt"] = prompt[cut:]
     kwargs["prompt_progress_callback"] = lambda p, t: cb(cut + p, cut + t)
     return cut
