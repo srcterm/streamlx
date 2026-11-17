@@ -864,6 +864,21 @@ def prefill_chunks(n: int, step: int, most: int = 0) -> list[int]:
     return [q + 1] * r + [q] * (k - r)
 
 
+def prefill_plan(n: int, budget: float, floor: float,
+                 step: int) -> tuple[list[int], float]:
+    """A prompt of n tokens prefilled inside a pool budget: its chunks
+    (prefill_chunks: none needing more working memory, PREFILL_TOKEN_BYTES a
+    token, than the budget leaves beside pools of `floor` bytes) and the
+    pool bytes that leave room for the largest. The pools sit idle while a
+    chunk's experts pass through the sweep's buffer, so they shrink for
+    prefill and grow back for decoding."""
+    most = max(PREFILL_MIN, int((budget - floor) / PREFILL_TOKEN_BYTES))
+    sizes = prefill_chunks(n, step, most)
+    if sizes[0] < PREFILL_MIN:
+        return sizes, budget
+    return sizes, max(floor, budget - sizes[0] * PREFILL_TOKEN_BYTES)
+
+
 def memory_limit() -> int:
     """A default limit for MLX's memory: 95% of the GPU working set the system
     recommends. Past that set a computation can come out wrong, not only

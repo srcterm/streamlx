@@ -9,9 +9,10 @@ Streams tokens to stdout live, then prints the punchline stats
 
 With no options the expert pools take what the memory limit leaves (95% of
 the GPU working set the system recommends, less the model's resident part
-and 4 GiB), the prompt goes through the checkpoint's chat template (--raw:
-as it is), and a checkpoint that carries a draft head (Qwen3.8,
-DeepSeek-V4.1, Inkling 2) decodes pipelined with it.
+and 4 GiB) and give a prompt chunk's working memory room during prefill
+(integrate.prefill_plan), the prompt goes through the checkpoint's chat
+template (--raw: as it is), and a checkpoint that carries a draft head
+(Qwen3.8, DeepSeek-V4.1, Inkling 2) decodes pipelined with it.
 
 A draft head decodes through streamlx.pipeline: K tokens in flight, so each
 token's expert reads overlap the others' compute; greedy output identical
@@ -41,7 +42,10 @@ from streamlx.integrate import (
     budget_within,
     load_streaming_model,
     memory_limit,
+    pool_floor,
     prefill_cache,
+    prefill_chunks,
+    prefill_plan,
     resize_pools,
 )
 
@@ -110,10 +114,11 @@ def main() -> int:
     if drafter is not None:
         ad = adapter_for(model, drafter)
         print(f"[load] draft head in {time.time()-t0:.1f}s", file=sys.stderr)
-    # the memory limit, less what is resident, MLX's buffer cache and 2 GiB
-    budget = (budget_within(memory_limit(), pools, reserve=4 * 2**30)
-              if auto else int(args.budget_gib * 2**30))
-    budget = resize_pools(pools, budget)
+    # the memory limit, less what is resident, MLX's buffer cache and 2 GiB;
+    # the pools take it, or every expert when that is less
+    room = (budget_within(memory_limit(), pools, reserve=4 * 2**30)
+            if auto else int(args.budget_gib * 2**30))
+    budget = resize_pools(pools, room)
     print(f"machine RAM: {ram:.0f} GB  |  expert budget: "
           f"{budget / 2**30:.1f} GiB\n")
 
@@ -128,8 +133,19 @@ def main() -> int:
                 add_generation_prompt=True, **args.chat_template_args))
         cache = make_prompt_cache(model)
         context = []
-        for i in range(0, len(ids), PREFILL_STEP):
-            chunk = mx.array([ids[i:i + PREFILL_STEP]])
+        if auto:   # the pools shrink for the prompt chunks, then grow back
+            sizes, pre = prefill_plan(len(ids), room, pool_floor(pools),
+                                      PREFILL_STEP)
+            if pre < budget:
+                got = resize_pools(pools, pre)
+                print(f"[prefill] {len(sizes)} chunk(s) of {sizes[0]} tokens:"
+                      f" expert pools {got / 2**30:.1f} GiB", file=sys.stderr)
+        else:
+            sizes, pre = prefill_chunks(len(ids), PREFILL_STEP), budget
+        done = 0
+        for n in sizes:
+            chunk = mx.array([ids[done:done + n]])
+            done += n
             with prefill_cache(cache):
                 if ad is None:
                     logits = model(chunk, cache=cache)
@@ -137,6 +153,8 @@ def main() -> int:
                     logits, h = ad.forward_taps(chunk, cache)
                     context.append(h)
             mx.eval(logits, context)
+        if pre < budget:
+            resize_pools(pools, budget)
         first = int(mx.argmax(logits[0, -1]).item())
 
         eos = set(tokenizer.eos_token_ids or ())
