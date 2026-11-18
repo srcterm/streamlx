@@ -692,6 +692,18 @@ def main() -> None:
         print("\nmlx_lm.server options:\n", flush=True)
         sys.argv = [sys.argv[0]] + rest
         srv.main()
+    mp = argparse.ArgumentParser(add_help=False)
+    mp.add_argument("--model")
+    model = mp.parse_known_args(rest)[0].model
+    if model:  # what would fail in the server's thread fails here instead
+        if not os.path.isdir(model):
+            raise SystemExit(f"streamlx serve: no checkpoint directory at "
+                             f"{model}")
+        from streamlx.integrate import _checkpoint_loader
+        try:
+            _checkpoint_loader(model)
+        except ImportError as e:
+            raise SystemExit(f"streamlx serve: {e}") from None
     if ours.budget_gib is not None:
         _CFG["budget_bytes"] = int(ours.budget_gib * 2**30)
     _CFG["trust"] = ours.trust_remote_code
