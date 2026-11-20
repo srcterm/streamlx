@@ -1,0 +1,210 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="516" viewBox="0 0 960 516" role="img" aria-labelledby="t d"><title id="t">How streamlx serves a request</title><desc id="d">A request from a coding agent goes to streamlx serve, which prefills the prompt expert by expert and decodes pipelined with the checkpoint's draft head. Each decoder layer is the stock model code except its routed experts, which run from expert pools in RAM; a miss is read from the stock checkpoint on the SSD straight into its slot. The KV cache is restored from and stored to a prompt cache on the SSD.</desc><style>svg{--bg:#f6f8fa;--edge:#d1d9e0;--mem:#ffffff;--ssd:#eef1f4;--box:#ffffff;--line:#afb8c1;--ink:#1f2328;--muted:#59636e;--acc:#0969da;--soft:#ddf4ff}@media (prefers-color-scheme:dark){svg{--bg:#151b23;--edge:#3d444d;--mem:#0d1117;--ssd:#1b2129;--box:#0d1117;--line:#4a525c;--ink:#f0f6fc;--muted:#9198a1;--acc:#4493f8;--soft:#102a52}}
+svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
+.card{fill:var(--bg);stroke:var(--edge)}
+.mem{fill:var(--mem);stroke:var(--edge)}
+.ssd{fill:var(--ssd);stroke:var(--edge)}
+.box{fill:var(--box);stroke:var(--line)}
+.sx{fill:var(--box);stroke:var(--acc);stroke-width:1.5}
+.ext{fill:var(--box);stroke:var(--line);stroke-dasharray:4 3}
+.slot{fill:var(--box);stroke:var(--line)}
+.hit{fill:var(--soft);stroke:var(--acc);stroke-width:1.5}
+.miss{fill:var(--acc);stroke:var(--acc)}
+.dense{fill:var(--line)}
+.tensor{fill:var(--box);stroke:var(--line);stroke-width:.8}
+.row{stroke:var(--line);stroke-width:.6}
+.hot{fill:var(--acc)}
+.t{fill:var(--ink);font-size:14px;font-weight:600}
+.n{fill:var(--ink);font-size:13px}
+.b{fill:var(--muted);font-size:12px}
+.lab{fill:var(--muted);font-size:11px;font-weight:600;letter-spacing:.08em}
+.a{fill:none;stroke:var(--muted);stroke-width:1.3}
+.ax{fill:none;stroke:var(--acc);stroke-width:1.6}
+.dash{stroke-dasharray:4 3}
+.ahf{fill:var(--muted)}
+.ahx{fill:var(--acc)}
+</style><defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 Z" class="ahf"/></marker><marker id="ahx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 Z" class="ahx"/></marker></defs>
+<rect x="0.5" y="0.5" width="959" height="515" rx="12" class="card"/>
+<rect x="12" y="136" width="936" height="232" rx="10" class="mem"/>
+<rect x="12" y="380" width="936" height="124" rx="10" class="ssd"/>
+<text x="28" y="162" class="lab">RAM</text>
+<text x="28" y="406" class="lab">SSD</text>
+<rect x="690" y="13" width="16" height="11" rx="2" class="sx"/>
+<text x="712" y="23" class="b">streamlx</text>
+<rect x="778" y="13" width="16" height="11" rx="2" class="box"/>
+<text x="800" y="23" class="b">stock mlx-lm / mlx-vlm</text>
+<rect x="24" y="52" width="100" height="60" rx="6" class="ext"/>
+<text x="74" y="86" class="n" text-anchor="middle">coding agent</text>
+<path d="M124,82 L154,82" class="a" marker-end="url(#ah)"/>
+<rect x="156" y="52" width="196" height="60" rx="6" class="sx"/>
+<text x="254.0" y="78" class="t" text-anchor="middle">streamlx serve</text>
+<text x="254.0" y="97" class="b" text-anchor="middle">mlx_lm.server</text>
+<path d="M352,82 L378,82" class="a" marker-end="url(#ah)"/>
+<rect x="380" y="52" width="248" height="60" rx="6" class="sx"/>
+<text x="504.0" y="78" class="t" text-anchor="middle">prefill</text>
+<text x="504.0" y="97" class="b" text-anchor="middle">expert by expert</text>
+<path d="M628,82 L654,82" class="a" marker-end="url(#ah)"/>
+<rect x="656" y="52" width="280" height="60" rx="6" class="sx"/>
+<text x="796.0" y="78" class="t" text-anchor="middle">decode</text>
+<text x="796.0" y="97" class="b" text-anchor="middle">pipelined with the draft head</text>
+<path d="M796,52 L796,36 L74,36 L74,50" class="a" marker-end="url(#ah)"/>
+<text x="435" y="30" class="b" text-anchor="middle">reply</text>
+<path d="M504,112 L504,176" class="a" marker-end="url(#ah)"/>
+<path d="M796,112 L796,176" class="a" marker-end="url(#ah)"/>
+<rect x="380" y="178" width="556" height="92" rx="8" class="box"/>
+<text x="396" y="198" class="t">decoder layer</text>
+<rect x="396" y="212" width="110" height="40" rx="6" class="box"/>
+<text x="451.0" y="237" class="n" text-anchor="middle">attention</text>
+<rect x="530" y="212" width="90" height="40" rx="6" class="box"/>
+<text x="575.0" y="237" class="n" text-anchor="middle">router</text>
+<rect x="818" y="212" width="100" height="40" rx="6" class="box"/>
+<text x="868.0" y="237" class="n" text-anchor="middle">weighted sum</text>
+<rect x="644" y="212" width="150" height="40" rx="6" class="sx"/>
+<text x="719" y="237" class="n" text-anchor="middle">routed experts</text>
+<path d="M506,232 L528,232" class="a" marker-end="url(#ah)"/>
+<path d="M620,232 L642,232" class="a" marker-end="url(#ah)"/>
+<path d="M794,232 L816,232" class="a" marker-end="url(#ah)"/>
+<rect x="156" y="212" width="150" height="40" rx="6" class="box"/>
+<text x="231" y="237" class="n" text-anchor="middle">KV cache</text>
+<path d="M308,232 L394,232" class="a" marker-end="url(#ah)" marker-start="url(#ah)"/>
+<path d="M719,252 L719,286" class="a" marker-end="url(#ah)"/>
+<rect x="520" y="288" width="416" height="68" rx="8" class="sx"/>
+<text x="532" y="309" class="t">expert pools</text>
+<rect x="532" y="320" width="26" height="24" rx="4" class="slot"/>
+<rect x="562" y="320" width="26" height="24" rx="4" class="hit"/>
+<rect x="592" y="320" width="26" height="24" rx="4" class="slot"/>
+<rect x="622" y="320" width="26" height="24" rx="4" class="slot"/>
+<rect x="652" y="320" width="26" height="24" rx="4" class="hit"/>
+<rect x="682" y="320" width="26" height="24" rx="4" class="slot"/>
+<rect x="712" y="320" width="26" height="24" rx="4" class="slot"/>
+<rect x="742" y="320" width="26" height="24" rx="4" class="hit"/>
+<rect x="772" y="320" width="26" height="24" rx="4" class="slot"/>
+<rect x="802" y="320" width="26" height="24" rx="4" class="hit"/>
+<rect x="832" y="320" width="26" height="24" rx="4" class="slot"/>
+<rect x="862" y="320" width="26" height="24" rx="4" class="slot"/>
+<rect x="892" y="320" width="26" height="24" rx="4" class="miss"/>
+<rect x="828" y="299" width="14" height="11" rx="2" class="hit"/>
+<text x="848" y="309" class="b">hit</text>
+<rect x="876" y="299" width="14" height="11" rx="2" class="miss"/>
+<text x="896" y="309" class="b">miss</text>
+<path d="M205,428 L205,254" class="a" marker-end="url(#ah)"/>
+<path d="M257,254 L257,428" class="a" marker-end="url(#ah)"/>
+<text x="197" y="338" class="b" text-anchor="end">restore</text>
+<text x="265" y="338" class="b">store</text>
+<rect x="156" y="430" width="30" height="28" rx="4" class="sx"/>
+<rect x="194" y="430" width="30" height="28" rx="4" class="sx"/>
+<rect x="232" y="430" width="30" height="28" rx="4" class="sx"/>
+<rect x="270" y="430" width="30" height="28" rx="4" class="sx"/>
+<text x="156" y="486" class="t">prompt cache</text>
+<path d="M400,428 L400,272" class="a dash" marker-end="url(#ah)"/>
+<text x="408" y="326" class="b">dense weights,</text>
+<text x="408" y="342" class="b">at load</text>
+<rect x="380" y="429" width="180" height="30" rx="4" class="box"/>
+<rect x="381" y="432" width="10" height="24" rx="2" class="tensor"/>
+<path d="M386,433 L386,455" class="row"/>
+<rect x="394" y="432" width="12" height="24" rx="2" class="dense"/>
+<rect x="409" y="432" width="50" height="24" rx="2" class="tensor"/>
+<path d="M414,433 L414,455" class="row"/>
+<path d="M419,433 L419,455" class="row"/>
+<path d="M424,433 L424,455" class="row"/>
+<path d="M429,433 L429,455" class="row"/>
+<path d="M434,433 L434,455" class="row"/>
+<path d="M439,433 L439,455" class="row"/>
+<path d="M444,433 L444,455" class="row"/>
+<path d="M449,433 L449,455" class="row"/>
+<path d="M454,433 L454,455" class="row"/>
+<rect x="462" y="432" width="50" height="24" rx="2" class="tensor"/>
+<path d="M467,433 L467,455" class="row"/>
+<path d="M472,433 L472,455" class="row"/>
+<path d="M477,433 L477,455" class="row"/>
+<path d="M482,433 L482,455" class="row"/>
+<path d="M487,433 L487,455" class="row"/>
+<path d="M492,433 L492,455" class="row"/>
+<path d="M497,433 L497,455" class="row"/>
+<path d="M502,433 L502,455" class="row"/>
+<path d="M507,433 L507,455" class="row"/>
+<rect x="515" y="432" width="44" height="24" rx="2" class="tensor"/>
+<path d="M520,433 L520,455" class="row"/>
+<path d="M525,433 L525,455" class="row"/>
+<path d="M530,433 L530,455" class="row"/>
+<path d="M535,433 L535,455" class="row"/>
+<path d="M540,433 L540,455" class="row"/>
+<path d="M545,433 L545,455" class="row"/>
+<path d="M550,433 L550,455" class="row"/>
+<path d="M555,433 L555,455" class="row"/>
+<rect x="568" y="429" width="180" height="30" rx="4" class="box"/>
+<rect x="569" y="432" width="20" height="24" rx="2" class="tensor"/>
+<path d="M574,433 L574,455" class="row"/>
+<path d="M579,433 L579,455" class="row"/>
+<path d="M584,433 L584,455" class="row"/>
+<rect x="592" y="432" width="12" height="24" rx="2" class="dense"/>
+<rect x="607" y="432" width="50" height="24" rx="2" class="tensor"/>
+<path d="M612,433 L612,455" class="row"/>
+<path d="M617,433 L617,455" class="row"/>
+<path d="M622,433 L622,455" class="row"/>
+<path d="M627,433 L627,455" class="row"/>
+<path d="M632,433 L632,455" class="row"/>
+<path d="M637,433 L637,455" class="row"/>
+<path d="M642,433 L642,455" class="row"/>
+<path d="M647,433 L647,455" class="row"/>
+<path d="M652,433 L652,455" class="row"/>
+<rect x="660" y="432" width="50" height="24" rx="2" class="tensor"/>
+<path d="M665,433 L665,455" class="row"/>
+<path d="M670,433 L670,455" class="row"/>
+<path d="M675,433 L675,455" class="row"/>
+<path d="M680,433 L680,455" class="row"/>
+<path d="M685,433 L685,455" class="row"/>
+<path d="M690,433 L690,455" class="row"/>
+<path d="M695,433 L695,455" class="row"/>
+<path d="M700,433 L700,455" class="row"/>
+<path d="M705,433 L705,455" class="row"/>
+<rect x="713" y="432" width="34" height="24" rx="2" class="tensor"/>
+<path d="M718,433 L718,455" class="row"/>
+<path d="M723,433 L723,455" class="row"/>
+<path d="M728,433 L728,455" class="row"/>
+<path d="M733,433 L733,455" class="row"/>
+<path d="M738,433 L738,455" class="row"/>
+<path d="M743,433 L743,455" class="row"/>
+<rect x="756" y="429" width="180" height="30" rx="4" class="box"/>
+<rect x="757" y="432" width="8" height="24" rx="2" class="tensor"/>
+<path d="M762,433 L762,455" class="row"/>
+<rect x="768" y="432" width="12" height="24" rx="2" class="dense"/>
+<rect x="783" y="432" width="50" height="24" rx="2" class="tensor"/>
+<path d="M788,433 L788,455" class="row"/>
+<path d="M793,433 L793,455" class="row"/>
+<path d="M798,433 L798,455" class="row"/>
+<path d="M803,433 L803,455" class="row"/>
+<path d="M808,433 L808,455" class="row"/>
+<path d="M813,433 L813,455" class="row"/>
+<path d="M818,433 L818,455" class="row"/>
+<path d="M823,433 L823,455" class="row"/>
+<path d="M828,433 L828,455" class="row"/>
+<rect x="813" y="432" width="5" height="24" rx="1" class="hot"/>
+<rect x="836" y="432" width="50" height="24" rx="2" class="tensor"/>
+<path d="M841,433 L841,455" class="row"/>
+<path d="M846,433 L846,455" class="row"/>
+<path d="M851,433 L851,455" class="row"/>
+<path d="M856,433 L856,455" class="row"/>
+<path d="M861,433 L861,455" class="row"/>
+<path d="M866,433 L866,455" class="row"/>
+<path d="M871,433 L871,455" class="row"/>
+<path d="M876,433 L876,455" class="row"/>
+<path d="M881,433 L881,455" class="row"/>
+<rect x="866" y="432" width="5" height="24" rx="1" class="hot"/>
+<rect x="889" y="432" width="46" height="24" rx="2" class="tensor"/>
+<path d="M894,433 L894,455" class="row"/>
+<path d="M899,433 L899,455" class="row"/>
+<path d="M904,433 L904,455" class="row"/>
+<path d="M909,433 L909,455" class="row"/>
+<path d="M914,433 L914,455" class="row"/>
+<path d="M919,433 L919,455" class="row"/>
+<path d="M924,433 L924,455" class="row"/>
+<path d="M929,433 L929,455" class="row"/>
+<rect x="919" y="432" width="5" height="24" rx="1" class="hot"/>
+<path d="M815.5,431 L905,408" class="ax"/>
+<path d="M868.5,431 L905,408" class="ax"/>
+<path d="M921.5,431 L905,408" class="ax"/>
+<path d="M905,408 L905,346" class="ax" marker-end="url(#ahx)"/>
+<text x="893" y="404" class="b" text-anchor="end">read on a miss</text>
+<text x="380" y="486" class="t">checkpoint</text>
+<text x="463" y="486" class="b">stock safetensors, read in place</text>
+</svg>
