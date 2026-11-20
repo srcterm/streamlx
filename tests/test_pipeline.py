@@ -2,7 +2,6 @@
 be the stock model's, bit for bit, whatever the number of streams, the pool
 size, the cache kind and the drafts that turn out wrong."""
 import importlib.util
-import time
 import unittest
 from collections import OrderedDict
 from types import SimpleNamespace
@@ -13,6 +12,7 @@ import numpy as np
 from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 
 import toy
+from streamlx import pipeline
 from streamlx.integrate import prefill_cache
 from streamlx.pipeline import PipelinedDecoder
 from streamlx.pipeline_adapters import adapter_for
@@ -141,33 +141,41 @@ class Rollback(unittest.TestCase):
                     self.assertEqual(rolled > 0, wrong > 0)
 
 
+class _Clock:
+    """The pipeline's clock in the gate test: time passes only where the
+    test spends it, so what the gate charged a step is exact on any machine
+    (on a hosted runner, steps and sleeps vary by more than the terms)."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def perf_counter(self):
+        return self.now
+
+    def spend(self, seconds):
+        self.now += seconds
+
+
 class _Head:
     """A draft head that proposes the stock model's own continuation, with
-    a wrong token in every fourth draft, and takes SLEEP seconds to draft
-    and to be fed a token while the gate has drafting off."""
+    a wrong token in every fourth draft, and takes DRAFT seconds of the
+    clock to draft and FEED to be fed the tokens of a step while the gate
+    has drafting off."""
     tap_layers = (3,)
-    SLEEP = 0.02
+    DRAFT, FEED = 0.5, 0.125
 
-    def __init__(self, seq):
-        self.seq, self.pos, self.calls = seq, 0, 0
-        self.t_feed, self.t_draft = [], []     # what the sleeps really took
+    def __init__(self, seq, clock):
+        self.seq, self.clock, self.pos, self.calls = seq, clock, 0, 0
 
     def reset(self):
         self.pos = 0
 
-    def _sleep(self, log):
-        t0 = time.perf_counter()
-        time.sleep(self.SLEEP)
-        log.append(time.perf_counter() - t0)
-
-    def prime_pairs(self, hidden, next_ids=None):
-        n = int(hidden.shape[1])
-        self.pos += n
-        if n == 1:                             # the gate's feed
-            self._sleep(self.t_feed)
+    def prime_pairs(self, hidden, next_ids=None):    # the gate's feed
+        self.pos += int(hidden.shape[1])
+        self.clock.spend(self.FEED)
 
     def draft(self, pairs, depth):
-        self._sleep(self.t_draft)
+        self.clock.spend(self.DRAFT)
         self.pos += len(pairs)
         self.calls += 1
         toks = list(self.seq[self.pos:self.pos + depth])
@@ -178,8 +186,9 @@ class _Head:
 
 class DecodeLoop(unittest.TestCase):
     """decode() with a draft head and the self-gate: the tokens, and what
-    the gate charges each arm (its own wall time up to where its next step
-    can begin: drafting = draft + step + rollback, plain = step + feed)."""
+    the gate charges each arm (its own time up to where its next step can
+    begin: drafting = draft + step + rollback, plain = step + feed)."""
+    STEP, ROLLBACK, PLAIN = 1.0, 0.25, 2.0     # seconds of the clock
 
     def test_tokens_and_gate(self):
         n = 160
@@ -187,7 +196,8 @@ class DecodeLoop(unittest.TestCase):
         self.addCleanup(ck.close)
         seq, _ = toy.greedy(ck.ref, PROMPT, n)
         m, pools = ck.streaming(8)
-        head = _Head(seq)
+        clock = _Clock()
+        head = _Head(seq, clock)
         ad = adapter_for(m, head)
         cache = make_prompt_cache(m)
         logits, rows = ad.forward_taps(mx.array([PROMPT]), cache)
@@ -196,39 +206,45 @@ class DecodeLoop(unittest.TestCase):
                                adaptive=False, plain_fn=ad.plain,
                                self_gate=True)
         dec.gate_probe, dec.gate_min, dec.gate_hold = 8, 4, 16
-        wall = {"plain": [], "step": [], "roll": []}
+        ran, charged = [], {"step": [], "plain": [], "undrafted": []}
 
-        def timed(name, fn, sleep=0.0):
+        def spending(name, fn, seconds):
             def run(*a, **kw):
-                t0 = time.perf_counter()
-                if sleep:
-                    time.sleep(sleep)
-                out = fn(*a, **kw)
-                if name == "plain":
-                    mx.eval(out[0])
-                wall[name].append(time.perf_counter() - t0)
-                return out
+                clock.spend(seconds)
+                if name != "rollback":
+                    ran.append(name)
+                return fn(*a, **kw)
             return run
 
-        dec.plain_fn = timed("plain", dec.plain_fn)
-        dec.step = timed("step", dec.step)
-        dec.rollback = timed("roll", dec.rollback, head.SLEEP)
-        out = dec.generate(seq[0], rows[:, -1:], len(PROMPT), n)
+        account = dec._gate_account
+
+        def recording(dt, tokens):
+            # a plain step with drafting on: the head had nothing to propose
+            kind = ("undrafted" if ran[-1] == "plain" and dec.drafting
+                    else ran[-1])
+            charged[kind].append(dt + dec._g_draft)
+            account(dt, tokens)
+
+        dec.plain_fn = spending("plain", dec.plain_fn, self.PLAIN)
+        dec.step = spending("step", dec.step, self.STEP)
+        dec.rollback = spending("rollback", dec.rollback, self.ROLLBACK)
+        dec._gate_account = recording
+        with mock.patch.object(pipeline, "time", clock):
+            out = dec.generate(seq[0], rows[:, -1:], len(PROMPT), n)
         self.assertEqual(out, seq[:len(out)])
         self.assertGreater(dec.draft_tried, dec.draft_ok)    # some rejected
         self.assertEqual(toy.wrong_slots(ck.ref, pools), [])
+        drafting = head.DRAFT + self.STEP + self.ROLLBACK
+        plain = self.PLAIN + head.FEED
+        self.assertGreater(len(charged["step"]), 8)
+        self.assertGreater(len(charged["plain"]), 8)
+        self.assertEqual(set(charged["step"]), {drafting})
+        self.assertEqual(set(charged["plain"]), {plain})
         on, off = dec._g_spt["on"], dec._g_spt["off"]
-        self.assertIsNotNone(on)
-        self.assertIsNotNone(off)
-        med = lambda v: float(np.median(v))  # noqa: E731
-        tokens = 1 + (dec.k_max - 1) * dec.draft_ok / dec.draft_tried
-        # a probe's steps can run slower than the run's median step, not
-        # faster by a sleep: the sleeps must be in what the gate charged
-        self.assertGreaterEqual(off - med(wall["plain"]),
-                                0.8 * med(head.t_feed))
-        self.assertGreaterEqual(
-            on * tokens - med(wall["step"]),
-            0.8 * (med(head.t_draft) + med(wall["roll"])))
+        self.assertEqual(off, plain)                 # a token a plain step
+        self.assertGreaterEqual(on, drafting / dec.k_max)
+        self.assertLessEqual(on, drafting)
+        self.assertTrue(dec._g_decisions)
 
 
 @unittest.skipUnless(importlib.util.find_spec("mlx_lm.models.inkling2")
