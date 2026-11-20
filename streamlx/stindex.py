@@ -55,7 +55,9 @@ class SafetensorsIndex:
     def __init__(self, model_dir: str):
         self.model_dir = str(model_dir)
         self.tensors: dict[str, TensorLoc] = {}
-        for shard in sorted(glob.glob(f"{self.model_dir}/model-*.safetensors")):
+        # the files stock mlx-lm loads: model-0000x-of-0000y.safetensors, or
+        # a small checkpoint's single model.safetensors
+        for shard in sorted(glob.glob(f"{self.model_dir}/model*.safetensors")):
             with open(shard, "rb") as f:
                 (hlen,) = struct.unpack("<Q", f.read(8))
                 hdr = json.loads(f.read(hlen))
@@ -69,7 +71,8 @@ class SafetensorsIndex:
                     dtype=info["dtype"], shape=tuple(info["shape"]),
                     name=name)
         if not self.tensors:
-            raise FileNotFoundError(f"no shards under {model_dir}")
+            raise FileNotFoundError(
+                f"no model*.safetensors under {model_dir}")
         # Quantization table: bits/group_size come from here (mixed-precision
         # checkpoints override per path), shapes only cross-check. Keys are
         # normalized so mlx-vlm's "language_model." prefix matches either way.

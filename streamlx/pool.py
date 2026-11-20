@@ -320,7 +320,9 @@ class StreamingSwitchMLP:
         Misses are slot-assigned in order (LRU) but FETCHED as one threaded
         batch, each range straight into its slot's memory (no array is built
         and no slot copy follows): eviction decisions never depend on fetch
-        timing. The slots it takes must be none a kernel in flight reads: the
+        timing. A batch whose read fails leaves none of its experts resident
+        (forget) and raises. The slots it takes must be none a kernel in
+        flight reads: the
         decode path touches its hits before calling, and a layer's earlier
         calls are evaluated by the time its routing is known.
         `wait`, when given, blocks on the batch's read futures in place of a
@@ -339,9 +341,24 @@ class StreamingSwitchMLP:
             slots.append(self.id2slot[e])
         if missing:
             t0 = time.perf_counter()
-            self.reader.read_into(self.slot_requests(missing), wait=wait)
+            try:
+                self.reader.read_into(self.slot_requests(missing), wait=wait)
+            except BaseException:
+                self.forget(missing)       # no read is still writing them
+                raise
             self.fetch_s += time.perf_counter() - t0
         return slots
+
+    def forget(self, ids) -> None:
+        """Experts given slots whose read did not finish: the slots hold
+        part of them, or what was there before, so the experts are not
+        resident and the slots are free (the next use reads them again).
+        Call it only once no read is writing those slots."""
+        for e in ids:
+            slot = self.id2slot.pop(e, None)
+            if slot is not None:
+                self.slot_table[e] = self.SENTINEL
+                self.free.append(slot)
 
     def slot_requests(self, ids: list[int]) -> list:
         """reader.read_into's requests for experts that have their slots:
