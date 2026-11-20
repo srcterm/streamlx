@@ -17,8 +17,9 @@ cut at any token when every layer is such a cache. Other layers (recurrent
 ArraysCache, rotating windows) store their whole state at the segment's end,
 so models with them restore at segment ends only.
 
-Each model's segments sit in a directory of its own under the root, and one
-budget covers them all: past it the least recently used of the other models'
+Each model's segments sit in a directory of its own under the root, named
+for its path, config and weight files (weights replaced under the same path
+start an empty cache), and one budget covers them all: past it the least recently used of the other models'
 caches go first, a model's whole cache at a time (a server still running on
 that model then misses and stores it again), then the served model's least
 recently used segments. A segment is not written when it would leave the volume with
@@ -63,6 +64,7 @@ _TAGS = {mx.bfloat16: "BF16", mx.float16: "F16", mx.float32: "F32",
          mx.uint8: "U8", mx.bool_: "BOOL"}
 
 _MODEL_DIR = re.compile(r"[0-9a-f]{16}")   # root/<model fingerprint>
+_SAMPLE = 2**16  # bytes of a weight file's middle, and of its end, fingerprinted
 _FREE_FLOOR = 2**30   # what a segment write leaves free on the volume at least
 
 log = logging.getLogger(__name__)
@@ -93,6 +95,23 @@ def _size_and_used(files: list[Path]) -> tuple[int, float]:
             continue
         n, used = n + st.st_size, max(used, st.st_mtime)
     return n, used
+
+
+def _weights_id(mdir: Path) -> bytes:
+    """What tells a checkpoint's weights from others put under the same path
+    with the same config: each weight file's name, size and modification
+    time, and bytes from its middle and its end (a copy can keep the time)."""
+    h = hashlib.sha256()
+    for p in sorted(mdir.glob("*.safetensors")):
+        if not p.is_file():
+            continue
+        st = p.stat()
+        h.update(f"{p.name}/{st.st_size}/{st.st_mtime_ns}/".encode())
+        with open(p, "rb") as f:
+            for at in (st.st_size // 2, max(0, st.st_size - _SAMPLE)):
+                f.seek(at)
+                h.update(f.read(_SAMPLE))
+    return h.digest()
 
 
 def stored_bytes(root) -> int:
@@ -179,8 +198,8 @@ class PagedPromptCache:
 
     def _open(self, model_key) -> None:
         """Bind to the served model: one directory per model fingerprint
-        (path, config, weight index), its segments indexed from their
-        headers."""
+        (path, config, weight index, weight files), its segments indexed
+        from their headers."""
         if self._dir is not None:
             return
         mdir = Path(model_key[0] if isinstance(model_key, tuple)
@@ -189,6 +208,7 @@ class PagedPromptCache:
         for f in ("config.json", "model.safetensors.index.json"):
             if (mdir / f).exists():
                 h.update((mdir / f).read_bytes())
+        h.update(_weights_id(mdir))
         self._seed = h.digest()
         self._dir = self.root / h.hexdigest()[:16]
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -489,6 +509,13 @@ class PagedPromptCache:
                 try:
                     t = self._tokens(s)
                 except OSError:
+                    continue
+                except Exception:  # a damaged file: dropped, stored again
+                    log.warning("kv cache: unreadable segment %s dropped",
+                                s.path.name)
+                    with self._lock:
+                        if self._segs.get(s.key) is s:
+                            self._drop(s)
                     continue
                 m = min(len(t), len(want))
                 eq = t[:m] == want[:m]

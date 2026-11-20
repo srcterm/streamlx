@@ -96,10 +96,16 @@ class StandardMoEAdapter:
         return ids, self.embed_tokens(ids), pos
 
     def offset(self, cache) -> int:
+        """Tokens the cache has taken in. A batch cache counts them in _idx
+        (its offset is the rows' padding); a rotating window's _idx is where
+        it writes next, which wraps, and its count is its offset."""
         for c in cache:
             for obj in (c, getattr(c, "kv_cache", None)):
-                if obj is not None and hasattr(obj, "_idx"):
+                if obj is None or not hasattr(obj, "_idx"):
+                    continue
+                if not hasattr(obj, "max_size"):
                     return int(obj._idx)
+                return int(getattr(obj, "_offset", obj.offset))
             off = getattr(c, "offset", None)
             if off is not None:
                 return int(off.reshape(-1)[0].item()) if isinstance(off, mx.array) else int(off)
