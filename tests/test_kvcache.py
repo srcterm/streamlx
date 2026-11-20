@@ -1,15 +1,18 @@
 """The SSD prompt cache restores a history only for the weights that
-computed it, and a damaged segment costs a prefill, never a request."""
+computed it, and a damaged or deleted segment costs one prefill: never a
+request, and never a second prefill of the same prompt."""
 import os
 import shutil
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
 
 import toy
+from streamlx import kvcache
 from streamlx.kvcache import PagedPromptCache
 
 TOKENS, NEXT = toy.prompt(12), 7
@@ -51,31 +54,53 @@ class _Case(unittest.TestCase):
 
 class ReplacedWeights(_Case):
     def test_same_path_new_weights(self):
-        # mlx-lm saves a small model as one model.safetensors (no index file)
-        for name in (toy.SHARDED, "model.safetensors"):
-            for keep_time in (False, True):
-                with self.subTest(file=name, keep_time=keep_time):
-                    ck = toy.Checkpoint(name)
-                    self.addCleanup(ck.close)
-                    root = tempfile.mkdtemp(dir=self.root)
-                    _store(_server(root), ck, ck.ref)
-                    # a restarted server finds its model's history
-                    self.assertEqual(
-                        self.restored(_server(root), ck, ck.ref), len(TOKENS))
-                    st = os.stat(ck.file)
-                    other = ck.rewrite(seed=1)
-                    self.assertEqual(os.stat(ck.file).st_size, st.st_size)
-                    if keep_time:              # a copy that keeps the times
-                        os.utime(ck.file, ns=(st.st_atime_ns, st.st_mtime_ns))
-                    pc = _server(root)
-                    self.assertEqual(self.restored(pc, ck, other), 0)
-                    # and the new weights get a cache of their own
-                    cache = make_prompt_cache(other)
-                    mx.eval(other(mx.array([TOKENS]), cache=cache))
-                    pc.insert_cache(ck.dir, TOKENS, cache)
-                    pc.flush()
-                    self.assertEqual(
-                        self.restored(_server(root), ck, other), len(TOKENS))
+        # mlx-lm saves a small model as one model.safetensors (no index
+        # file); a copy can keep the files' times; and an edit can sit
+        # where the sampled bytes do not look (here: no samples at all)
+        cases = [(name, keep_time, 2**16) for name in
+                 (toy.SHARDED, "model.safetensors")
+                 for keep_time in (False, True)]
+        cases.append((toy.SHARDED, True, 0))
+        for name, keep_time, sample in cases:
+            with self.subTest(file=name, keep_time=keep_time, sample=sample), \
+                    mock.patch.object(kvcache, "_SAMPLE", sample):
+                ck = toy.Checkpoint(name)
+                self.addCleanup(ck.close)
+                root = tempfile.mkdtemp(dir=self.root)
+                _store(_server(root), ck, ck.ref)
+                # a restarted server finds its model's history
+                self.assertEqual(
+                    self.restored(_server(root), ck, ck.ref), len(TOKENS))
+                st = os.stat(ck.file)
+                other = ck.rewrite(seed=1)
+                self.assertEqual(os.stat(ck.file).st_size, st.st_size)
+                if keep_time:
+                    os.utime(ck.file, ns=(st.st_atime_ns, st.st_mtime_ns))
+                pc = _server(root)
+                self.assertEqual(self.restored(pc, ck, other), 0)
+                # and the new weights get a cache of their own
+                cache = make_prompt_cache(other)
+                mx.eval(other(mx.array([TOKENS]), cache=cache))
+                pc.insert_cache(ck.dir, TOKENS, cache)
+                pc.flush()
+                self.assertEqual(
+                    self.restored(_server(root), ck, other), len(TOKENS))
+
+
+class DeletedSegment(_Case):
+    def test_missed_lookup(self):
+        """A segment whose file is gone, met by a request it cannot serve
+        (the same prompt: it ends where the segment does): forgotten at
+        that miss, so the prompt is stored again."""
+        ck = toy.Checkpoint()
+        self.addCleanup(ck.close)
+        pc = _server(self.root)
+        _store(pc, ck, ck.ref)
+        (seg,) = pc._segs.values()
+        seg.path.unlink()
+        _store(pc, ck, ck.ref)                 # a miss, stored again
+        self.assertTrue(seg.path.exists())
+        self.assertEqual(self.restored(pc, ck, ck.ref), len(TOKENS))
 
 
 class DamagedSegment(_Case):

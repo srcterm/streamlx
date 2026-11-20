@@ -99,14 +99,16 @@ def _size_and_used(files: list[Path]) -> tuple[int, float]:
 
 def _weights_id(mdir: Path) -> bytes:
     """What tells a checkpoint's weights from others put under the same path
-    with the same config: each weight file's name, size and modification
-    time, and bytes from its middle and its end (a copy can keep the time)."""
+    with the same config: each weight file's name, size, modification time
+    and change time, and bytes from its middle and its end (a copy can keep
+    the modification time; no write to the file keeps the change time)."""
     h = hashlib.sha256()
     for p in sorted(mdir.glob("*.safetensors")):
         if not p.is_file():
             continue
         st = p.stat()
-        h.update(f"{p.name}/{st.st_size}/{st.st_mtime_ns}/".encode())
+        h.update(f"{p.name}/{st.st_size}/{st.st_mtime_ns}/"
+                 f"{st.st_ctime_ns}/".encode())
         with open(p, "rb") as f:
             for at in (st.st_size // 2, max(0, st.st_size - _SAMPLE)):
                 f.seek(at)
@@ -486,6 +488,9 @@ class PagedPromptCache:
     def fetch_nearest_cache(self, model_key, tokens):
         self._open(model_key)
         self.flush()    # the previous turn's segments, if still in flight
+        # a segment whose file is gone must not stay indexed past a lookup
+        # it does not serve: its prompt would count as stored
+        self._forget_gone()
         tokens = list(tokens)
         self.last = (0, len(tokens))
         chain, a = self._chain(tokens)
