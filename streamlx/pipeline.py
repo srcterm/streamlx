@@ -48,12 +48,16 @@ Adapter protocol (duck-typed):
 
 Rollback: a shallow snapshot of every layer cache is taken right before
 each stream's begin() at that layer; rejecting streams >= a restores the
-snapshot taken before S_a. This is exact for caches that update
-functionally (state = new array) or through an offset over an in-place
-buffer (mlx-lm/mlx-vlm KVCache: the rejected rows beyond the restored
-offset are never read). A cache that mutates a state array in place with
-no offset would not be restorable this way — the host must then provide
-snapshot/restore itself (adapter.snapshot_cache / restore_cache).
+snapshot taken before S_a. The pipelined decode is the sequential decode
+only if that restore gives back the cache exactly, so it is a condition on
+the cache. It holds for caches that update functionally (state = new
+array), through an offset over an in-place buffer (mlx-lm/mlx-vlm KVCache:
+the rejected rows beyond the restored offset are never read), and for
+mlx-lm's rotating windows, which write over rows they still read once the
+window is full: their arrays are copied, not shared (_ring). Any other
+cache that mutates a state array in place is not restorable this way: the
+host must then provide snapshot/restore itself (adapter.snapshot_cache /
+restore_cache), as deepseek_v41 and inkling2 do.
 """
 from __future__ import annotations
 
@@ -74,13 +78,26 @@ def _cache_like(x) -> bool:
         hasattr(x, a) for a in ("update_and_fetch", "offset", "state", "cache"))
 
 
+def _ring(c) -> bool:
+    """A bounded window written in place over rows it still reads (mlx-lm's
+    and mlx-vlm's RotatingKVCache, once full: a write index and a maximum
+    size): a rejected stream's write lands on live history, so a snapshot
+    must hold the arrays themselves. A second handle on an array keeps its
+    values when the cache writes through the first; it costs no copy of its
+    own, and holds the window as it was until the snapshot goes (a window
+    is bounded, so that is small; for a cache that grows with the context
+    it would be the whole context, once a stream)."""
+    return hasattr(c, "_idx") and hasattr(c, "max_size")
+
+
 def snapshot_cache(c):
     """Shallow snapshot: attribute dict copied one container level deep,
-    cache-like children snapshotted recursively."""
+    cache-like children snapshotted recursively; a ring's arrays copied."""
     if c is None:
         return None
     attrs = {}
     kids = {}
+    ring = _ring(c)
     for k, v in vars(c).items():
         if isinstance(v, list):
             attrs[k] = list(v)
@@ -88,6 +105,8 @@ def snapshot_cache(c):
             attrs[k] = tuple(v)
         elif isinstance(v, dict):
             attrs[k] = dict(v)
+        elif ring and isinstance(v, mx.array):
+            attrs[k] = mx.array(v)
         else:
             attrs[k] = v
         if isinstance(v, (list, tuple)) and v and all(_cache_like(x) for x in v):
@@ -103,11 +122,14 @@ def restore_cache(c, snap) -> None:
     if c is None or snap is None:
         return
     attrs, kids = snap
+    ring = _ring(c)
     for k, v in attrs.items():
         if isinstance(v, list):
             v = list(v)
         elif isinstance(v, dict):
             v = dict(v)
+        elif ring and isinstance(v, mx.array):
+            v = mx.array(v)        # the snapshot keeps its own
         setattr(c, k, v)
     for k, sub in kids.items():
         cur = getattr(c, k)
@@ -142,10 +164,10 @@ class _Read:
     """One read of a layer's experts, for every stream of the step that
     routes to them: straight into their pool slots (the future gives None),
     or as arrays when the pool had no slot to give (rows, once viewed)."""
-    __slots__ = ("fut", "ids", "rows")
+    __slots__ = ("fut", "ids", "rows", "slots")
 
-    def __init__(self, fut, ids):
-        self.fut, self.ids, self.rows = fut, ids, None
+    def __init__(self, fut, ids, slots=False):
+        self.fut, self.ids, self.rows, self.slots = fut, ids, None, slots
 
 
 class PipelinedDecoder:
@@ -164,8 +186,10 @@ class PipelinedDecoder:
         # step and the drafter is byte-cheap and confident; elsewhere
         # drafting costs bytes and head compute for nothing. The gate
         # measures seconds per committed token with drafting ON (pipelined
-        # steps + gated plain steps, draft time included) and OFF (plain_fn
-        # only), keeps the faster arm for a hold period, and re-probes the
+        # steps + gated plain steps, with the draft and the rollback) and
+        # OFF (plain_fn, with the feed that keeps the head's cache exact):
+        # each arm as it runs, up to where its next step can begin. It
+        # keeps the faster arm for a hold period, and re-probes the
         # other arm afterwards. Needs plain_fn; a decoder without one
         # always drafts. It starts on the plain arm and ends a probe early
         # once its arm is clearly the slower: a losing drafter costs seconds
@@ -194,8 +218,9 @@ class PipelinedDecoder:
         if self.self_gate:
             self._g_begin("off")
         self.plain_steps = 0
-        # a host whose caches mutate live state in place (rotating windows,
-        # pooling rings) supplies its own snapshot/restore
+        # a host whose caches mutate live state in place in a way the
+        # generic snapshot does not know (pooling rings, a window inside
+        # another object) supplies its own snapshot/restore
         self._snap = getattr(adapter, "snapshot_cache", None) or snapshot_cache
         self._restore = getattr(adapter, "restore_cache", None) or restore_cache
         self.reader = next(iter(pools.values())).reader
@@ -294,8 +319,13 @@ class PipelinedDecoder:
                 pool._take_slot_for(e)
                 direct.append(e)
         if direct:
-            rd = _Read(self.ex.submit(self.reader.read_into,
-                                      pool.slot_requests(direct)), direct)
+            try:
+                reqs = pool.slot_requests(direct)
+            except BaseException:
+                pool.forget(direct)        # slots given, nothing read
+                raise
+            rd = _Read(self.ex.submit(self.reader.read_into, reqs), direct,
+                       slots=True)
             held.update(dict.fromkeys(direct, rd))
         if len(direct) < len(new):
             rest = [e for e in new if e not in pool.id2slot]
@@ -391,7 +421,30 @@ class PipelinedDecoder:
     def step(self, toks: list[int], offset: int):
         """Returns (outputs, hiddens, snaps): outputs[i] = argmax after
         stream i, hiddens[i] = its final (pre-head) hidden, snaps[l][i] =
-        layer-l cache snapshot taken before stream i wrote it."""
+        layer-l cache snapshot taken before stream i wrote it. A step that
+        raises (a read failed) leaves the pools usable: see _abandon. The
+        cache then holds part of the step and is the caller's to drop."""
+        try:
+            return self._step(toks, offset)
+        except BaseException:
+            self._abandon()
+            raise
+
+    def _abandon(self) -> None:
+        """A step that raised: its reads are waited out (none may still be
+        writing a slot when the pools are next used), and the experts of a
+        read into slots that failed are not resident (pool.forget)."""
+        reads, self._reads = self._reads, {}
+        self._used, self._fin = {}, {}
+        for l, held in reads.items():
+            for rd in dict.fromkeys(held.values()):
+                try:
+                    rd.fut.result()
+                except BaseException:
+                    if rd.slots:
+                        self.pools[l].forget(rd.ids)
+
+    def _step(self, toks: list[int], offset: int):
         K, n = len(toks), self.n_layers
         self._reads, self._used, self._fin = {}, {}, {}
         self._k_cur = K
@@ -464,8 +517,8 @@ class PipelinedDecoder:
         return int(mx.argmax(logits[0, -1]).item()), logits, hidden
 
     def _gate_account(self, dt: float, tokens: int) -> None:
-        """Charge `dt` seconds, plus the step's draft time, for `tokens`
-        committed tokens to the current gate phase."""
+        """Charge `dt` seconds, plus the step's draft (or feed) time, for
+        `tokens` committed tokens to the current gate phase."""
         if not self.self_gate:
             return
         dt += self._g_draft
@@ -579,8 +632,10 @@ class PipelinedDecoder:
             self.draft_tried += K - 1
             self.draft_ok += a - 1
             self.accepted_hist[a] = self.accepted_hist.get(a, 0) + 1
-            self._gate_account(dt, a)
+            tr = time.perf_counter()
             self.rollback(snaps, a)
+            # the step's cost up to where the next one can begin
+            self._gate_account(dt + time.perf_counter() - tr, a)
             for i in range(a):
                 pairs.append((hiddens[i], outs[i]))
                 n += 1
@@ -705,7 +760,9 @@ class PipelinedDecoder:
             if feed is not None:
                 t0 = time.perf_counter()
                 feed(tok_pairs)
-                self.t_draft += time.perf_counter() - t0
+                dt = time.perf_counter() - t0
+                self.t_draft += dt
+                self._g_draft = dt          # this arm's cost as it runs
             else:
                 self._stale_drafter = True
             return [], []
