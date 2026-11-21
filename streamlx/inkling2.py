@@ -183,10 +183,15 @@ class Inkling2Adapter(StandardMoEAdapter):
     """
 
     def __init__(self, model, drafter=None):
-        import mlx_lm.models.inkling2 as stock
+        try:    # mlx-lm's layout from 11-19 (#2082): the model is a package
+            from mlx_lm.models.inkling2 import layers as stock
 
-        self._rms, self._conv_state = (stock._unweighted_rms_norm,
-                                       stock._conv_state)
+            self._rms = stock.unweighted_rms_norm
+        except ImportError:
+            import mlx_lm.models.inkling2 as stock
+
+            self._rms = stock._unweighted_rms_norm
+        self._conv_state = stock._conv_state
         self.model = model
         self.lm = model.model.language_model
         self.layers = list(model.layers)

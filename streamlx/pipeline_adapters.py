@@ -112,7 +112,10 @@ class StandardMoEAdapter:
         return 0
 
     def masks(self, h, cache):
-        from mlx_lm.models.base import create_attention_mask
+        try:
+            from mlx_lm.models.base import create_attention_mask
+        except ImportError:    # mlx-lm's layout from 11-19 (#2082)
+            from mlx_lm.layers.attention import create_attention_mask
 
         return create_attention_mask(h, cache[0] if cache else None)
 

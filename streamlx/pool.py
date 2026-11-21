@@ -21,7 +21,10 @@ from concurrent.futures import wait as _wait_all
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.models.activations import swiglu
+try:
+    from mlx_lm.models.activations import swiglu
+except ImportError:    # mlx-lm's layout from 11-19 (#2082)
+    from mlx_lm.layers.common import swiglu
 
 from .reader import ExpertReader
 from .stindex import PARTS, SafetensorsIndex
