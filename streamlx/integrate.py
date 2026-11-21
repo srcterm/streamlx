@@ -740,7 +740,9 @@ def _routed_topk(model_dir: str, default: int = 8) -> int:
 def _checkpoint_loader(model_dir: str):
     """The loader for a checkpoint mlx-lm can't run: DeepSeek-V4.1 with Engram
     layers (mlx-lm refuses them) and Qwen3.8 (not in mlx-lm): mlx-vlm has both.
-    Also for an oQ export of Inkling 2, which mlx-lm runs under its own layout."""
+    Also for an oQ export of Inkling 2, which mlx-lm runs under its own layout.
+    Raises ImportError, naming what to install, when the model's code is not
+    installed."""
     import json
     from pathlib import Path
 
@@ -763,6 +765,14 @@ def _checkpoint_loader(model_dir: str):
             raise ImportError("Qwen3.8 needs mlx-vlm: pip install mlx-vlm") from e
         return load_qwen4_exp
     if cfg.get("model_type") == "inkling2":
+        try:
+            import mlx_lm.models.inkling2  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "Inkling 2 needs mlx-lm with its inkling2 model, still an open "
+                "pull request: pip install "
+                "git+https://github.com/ml-explore/mlx-lm@refs/pull/2061/head"
+            ) from e
         from .inkling2 import is_oq_export, load_inkling2
 
         if is_oq_export(cfg):

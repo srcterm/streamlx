@@ -1,0 +1,23 @@
+# The toy-model tests: a tiny random checkpoint written to a temporary
+# directory, streamed, and compared bit for bit with mlx-lm's resident model.
+# No model download. Hosted macOS runners give no dependable GPU, so the
+# tests run on the CPU here; on a Mac, `python -m unittest discover -s tests`
+# runs them on the GPU (and Inkling 2's, which needs it).
+name: tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  toy-models:
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      STREAMLX_TEST_DEVICE: cpu
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - run: python -m unittest discover -s tests -v

@@ -17,6 +17,7 @@ import fcntl
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as _all_done
 
 import mlx.core as mx
 import numpy as np
@@ -140,7 +141,9 @@ class ExpertReader:
     def read_into(self, requests, wait=None) -> None:
         """[(path, off, n, buffer)]: each range read straight into `buffer`,
         a writable view of the n bytes of memory it belongs in. Returns once
-        all are in; `wait` as in read_ranges."""
+        all are in; `wait` as in read_ranges. When a read fails (or `wait`
+        raises) it raises only once no range is still being written: what
+        the buffers hold then is the caller's to throw away."""
         def read_bucket(bucket):
             for path, off, n, buf in bucket:
                 got = os.preadv(self._fd(path), [buf], off)
@@ -156,12 +159,16 @@ class ExpertReader:
             buckets[i].append(r)
             loads[i] += r[2]
         futs = [self._ex.submit(read_bucket, b) for b in buckets if b]
-        if wait is not None:
-            wait(futs)
-        for fut in futs:
-            n, reads = fut.result()
-            self.bytes_read += n
-            self.reads += reads
+        try:
+            if wait is not None:
+                wait(futs)
+            for fut in futs:
+                n, reads = fut.result()
+                self.bytes_read += n
+                self.reads += reads
+        except BaseException:
+            _all_done(futs)        # the other buckets write on until done
+            raise
 
     # -- expert-level API ----------------------------------------------------
 
