@@ -70,6 +70,11 @@ class StandardMoEAdapter:
     # begin() routes with the block's own code (the switch stub), so the
     # pipeline may hand that routing to the block's switch call in finish()
     exact_routing = True
+    # plain() takes a token id still being computed without waiting for it
+    # (the decoder may then queue a plain step on the one before's argmax);
+    # False where the forward reads the id on the host (embedding rows
+    # looked up from the SSD)
+    plain_lazy = True
 
     def __init__(self, model, drafter=None):
         self.model = model

@@ -313,6 +313,21 @@ class RunAhead(unittest.TestCase):
         self.assertEqual(got, self.seq[1:k + 1])
         self.assertEqual(cache[0].offset, len(PROMPT) + k + 1)
 
+    def test_not_where_the_forward_reads_the_token(self):
+        """An adapter whose plain forward reads the token id on the host
+        (plain_lazy False: DeepSeek-V4.1's and Qwen3.8's embedding rows)
+        gets every step's token as an id, in turn."""
+        dec, cache, row = self._decoder(_Head(self.seq, _Clock()), k_max=1,
+                                        self_gate=False)
+        dec.ad.plain_lazy = False
+        fed = []
+        plain = dec.plain_fn
+        dec.plain_fn = lambda tok, c: (fed.append(tok), plain(tok, c))[1]
+        out = dec.generate(self.seq[0], row, len(PROMPT), N)
+        self.assertEqual(out, self.seq[:N])
+        self.assertTrue(all(isinstance(t, int) for t in fed))
+        self.assertEqual(cache[0].offset, len(PROMPT) + N - 1)
+
     def test_head_kept_while_gated_off(self):
         out = []
         head = _CountingHead(self.seq, _Clock(), lambda: len(out))

@@ -646,8 +646,12 @@ class PipelinedDecoder:
         # argmax while the GPU computes it (as mlx-lm's generate_step; same
         # ids). The committed pairs then wait for the head's next draft,
         # which takes any number, instead of a feed per token, whose eval
-        # would wait behind the step in flight.
-        ahead = self.plain_fn is not None and all_held(self.pools)
+        # would wait behind the step in flight. Not where the forward reads
+        # the token on the host (plain_lazy): building the next step would
+        # wait for this one, and the gate, which is charged the build on top
+        # of the step, would count the step twice.
+        ahead = (self.plain_fn is not None and all_held(self.pools)
+                 and getattr(self.ad, "plain_lazy", True))
         self._held = ahead
         pend = None                    # (argmax, hidden) queued on `cur`
         while n < n_tokens:

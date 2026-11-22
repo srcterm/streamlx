@@ -302,6 +302,9 @@ def load_head(model_dir, model):
 
 
 class Qwen4ExpAdapter(StandardMoEAdapter):
+    # the per-layer embedding rows are read ahead by token id, on the host
+    plain_lazy = False
+
     def __init__(self, model, drafter=None):
         self.model = model
         self.lm = model.language_model

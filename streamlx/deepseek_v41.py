@@ -277,6 +277,9 @@ class V41View:
 
 class V41Adapter(StandardMoEAdapter):
     # begin() routes with the MoE's own gate (exact_routing)
+    # the embedding's rows are read from the SSD by token id, on the host
+    plain_lazy = False
+
     def __init__(self, model, drafter=None):
         self.model = model
         self.lm = model.language_model
