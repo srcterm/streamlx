@@ -991,14 +991,14 @@ def split_slots(budget_bytes: float, layers: dict) -> dict:
     return want
 
 
-def resize_pools(pools: dict, budget_bytes: float) -> int:
+def resize_pools(pools: dict, budget_bytes: float, fill: bool = True) -> int:
     """Split `budget_bytes` over `pools` the way load_streaming_model splits
     its budget (split_slots: equal bytes a pool, at least its min_slots, at
     most its experts) and resize each pool to its share
     (StreamingSwitchMLP.resize: exact), shrinking ones first so the copies'
     transient stays one pool array; a pool that can then hold all its layer's
-    experts reads the ones it lacks (fill). Returns the bytes the pools then
-    hold."""
+    experts reads the ones it lacks (fill; not with fill=False, for a size
+    that is about to change). Returns the bytes the pools then hold."""
     want = split_slots(budget_bytes, {i: (p.expert_bytes, p.n_experts,
                                           p.min_slots)
                                       for i, p in pools.items()})
@@ -1007,8 +1007,9 @@ def resize_pools(pools: dict, budget_bytes: float) -> int:
     mx.clear_cache()
     # a pool that can now hold every expert of its layer reads the ones it
     # lacks (the whole model, when it fits): its decoding never waits on reads
-    for p in pools.values():
-        p.fill()
+    if fill:
+        for p in pools.values():
+            p.fill()
     return pool_bytes(pools)
 
 

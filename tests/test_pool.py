@@ -139,6 +139,20 @@ class WholeModel(unittest.TestCase):
         for got, want in zip(logits, self.want):
             self.assertTrue(mx.array_equal(got, want))
 
+    def test_sized_without_reading(self):
+        """fill=False sizes the pools and reads nothing (a size about to
+        change); the next sizing reads."""
+        _, pools = self.ck.streaming(8)
+        reader = next(iter(pools.values())).reader
+        every = sum(p.n_experts * p.expert_bytes for p in pools.values())
+        b0 = reader.bytes_read
+        self.assertEqual(resize_pools(pools, every, fill=False), every)
+        self.assertEqual(reader.bytes_read, b0)
+        self.assertFalse(all_held(pools))
+        resize_pools(pools, every)
+        self.assertEqual(reader.bytes_read - b0, every)
+        self.assertTrue(all_held(pools))
+
     def test_short(self):
         _, pools = self.ck.streaming(8)
         reader = next(iter(pools.values())).reader

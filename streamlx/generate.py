@@ -120,7 +120,9 @@ def main() -> int:
     # the pools take it, or every expert when that is less
     room = (budget_within(memory_limit(), pools, reserve=4 * 2**30)
             if auto else int(args.budget_gib * 2**30))
-    budget = resize_pools(pools, room)
+    # (sized, not read yet: a prompt whose chunks need the pools smaller
+    # would drop what was read and read it again after the prefill)
+    budget = resize_pools(pools, room, fill=False)
     print(f"machine RAM: {ram:.0f} GB  |  expert budget: "
           f"{budget / 2**30:.1f} GiB\n")
 
@@ -144,6 +146,8 @@ def main() -> int:
                       f" expert pools {got / 2**30:.1f} GiB", file=sys.stderr)
         else:
             sizes, pre = prefill_chunks(len(ids), PREFILL_STEP), budget
+        if pre >= budget:      # the pools stay: what fits whole is read now
+            resize_pools(pools, room)
         done = 0
         for n in sizes:
             chunk = mx.array([ids[done:done + n]])
