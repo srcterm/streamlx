@@ -323,5 +323,113 @@ class Inkling2(unittest.TestCase):
                     self.assertEqual(rolled > 0, wrong > 0)
 
 
+def _has_loop() -> bool:
+    if (importlib.util.find_spec("mlx_lm.models.inkling2") is None
+            or mx.default_device() != mx.gpu):
+        return False
+    import toy_inkling2 as ink
+
+    return ink.HAS_LOOP
+
+
+@unittest.skipUnless(_has_loop(), "needs an mlx-lm with the looped inkling2 "
+                     "(inkling2_loop), on the GPU")
+class InklingLoop(unittest.TestCase):
+    """Inkling 2 Mini's looped stack through BatchedDecoder, each step's
+    drafts checked in one forward: what a step's rejected drafts were leaves
+    no trace in the caches (what follows is bit for bit the same), with the
+    sliding windows filling and full, after one rollback or two; and a
+    decode with the checkpoint's head ends with the caches where the server
+    expects them."""
+    TAPS = (2, 5, 10)
+
+    @classmethod
+    def setUpClass(cls):
+        import toy_inkling2 as ink
+
+        cls.ink = ink
+        cls.ck = ink.Checkpoint(loop=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ck.close()
+
+    def test_rejected_drafts_leave_no_trace(self):
+        ink, rng = self.ink, np.random.default_rng(0)
+        for slots in (16, 4):
+            m, _pools = self.ck.streaming(slots)
+            ad = adapter_for(m, SimpleNamespace(tap_layers=self.TAPS))
+            self.assertTrue(ad.batched)
+            for n in (4, 14):                # windows of 8: filling, full
+                prompt = [t % ink.VOCAB for t in toy.prompt(n)]
+                for K, keep in ((2, 1), (4, 1), (4, 3), (5, 2)):
+                    with self.subTest(slots=slots, prompt=n, K=K, keep=keep):
+                        got = []
+                        for variant in range(3):
+                            cache = m.make_cache()
+                            views = ad.views(cache)
+                            with prefill_cache(cache):
+                                mx.eval(ad.forward_taps(mx.array([prompt]),
+                                                        cache))
+                            junk = rng.integers(0, ink.VOCAB, K - keep)
+                            toks = [7, 11, 13, 17][:keep] + junk.tolist()
+                            _, _, rec = ad.verify(toks, views)
+                            if variant == 2:         # the decode loop's two
+                                ad.rollback(views, rec, keep + 1)
+                            ad.rollback(views, rec, keep)
+                            # what follows: a plain step (in place in the
+                            # windows), a step with a rejected draft, another
+                            after = list(ad.plain(37, views))
+                            lg, rows, rec = ad.verify([23, 29, 31], views)
+                            ad.rollback(views, rec, 2)
+                            after += [lg, rows, *ad.plain(41, views)]
+                            mx.eval(after)
+                            got.append((ad.offset(views), *after))
+                        for g in got:
+                            self.assertEqual(g[0], n + keep + 4)
+                            for x, y in zip(g[1:], got[0][1:]):
+                                self.assertTrue(mx.array_equal(x, y))
+
+    def test_decode_with_the_head(self):
+        from streamlx.inkling2 import Inkling2LoopAdapter
+        from streamlx.pipeline import BatchedDecoder
+        from streamlx.pipeline_adapters import load_drafter
+
+        ink = self.ink
+        m, pools = self.ck.streaming(8)
+        ad = adapter_for(m, load_drafter(self.ck.dir, m))
+        self.assertIsInstance(ad, Inkling2LoopAdapter)
+        prompt = [t % ink.VOCAB for t in toy.prompt(14)]
+        for n, early in ((40, False), (9, True)):
+            cache = m.make_cache()
+            views = ad.views(cache)
+            ad.reset_drafter()
+            with prefill_cache(cache):
+                logits, rows = ad.forward_taps(mx.array([prompt]), cache)
+            mx.eval(logits, rows)
+            ad.prime_pairs(rows[:, :-1], None)
+            dec = BatchedDecoder(ad, pools, views, k_max=4, plain_fn=ad.plain,
+                                 adaptive=False, self_gate=False)
+            first = int(mx.argmax(logits[0, -1]).item())
+            if early:                         # a server's request that ends
+                out, gen = [first], dec.decode(first, rows[:, -1:],
+                                               len(prompt), 10**6)
+                for t in gen:
+                    out.append(t)
+                    if len(out) == n:
+                        break
+                gen.close()
+            else:
+                out = dec.generate(first, rows[:, -1:], len(prompt), n)
+            with self.subTest(n=n, early=early):
+                self.assertEqual(len(out), n)
+                self.assertTrue(all(0 <= t < ink.TEXT["vocab_size"]
+                                    for t in out))
+                self.assertGreater(dec.draft_tried, 0)
+                # the cache holds the prompt and every token out but the
+                # last, which it holds too when a later stream ran it
+                self.assertIn(ad.offset(views) - len(prompt), (n - 1, n))
+
+
 if __name__ == "__main__":
     unittest.main()

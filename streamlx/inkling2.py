@@ -1,12 +1,13 @@
 """Inkling 2 through mlx-lm's inkling2: the loader for an oQ export.
 
 mlx-lm builds the model. A checkpoint saved in mlx-lm's own layout
-(mlx-community's conversions) needs nothing from here. The published source
-checkpoint does not stream: mlx-lm loads it, but its expert tensors
-(`w13_weight` / `w2_weight`, their scales derived at load) are not what the
-shard index reads, so convert it with mlx-lm first. An oQ export stores the
-same weights under oMLX's runtime layout, which `load_inkling2` maps onto
-mlx-lm's parameter tree without requantizing:
+(mlx-community's conversions) needs nothing from here, nor does a published
+source checkpoint (Inkling 2 Mini's): the shard index reads its experts
+(`w13_weight` / `w2_weight`, NVFP4 or MXFP8) with their bytes as they are,
+and the global scale mlx-lm derives from them at load comes from the stock
+module. An oQ export stores the same weights under oMLX's runtime layout,
+which `load_inkling2` maps onto mlx-lm's parameter tree without
+requantizing:
   - renames (attn -> self_attn, mlp.router_weight -> mlp.gate.weight, ...);
   - the attention projections oQ stacks row-wise into one quantized matrix,
     split back by rows (a row keeps its own scales and biases, so a slice
@@ -22,12 +23,15 @@ Text only: the vision tower is not built and its tensors are dropped.
 
 Also the pipeline's adapter for the model (`Inkling2Adapter`): its layers
 pass the residual blocks along and store four convolution states, the last
-one after the expert call.
+one after the expert call. The looped Mini's (`Inkling2LoopAdapter`) checks
+a step's drafts in one forward of mlx-lm's own loop instead.
 """
 from __future__ import annotations
 
 import inspect
 import re
+import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -341,3 +345,104 @@ class Inkling2Adapter(StandardMoEAdapter):
         return logits, mx.concatenate(
             [mx.concatenate(got[i - 1], axis=1) if i < n else hidden
              for i in self.tap_layers], axis=-1)
+
+
+class Inkling2LoopAdapter(Inkling2Adapter):
+    """The adapter for mlx-lm's looped Inkling 2 (Mini: layers 6 to 17 run
+    three times a token, each pass with caches of its own). Its drafts are
+    checked in one forward of the step's tokens (pipeline.BatchedDecoder),
+    mlx-lm's own loop: verify() runs it and records every convolution window
+    the layers build, rollback() takes a rejected draft's rows off the KV
+    caches and each convolution state from its window, at the last token
+    kept. A draft head's taps count layer visits: the residual entering
+    visit t, past the last visit the model's final normalized output."""
+    batched = True
+
+    def __init__(self, model, drafter=None):
+        super().__init__(model, drafter)
+        self.n_visits = len(self.lm.layer_visits)
+        self._classes = {type(layer) for layer in self.layers}
+        # the module whose _conv_state the layers call
+        self._module = sys.modules[type(self.layers[0]).__module__]
+        self._want = {t - 1 for t in self.tap_layers if t < self.n_visits}
+
+    @contextmanager
+    def _recording(self, windows=None):
+        """During the forward inside: {visit: its output} for the visits the
+        taps read and, appended to `windows`, every convolution window in
+        the order the layers build them (four a visit)."""
+        orig = {c: c.__call__ for c in self._classes}
+        outs, count, want = {}, [0], self._want
+
+        def wrap(f):
+            def call(layer, *a, **kw):
+                res = f(layer, *a, **kw)
+                if count[0] in want:
+                    outs[count[0]] = res[0]
+                count[0] += 1
+                return res
+            return call
+
+        conv_state = self._module._conv_state
+
+        def recorded(window, lengths, n):
+            windows.append(window)
+            return conv_state(window, lengths, n)
+
+        for c, f in orig.items():
+            c.__call__ = wrap(f)
+        if windows is not None:
+            self._module._conv_state = recorded
+        try:
+            yield outs
+        finally:
+            for c, f in orig.items():
+                c.__call__ = f
+            self._module._conv_state = conv_state
+
+    def forward_taps(self, ids, cache, windows=None):
+        """The model's logits plus the head's rows for every position."""
+        if not self.taps and windows is None:
+            return self.logits(self.lm(ids, cache=cache)), None
+        with self._recording(windows) as got:
+            hidden = self.lm(ids, cache=cache)
+        logits = self.logits(hidden)
+        if not self.taps:
+            return logits, None
+        return logits, mx.concatenate(
+            [got[t - 1] if t < self.n_visits else hidden
+             for t in self.tap_layers], axis=-1)
+
+    def verify(self, toks, views):
+        """The step's tokens through the model in one forward: (logits
+        [1, K, V], the head's rows [1, K, ...], what rollback() needs)."""
+        windows = []
+        logits, rows = self.forward_taps(mx.array([toks]),
+                                         [v.entry for v in views], windows)
+        return logits, rows, SimpleNamespace(windows=windows, n=len(toks))
+
+    def rollback(self, views, rec, keep: int) -> None:
+        """Keep only the step's first `keep` tokens in the caches. A window
+        (RotatingKVCache) holds its rows in order after a forward of several
+        tokens, the new ones last, so they come off its end; every cache
+        holds the rows that the next token's window reaches back to."""
+        r = rec.n - keep
+        if r <= 0:
+            return
+        if len(rec.windows) != 4 * len(views):
+            raise RuntimeError(
+                f"Inkling 2 rollback: {len(rec.windows)} convolution windows "
+                f"for {len(views)} layer visits (mlx-lm's layer changed?)")
+        n = self._keep
+        for v in views:
+            kv, conv = v.entry[0], v.entry[1]
+            if conv.lengths is not None:
+                raise RuntimeError("Inkling 2 rollback: a batched cache")
+            kv.offset -= r
+            if hasattr(kv, "max_size"):
+                kv._idx -= r
+                kv.keys = kv.keys[..., :kv._idx, :]
+                kv.values = kv.values[..., :kv._idx, :]
+            conv.cache = [w[:, keep:keep + n]
+                          for w in rec.windows[4 * v.layer:4 * v.layer + 4]]
+        rec.n = keep

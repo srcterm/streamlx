@@ -804,3 +804,37 @@ class PipelinedDecoder:
             },
         }
 
+
+
+class BatchedDecoder(PipelinedDecoder):
+    """Speculative decoding with each step's drafts checked in ONE forward of
+    all its tokens, the model's own code over K positions: for a model held
+    in memory that costs well under K forwards of a token (each weight is
+    read once for all of them), where the pipelined streams above only pay
+    when there are expert reads to hide. The adapter runs the forward and
+    rolls the caches back to the tokens accepted:
+        verify(toks, cache) -> (logits [1, K, V], draft rows [1, K, ...],
+                                record)
+        rollback(cache, record, keep)
+    Drafting, the adaptive K, the self-gate against plain decoding and the
+    decode loop are the pipelined decoder's. Unlike the streams above, this
+    is not plain decoding bit for bit: a forward of K tokens computes each
+    one through other kernels than a forward of one (matrix products,
+    attention), so logits differ in their last bits, as in stock's own
+    chunked prefill, and where plain's best two tokens are about tied the
+    text can take the other (Inkling 2 Mini: after some tens of tokens on a
+    long prompt; identical on short ones)."""
+
+    def step(self, toks: list[int], offset: int):
+        logits, rows, rec = self.ad.verify(toks, self.cache)
+        outs = mx.argmax(logits[0], axis=-1)
+        mx.eval(outs, [] if rows is None else rows)
+        return (outs.tolist(), [None if rows is None else rows[:, i:i + 1]
+                                for i in range(len(toks))], rec)
+
+    def rollback(self, rec, a: int) -> None:
+        if rec is None:
+            return
+        t0 = time.perf_counter()
+        self.ad.rollback(self.cache, rec, a)
+        self.t_rollback += time.perf_counter() - t0

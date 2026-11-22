@@ -70,8 +70,12 @@ A draft head decodes greedy requests through streamlx.pipeline: K tokens in
 flight, so each token's expert reads overlap the others' compute, with plain
 decoding's output. A checkpoint that carries one (Qwen3.8, DeepSeek-V4.1,
 Inkling 2) uses it by default; --draft-head takes an mlx-vlm drafter
-directory for other models, or none for plain decoding. The self-gate's
-verdict carries across requests.
+directory for other models, or none for plain decoding. Inkling 2 Mini (a
+looped stack) checks each step's drafts in one forward instead
+(pipeline.BatchedDecoder), which pays when its experts are in memory; its
+text can then leave plain decoding's where two tokens are about tied
+(--draft-head none keeps plain's). The self-gate's verdict carries across
+requests.
 Requests that sample, process logits or ask for logprobs decode plainly. On a
 prompt-cache hit the head's context starts at the tokens this request
 prefills: drafts are verified, so that can only cost acceptance, not change
@@ -589,7 +593,7 @@ class StreamingModelProvider(srv.ModelProvider):
                                 _CFG["draft_k"])
         drafter = None
         if head:
-            from streamlx.pipeline import PipelinedDecoder
+            from streamlx.pipeline import BatchedDecoder, PipelinedDecoder
             from streamlx.pipeline_adapters import adapter_for, load_drafter
 
             t0 = time.time()
@@ -603,10 +607,13 @@ class StreamingModelProvider(srv.ModelProvider):
                       file=sys.stderr)
         if drafter is not None:
             ad = adapter_for(model, drafter)
-            _STATE["decoder"] = PipelinedDecoder(ad, pools, [], k_max=k,
-                                                 plain_fn=ad.plain)
+            batched = getattr(ad, "batched", False)
+            _STATE["decoder"] = (BatchedDecoder if batched
+                                 else PipelinedDecoder)(
+                ad, pools, [], k_max=k, plain_fn=ad.plain)
             print(f"[streamlx] draft head in {time.time()-t0:.1f}s, up to "
-                  f"{k} tokens in flight", file=sys.stderr)
+                  f"{k} tokens " + ("a forward" if batched else "in flight"),
+                  file=sys.stderr)
         if auto:
             # what the memory limit leaves beside the trunk and the head is
             # the most the pools may take; they start at what the first

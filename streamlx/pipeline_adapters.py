@@ -262,10 +262,15 @@ def adapter_for(model, drafter=None):
     visits = getattr(lm, "layer_visits", None)
     if visits is not None and len(visits) != len(model.layers):
         # a looped stack (Inkling 2 Mini) runs some layers more than once a
-        # token, with caches and inputs of each pass: no adapter models that
-        raise NotImplementedError(
-            f"pipelined decoding does not support looped models ({mt}): "
-            "serve it with --draft-head none")
+        # token, with caches and inputs of each pass: its drafts are checked
+        # in one forward of the model's own (pipeline.BatchedDecoder)
+        if mt != "inkling2_loop":
+            raise NotImplementedError(
+                f"draft heads do not support looped models ({mt}): "
+                "serve it with --draft-head none")
+        from .inkling2 import Inkling2LoopAdapter
+
+        return Inkling2LoopAdapter(model, drafter)
     if mt == "mistral_large4":
         return MistralLarge4Adapter(model, drafter)
     if mt == "deepseek_v41":
@@ -426,7 +431,8 @@ def _vlm_target(model, cfg):
 
 # Model types whose checkpoints carry their own draft head, and the tokens in
 # flight that suit it.
-HEAD_K = {"qwen4_exp": 3, "deepseek_v41": 6, "inkling2": 3}
+HEAD_K = {"qwen4_exp": 3, "deepseek_v41": 6, "inkling2": 3,
+          "inkling2_loop": 4}
 
 
 def checkpoint_head(model_dir) -> str | None:
@@ -489,7 +495,7 @@ def load_drafter(path: str, model, reader=None):
         from .deepseek_v41_dspark import V41DSpark
 
         return V41DSpark(model, path, reader.index, reader)
-    if mt == "inkling2":
+    if mt in ("inkling2", "inkling2_loop"):
         from .inkling2_dspark import Inkling2Draft
 
         return Inkling2Draft(model, path)
