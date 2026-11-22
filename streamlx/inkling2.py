@@ -26,6 +26,7 @@ one after the expert call.
 """
 from __future__ import annotations
 
+import inspect
 import re
 from types import SimpleNamespace
 
@@ -204,6 +205,10 @@ class Inkling2Adapter(StandardMoEAdapter):
         # id past the stack, the model's final normalized output
         self.tap_layers = tuple(getattr(drafter, "tap_layers", None) or ())
         self.taps = frozenset(self.tap_layers)
+        # mlx-lm's looped Inkling 2 (#2086) hands _self_attention the loop's
+        # messages too; a stack without a loop passes none
+        sa = inspect.signature(type(self.layers[0])._self_attention)
+        self._no_messages = (None,) if "messages" in sa.parameters else ()
         self._dated = {}     # layer -> the snapshot its next begin() dates
         self._late = {}      # layer -> {position: its fourth conv state}
 
@@ -270,7 +275,8 @@ class Inkling2Adapter(StandardMoEAdapter):
         inputs = None
         if layer.attention_input is not None:
             inputs = layer.attention_input(pos.blocks, normed)
-        x = layer._self_attention(h, inputs, entry, win, ctx)
+        x = layer._self_attention(h, inputs, entry, win, ctx,
+                                  *self._no_messages)
         x, win[2] = layer.post_attention_convolution(x, win[2], ctx)
         res = x = x.astype(mx.float32)
         blocks = pos.blocks

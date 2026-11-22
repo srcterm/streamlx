@@ -248,6 +248,9 @@ class StreamingSwitchMLP:
         self.index = index or SafetensorsIndex(model_dir)
         self.reader = reader or ExpertReader(self.index)
         self.layer = layer
+        # the model's cache entries of this layer, in call order: one, or
+        # one a visit for a looped stack (set at load)
+        self.visits = [layer]
         self.tag = tag              # module path of a non-trunk block
         self.triples_loc = self.index.switch_triples(layer, tag=tag)
         # the layer's projections: gate / up / down, or gate+up / down

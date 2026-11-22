@@ -258,6 +258,14 @@ class MistralLarge4Adapter(StandardMoEAdapter):
 def adapter_for(model, drafter=None):
     """The pipeline adapter for `model`'s decoder shape."""
     mt = getattr(getattr(model, "args", None), "model_type", None)
+    lm = getattr(getattr(model, "model", None), "language_model", None)
+    visits = getattr(lm, "layer_visits", None)
+    if visits is not None and len(visits) != len(model.layers):
+        # a looped stack (Inkling 2 Mini) runs some layers more than once a
+        # token, with caches and inputs of each pass: no adapter models that
+        raise NotImplementedError(
+            f"pipelined decoding does not support looped models ({mt}): "
+            "serve it with --draft-head none")
     if mt == "mistral_large4":
         return MistralLarge4Adapter(model, drafter)
     if mt == "deepseek_v41":

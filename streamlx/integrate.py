@@ -120,12 +120,15 @@ class StreamingSwitchGLU(nn.Module):
 
     def _own_cache_states(self) -> None:
         """prefill_cache's per-layer step: evaluate the entries of the layers
-        up to this one that this forward has not (a layer at or below the
-        last one seen starts a new forward)."""
+        up to this one that this forward has not (a layer with no visit past
+        the last one seen starts a new forward)."""
         cache, done = _PREFILL["cache"], _PREFILL["done"]
-        upto = min(self.pool.layer, len(cache) - 1)
-        if upto <= done:
+        # this call's entry: the first of the layer's visits past the last
+        # one seen (a looped stack runs a layer more than once a forward)
+        later = [v for v in self.pool.visits if v > done]
+        if not later:
             done = -1
+        upto = min(later[0] if later else self.pool.visits[0], len(cache) - 1)
         states = []
         # from the last layer seen: what it stored after its MoE call
         # (inkling2's convolution states) is new to this one
@@ -626,6 +629,14 @@ def _wrap(layer, mlp, pool) -> None:
         # deepseek_v41 weights each expert's activation before its down
         # projection: act(up, gate, weights)
         pool.act_weights = act is not None and _n_args(act) >= 3
+    # nvfp4 tensor scales the loader computed (Inkling 2's source
+    # checkpoints): the reader copies the stock values into the slots
+    for proj, parts in pool.triples_loc.items():
+        loc = parts.get("global_scale")
+        if loc is not None and loc.derived:
+            gs = getattr(sw, proj).global_scale
+            mx.eval(gs)
+            pool.reader._vectors[loc.name] = np.array(gs, dtype=np.float32)
     # Per-expert output scales are tiny [E] vectors riding the module being
     # dropped: materialize them now (expert tensors stay lazy). Trivial
     # all-ones stays None so models without them pay nothing.
@@ -658,6 +669,7 @@ def install_streaming(model, model_dir: str, n_slots: int):
     if not pools:
         raise RuntimeError("no MoE layers found to wrap")
     _link_next_layers(model, pools)
+    _set_visits(model, pools)
     return pools, reader
 
 
@@ -668,6 +680,22 @@ def _link_next_layers(model, pools: dict) -> None:
     ws = [getattr(m, _switch_name(m)) for m in blocks]
     for a, b in itertools.pairwise(ws):
         a._next = b
+
+
+def _set_visits(model, pools: dict) -> None:
+    """A looped stack (Inkling 2 Mini runs layers 6-17 three times a token)
+    keeps a cache entry a layer visit: each pool learns its layer's."""
+    lm = getattr(getattr(model, "model", None), "language_model", None)
+    visits = getattr(lm, "layer_visits", None)
+    if visits is None or len(visits) == len(model.layers):
+        return
+    at = {id(layer): i for i, layer in enumerate(model.layers)}
+    for p in pools.values():
+        p.visits = []
+    for j, layer in enumerate(visits):
+        p = pools.get(at[id(layer)])
+        if p is not None:
+            p.visits.append(j)
 
 
 def _vlm_export_shim(model_dir: str) -> dict | None:
@@ -834,6 +862,7 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
         pool.min_slots = min(k, pool.n_experts)
         pools[i] = pool
     _link_next_layers(model, pools)
+    _set_visits(model, pools)
     # the trunk: the experts' modules were replaced before any eval and
     # never materialize
     mx.eval(model.parameters())

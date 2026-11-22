@@ -11,11 +11,12 @@ import glob
 import json
 import re
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
 from pathlib import Path
 
-DTYPE_SIZE = {"U32": 4, "BF16": 2, "F16": 2, "F32": 4, "U16": 2, "U8": 1}
+DTYPE_SIZE = {"U32": 4, "BF16": 2, "F16": 2, "F32": 4, "U16": 2, "U8": 1,
+              "F8_E4M3": 1, "F8_E5M2": 1}
 PROJS = ("gate_proj", "up_proj", "down_proj")
 # inkling2: gate and up in one projection, gate rows even and up rows odd
 FUSED = ("gate_up_proj", "down_proj")
@@ -39,6 +40,9 @@ class TensorLoc:
     dtype: str
     shape: tuple
     name: str = ""   # tensor key in the checkpoint
+    # the values are computed at load from this tensor (the reader takes
+    # them from the stock module, never from these bytes)
+    derived: bool = False
 
     @property
     def row_stride(self) -> int:
@@ -123,8 +127,27 @@ class SafetensorsIndex:
                            + re.escape(base) + r"\.mlp\.experts\."
                            + r"(gate_up_proj|down_proj)\."
                            + r"(weight|scales|biases|global_scale)$")
+        # Inkling 2's source checkpoints (modelopt): `mlp.experts.w13_weight`
+        # / `w2_weight` and their `_scale`, bytes mlx-lm runs as they are
+        # (packed rows seen as uint32, fp8 scales as bytes); the nvfp4 tensor
+        # scale is computed at load from `_amax`
+        src = re.compile(r"^(?:model\.)?(?:llm\.|language_model\.)?"
+                         + re.escape(base)
+                         + r"\.mlp\.experts\.(w13|w2)_weight(_scale|_amax)?$")
         for name, loc in self.tensors.items():
             norm = self._norm(name)
+            if (m := src.match(norm)) is not None:
+                proj, suffix = DS_PROJ[m.group(1)], m.group(2)
+                if suffix is None:
+                    n = loc.shape[-1] * DTYPE_SIZE[loc.dtype]
+                    part, loc = "weight", replace(
+                        loc, dtype="U32", shape=loc.shape[:-1] + (n // 4,))
+                elif suffix == "_scale":
+                    part, loc = "scales", replace(loc, dtype="U8")
+                else:
+                    part, loc = "global_scale", replace(loc, derived=True)
+                out.setdefault(proj, {})[part] = loc
+                continue
             ds = ds_names.match(norm) or fused.match(norm)
             if ds is not None:
                 proj = DS_PROJ.get(ds.group(1), ds.group(1))
