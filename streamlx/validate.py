@@ -19,7 +19,8 @@ import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.models.cache import make_prompt_cache
 
-from streamlx.integrate import aggregate_stats, install_streaming
+from streamlx.integrate import (_checkpoint_loader, aggregate_stats,
+                                install_streaming)
 
 PROMPT = ("The tradeoff between memory bandwidth and storage bandwidth in "
           "local inference of mixture-of-experts models is")
@@ -52,7 +53,14 @@ def main() -> int:
     args = ap.parse_args()
 
     t0 = time.time()
-    model, tokenizer = load(args.model)
+    # a checkpoint mlx-lm can't build as it is (an oQ export, Qwen3.8,
+    # DeepSeek-V4.1 with Engram layers) loads through streamlx's loader
+    loader = _checkpoint_loader(args.model)
+    if loader is None:
+        model, tokenizer = load(args.model)
+    else:
+        model, tokenizer = loader(args.model)
+        mx.eval(model.parameters())
     print(f"[validate] reference model loaded in {time.time()-t0:.1f}s",
           file=sys.stderr)
     cache_factory = lambda: make_prompt_cache(model)

@@ -792,7 +792,7 @@ def _checkpoint_loader(model_dir: str):
         except ImportError as e:
             raise ImportError("Qwen3.8 needs mlx-vlm: pip install mlx-vlm") from e
         return load_qwen4_exp
-    if cfg.get("model_type") == "inkling2":
+    if cfg.get("model_type") in ("inkling2", "inkling2_loop"):
         try:
             import mlx_lm.models.inkling2  # noqa: F401
         except ImportError as e:

@@ -15,9 +15,16 @@ requantizing:
       sliding layers  attn.in_proj = q | k | v | r | gate | sink
       full layers     attn.q_proj  = q | r | gate | sink
                       attn.k_proj  = k | k_sconv.weight_proj   (v likewise)
-  - conv weights and attention-residual queries reshaped.
+  - conv weights and attention-residual queries reshaped;
+  - the looped layers' message gates (the Mini's), stacked over the four
+    inputs a gate feeds (query, key, value, mlp): loop_down [4, 2, dims,
+    rank] = each gate's down_proj, transposed and split into the hidden
+    state's and the message's halves; loop_gain_forget [4, rank, 2 * dims]
+    = its message_gate_proj | forget_gate_proj, transposed; and the layer's
+    four message queries, loop_message.query [4, dims] (one row of mlx-lm's
+    message_input).
 The routed experts (w13 = gate and up in one projection, w2 = down) keep
-their bytes. mlx-lm reads every module's bits, group size and mode off its
+their bytes (NVFP4 ones with their global scale). mlx-lm reads every module's bits, group size and mode off its
 packed shapes, so the export's quantization table needs no translation.
 Text only: the vision tower is not built and its tensors are dropped.
 
@@ -69,6 +76,8 @@ _CONVS = {"attn.k_conv": "self_attn.k_sconv.conv1d.weight",
 # [n, dims] -> [dims] for one query, as it is for a full layer's three
 _QUERIES = {"attn_input.query": "attention_input.query",
             "mlp_input.query": "mlp_input.query"}
+# a looped layer's four message gates, in the order oQ stacks them
+_GATES = ("q", "k", "v", "mlp")
 
 
 def _splits(text: dict, sliding: bool) -> dict:
@@ -93,7 +102,7 @@ def from_oq_export(weights: dict, text: dict) -> dict:
     """An oQ export's tensors under mlx-lm's names (text model only). `text`
     is the checkpoint's text_config."""
     local = set(text["local_layer_ids"])
-    out = {}
+    out, messages = {}, {}
     for key, v in weights.items():
         if key.startswith("vision_tower."):
             continue
@@ -123,19 +132,36 @@ def from_oq_export(weights: dict, text: dict) -> dict:
             out[pre + _CONVS[rest]] = v[..., None]
         elif rest in _QUERIES:
             out[pre + _QUERIES[rest]] = v.reshape(-1) if v.shape[0] == 1 else v
+        elif rest == "loop_down":
+            for i, g in enumerate(_GATES):
+                out[f"{pre}{g}_message_gate.down_proj.weight"] = (
+                    v[i].reshape(-1, v.shape[-1]).T)
+        elif rest == "loop_gain_forget":
+            dims = v.shape[-1] // 2
+            for i, g in enumerate(_GATES):
+                out[f"{pre}{g}_message_gate.message_gate_proj.weight"] = (
+                    v[i, :, :dims].T)
+                out[f"{pre}{g}_message_gate.forget_gate_proj.weight"] = (
+                    v[i, :, dims:].T)
+        elif rest == "loop_message.query":
+            messages[n] = v
         else:
             new = next((n_ + rest[len(o):] for o, n_ in _RENAMES.items()
                         if rest.startswith(o)), None)
             if new is None:
                 raise ValueError(f"unmapped Inkling 2 tensor {key}")
             out[pre + new] = v
+    if messages:
+        # the looped layers in order: message_input.query [layers, 4, dims]
+        out[_ROOT + "message_input.query"] = mx.stack(
+            [messages[n] for n in sorted(messages)])
     return out
 
 
 def is_oq_export(cfg: dict) -> bool:
-    """Whether an inkling2 checkpoint is in oQ's layout (its quantization
-    table names oQ's modules)."""
-    return (cfg.get("model_type") == "inkling2"
+    """Whether an inkling2 checkpoint (the Mini's: inkling2_loop) is in oQ's
+    layout (its quantization table names oQ's modules)."""
+    return (cfg.get("model_type") in ("inkling2", "inkling2_loop")
             and "model.embed" in (cfg.get("quantization") or {}))
 
 
