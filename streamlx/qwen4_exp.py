@@ -43,7 +43,7 @@ from mlx_vlm.models.qwen4_exp.ple_storage import (
     build_quantized_ple_manifest,
 )
 
-from .pipeline_adapters import StandardMoEAdapter, _find_switch
+from .pipeline_adapters import StandardMoEAdapter, _find_switch, token_ids
 from .reader import open_nocache
 
 
@@ -384,8 +384,8 @@ class Qwen4ExpAdapter(StandardMoEAdapter):
         return st.hyper + (branch[..., None, :]
                            * st.weights[..., None]).reshape(*st.hyper.shape)
 
-    def plain(self, tok: int, cache):
-        return self.forward_taps(mx.array([[tok]]), cache)
+    def plain(self, tok, cache):
+        return self.forward_taps(token_ids(tok), cache)
 
     def forward_taps(self, ids, cache):
         out = self.model.forward(ids, cache, return_hidden=True)

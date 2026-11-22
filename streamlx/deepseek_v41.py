@@ -66,7 +66,7 @@ from mlx_vlm.models.deepseek_v41.language import (
 )
 
 from . import chat_formats
-from .pipeline_adapters import StandardMoEAdapter, capture_layer_outputs
+from .pipeline_adapters import StandardMoEAdapter, capture_layer_outputs, token_ids
 from .stindex import DS_PROJ as _W
 from .stindex import default_group_size
 
@@ -411,8 +411,8 @@ class V41Adapter(StandardMoEAdapter):
         return h
 
     # -- the model's own forward -------------------------------------------
-    def plain(self, tok: int, cache):
-        return self.forward_taps(mx.array([[tok]]), [cache[0].entry])
+    def plain(self, tok, cache):
+        return self.forward_taps(token_ids(tok), [cache[0].entry])
 
     def forward_taps(self, ids, cache):
         """The model's forward plus the draft head's context for every

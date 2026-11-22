@@ -13,7 +13,7 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 
 import toy
 from streamlx import pipeline
-from streamlx.integrate import prefill_cache
+from streamlx.integrate import prefill_cache, resize_pools
 from streamlx.pipeline import PipelinedDecoder
 from streamlx.pipeline_adapters import adapter_for
 
@@ -245,6 +245,88 @@ class DecodeLoop(unittest.TestCase):
         self.assertGreaterEqual(on, drafting / dec.k_max)
         self.assertLessEqual(on, drafting)
         self.assertTrue(dec._g_decisions)
+
+
+class _CountingHead(_Head):
+    """_Head that checks, at each draft, that it has been given every
+    committed token's pair (fed or with the draft) and no more."""
+
+    def __init__(self, seq, clock, committed):
+        super().__init__(seq, clock)
+        self.committed, self.fed, self.drafts, self.late = committed, 0, [], []
+
+    def prime_pairs(self, hidden, next_ids=None):
+        self.fed += int(hidden.shape[1])
+        super().prime_pairs(hidden, next_ids)
+
+    def draft(self, pairs, depth):
+        self.drafts.append(len(pairs))
+        if self.pos + len(pairs) != self.committed():
+            self.late.append((self.pos + len(pairs), self.committed()))
+        return super().draft(pairs, depth)
+
+
+class RunAhead(unittest.TestCase):
+    """Every expert held: plain steps run one ahead, the next one queued on
+    this one's argmax before it is read. The ids are plain decoding's; a
+    reader that stops early leaves the cache just after the last id out; and
+    while the gate has drafting off the head is fed nothing per token, its
+    next draft getting every committed pair."""
+
+    def setUp(self):
+        self.ck = toy.Checkpoint()
+        self.addCleanup(self.ck.close)
+        self.seq, _ = toy.greedy(self.ck.ref, PROMPT, N)
+        m, self.pools = self.ck.streaming(8)
+        resize_pools(self.pools, sum(p.n_experts * p.expert_bytes
+                                     for p in self.pools.values()))
+        self.m = m
+
+    def _decoder(self, head, **kw):
+        ad = adapter_for(self.m, head)
+        cache = make_prompt_cache(self.m)
+        logits, rows = ad.forward_taps(mx.array([PROMPT]), cache)
+        mx.eval(logits, rows)
+        dec = PipelinedDecoder(ad, self.pools, ad.views(cache),
+                               plain_fn=ad.plain, **kw)
+        return dec, cache, rows[:, -1:]
+
+    def test_plain_ids_and_cache_end(self):
+        dec, cache, row = self._decoder(_Head(self.seq, _Clock()), k_max=1,
+                                        self_gate=False)
+        fed = []
+        plain = dec.plain_fn
+        dec.plain_fn = lambda tok, c: (fed.append(tok), plain(tok, c))[1]
+        out = dec.generate(self.seq[0], row, len(PROMPT), N)
+        self.assertEqual(out, self.seq[:N])
+        # every forward after the first went in on the step before's argmax
+        self.assertIsInstance(fed[0], int)
+        self.assertTrue(all(isinstance(t, mx.array) for t in fed[1:]))
+        self.assertEqual(cache[0].offset, len(PROMPT) + N - 1)
+        # a reader that stops after k ids: the forward of the k-th ran too
+        dec, cache, row = self._decoder(_Head(self.seq, _Clock()), k_max=1,
+                                        self_gate=False)
+        it = dec.decode(self.seq[0], row, len(PROMPT), N)
+        k = 5
+        got = [next(it) for _ in range(k)]
+        it.close()
+        self.assertEqual(got, self.seq[1:k + 1])
+        self.assertEqual(cache[0].offset, len(PROMPT) + k + 1)
+
+    def test_head_kept_while_gated_off(self):
+        out = []
+        head = _CountingHead(self.seq, _Clock(), lambda: len(out))
+        dec, cache, row = self._decoder(head, k_max=3, adaptive=False,
+                                        self_gate=True)
+        dec.gate_probe, dec.gate_min, dec.gate_hold = 8, 4, 16
+        out.append(self.seq[0])
+        got = dec.generate(self.seq[0], row, len(PROMPT), N,
+                           on_token=out.append)
+        self.assertEqual(got, self.seq[:N])
+        self.assertEqual(head.late, [])      # never short of a pair
+        self.assertEqual(head.fed, 0)        # nothing fed per token
+        self.assertGreater(head.drafts[0], 8)    # the gated-off run's pairs
+        self.assertGreater(dec.draft_ok, 0)
 
 
 @unittest.skipUnless(importlib.util.find_spec("mlx_lm.models.inkling2")

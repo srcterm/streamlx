@@ -44,7 +44,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 
 from .pipeline import snapshot_cache
-from .pipeline_adapters import StandardMoEAdapter, capture_layer_outputs
+from .pipeline_adapters import StandardMoEAdapter, capture_layer_outputs, token_ids
 
 _LAYER = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 _ROOT = "model.language_model."
@@ -354,8 +354,8 @@ class Inkling2Adapter(StandardMoEAdapter):
                                for i in self.tap_layers], axis=-1)
 
     # -- the model's own forward -------------------------------------------
-    def plain(self, tok: int, cache):
-        return self.forward_taps(mx.array([[tok]]), [v.entry for v in cache])
+    def plain(self, tok, cache):
+        return self.forward_taps(token_ids(tok), [v.entry for v in cache])
 
     def forward_taps(self, ids, cache):
         """The model's logits plus the head's context for every position: the

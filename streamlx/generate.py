@@ -48,6 +48,8 @@ from streamlx.integrate import (
     prefill_plan,
     resize_pools,
 )
+from streamlx.pipeline_adapters import token_ids
+from streamlx.pool import all_held
 
 PREFILL_STEP = 4096
 
@@ -188,13 +190,27 @@ def main() -> int:
             out = dec.generate(first, hidden[:, -1:], len(ids),
                                args.max_tokens, on_token=emit, stop=eos)
         else:
-            out, tok = [first], first
+            def queue(t):
+                """The forward of `t` (an id, or the step before's argmax
+                still being computed), queued: its argmax."""
+                y = mx.argmax(model(token_ids(t), cache=cache)[0, -1])
+                mx.async_eval(y)
+                return y
+
+            # every expert held: a forward never waits on the host, so the
+            # next one is queued on this one's argmax while the GPU computes
+            # it (as mlx-lm's generate_step; same ids)
+            ahead = all_held(pools)
+            out, tok, y = [first], first, None
             emit(first)
             while len(out) < args.max_tokens and tok not in eos:
-                logits = model(mx.array([[tok]]), cache=cache)
-                tok = int(mx.argmax(logits[0, -1]).item())
+                y = queue(tok) if y is None else y
+                nxt = (queue(y) if ahead and len(out) + 1 < args.max_tokens
+                       else None)
+                tok = int(y.item())
                 out.append(tok)
                 emit(tok)
+                y = nxt
         n = len([t for t in out if t not in eos])
         detok.finalize()
         print(detok.last_segment)

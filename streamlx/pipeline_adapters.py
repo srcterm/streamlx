@@ -35,6 +35,15 @@ _NORM2 = ("post_attention_layernorm", "ffn_norm", "ln_2", "pre_mlp_layernorm")
 _MLP = ("mlp", "ffn", "feed_forward", "block_sparse_moe")
 
 
+def token_ids(tok) -> mx.array:
+    """[1, 1] ids of one token for a plain step: an id, or the step before's
+    argmax still being computed (a step queued ahead; the pipeline's
+    _plain_queue)."""
+    if isinstance(tok, mx.array):
+        return tok.reshape(1, 1).astype(mx.int32)
+    return mx.array([[tok]])
+
+
 def _pick(obj, names, what):
     for n in names:
         if getattr(obj, n, None) is not None:
@@ -164,12 +173,13 @@ class StandardMoEAdapter:
             return h
         return mx.concatenate([pos.taps[i] for i in self.tap_layers], axis=-1)
 
-    def plain(self, tok: int, cache):
-        """The model's own one-token forward: the pipeline's plain_fn.
-        Returns (logits, the hidden draft_hidden gives)."""
+    def plain(self, tok, cache):
+        """The model's own one-token forward: the pipeline's plain_fn (tok an
+        id or a queued step's argmax, token_ids). Returns (logits, the hidden
+        draft_hidden gives)."""
         want = self.tap_layers or (len(self.layers) - 1,)
         with capture_layer_outputs(self.model, want) as got:
-            logits = self.model(mx.array([[tok]]), cache=cache)
+            logits = self.model(token_ids(tok), cache=cache)
         if not self.taps:
             return logits, got[want[0]][-1]
         return logits, mx.concatenate([got[i][-1] for i in self.tap_layers],
