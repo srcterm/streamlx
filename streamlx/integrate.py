@@ -853,9 +853,13 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
     moe_layers = [i for i, l in enumerate(model.layers)
                   if _moe_block(l) is not None]
     bpe = {i: index.layer_expert_bytes(i) for i in moe_layers}
+    n_exp = {i: next(iter(index.switch_triples(i).values()))["weight"].shape[0]
+             for i in moe_layers}
+    first = split_slots(budget_bytes, {i: (bpe[i], n_exp[i], min(k, n_exp[i]))
+                                       for i in moe_layers})
     pools: dict[int, StreamingSwitchMLP] = {}
     for i in moe_layers:
-        slots = max(k, int(budget_bytes / len(moe_layers) / bpe[i]))
+        slots = max(k, first[i])
         pool = StreamingSwitchMLP(model_dir, i, slots, index=index,
                                   reader=reader)
         _wrap(model.layers[i], _moe_block(model.layers[i]), pool)
@@ -933,19 +937,45 @@ def budget_within(limit: int, pools: dict, reserve: int = 0) -> int:
     return max(int(limit - resident - reserve), 2**30)
 
 
+def split_slots(budget_bytes: float, layers: dict) -> dict:
+    """Slots a pool for `budget_bytes` over pools given as {i: (bytes an
+    expert, experts, least slots)}: equal bytes a pool, and what a pool's
+    share has past all its experts goes to the others (a model whose layers'
+    experts differ in size, Inkling 2's nvfp4 and mxfp8 ones, then holds every
+    expert once the budget does)."""
+    want, left, b = {}, dict(layers), float(budget_bytes)
+    while left:
+        share = b / len(left)
+        full = [i for i, (eb, n, _) in left.items() if n * eb <= share]
+        if not full:
+            break
+        for i in full:
+            eb, n, _ = left.pop(i)
+            want[i] = n
+            b -= n * eb
+    for i, (eb, n, least) in left.items():
+        want[i] = max(least, min(n, int(b / len(left) / eb)))
+    return want
+
+
 def resize_pools(pools: dict, budget_bytes: float) -> int:
     """Split `budget_bytes` over `pools` the way load_streaming_model splits
-    its budget (equal bytes a pool, at least its min_slots, at most its
-    experts) and resize each pool to its share (StreamingSwitchMLP.resize:
-    exact), shrinking ones first so the copies' transient stays one pool
-    array. Returns the bytes the pools then hold."""
-    n = len(pools)
-    want = {i: max(p.min_slots, min(p.n_experts,
-                                    int(budget_bytes / n / p.expert_bytes)))
-            for i, p in pools.items()}
+    its budget (split_slots: equal bytes a pool, at least its min_slots, at
+    most its experts) and resize each pool to its share
+    (StreamingSwitchMLP.resize: exact), shrinking ones first so the copies'
+    transient stays one pool array; a pool that can then hold all its layer's
+    experts reads the ones it lacks (fill). Returns the bytes the pools then
+    hold."""
+    want = split_slots(budget_bytes, {i: (p.expert_bytes, p.n_experts,
+                                          p.min_slots)
+                                      for i, p in pools.items()})
     for i in sorted(pools, key=lambda i: want[i] - pools[i].n_slots):
         pools[i].resize(want[i])
     mx.clear_cache()
+    # a pool that can now hold every expert of its layer reads the ones it
+    # lacks (the whole model, when it fits): its decoding never waits on reads
+    for p in pools.values():
+        p.fill()
     return pool_bytes(pools)
 
 

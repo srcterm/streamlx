@@ -619,11 +619,15 @@ class StreamingModelProvider(srv.ModelProvider):
                      if lim else _CFG["budget_bytes"])
         else:
             start = _CFG["budget_bytes"]
+        t1 = time.perf_counter()
         got = resize_pools(_STATE["pools"], max(start, 2**30))
         slots = sum(p.n_slots for p in _STATE["pools"].values())
+        whole = all(p.n_slots == p.n_experts
+                    for p in _STATE["pools"].values())
         print(f"[streamlx] expert pools: {slots} slots, {got / 2**30:.1f} GiB"
-              f" (at most {_CFG['budget_bytes'] / 2**30:.1f})",
-              file=sys.stderr)
+              f" (at most {_CFG['budget_bytes'] / 2**30:.1f})"
+              + (f"; every expert read in {time.perf_counter() - t1:.1f}s"
+                 if whole else ""), file=sys.stderr)
 
         if (self.cli_args.use_default_chat_template
                 and tokenizer.chat_template is None):

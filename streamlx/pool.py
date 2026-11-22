@@ -301,6 +301,8 @@ class StreamingSwitchMLP:
         self.misses = 0
         self.evictions = 0
         self.fetch_s = 0.0
+        self.filled = 0       # experts fill() read, and its seconds
+        self.fill_s = 0.0
         self.sweep_experts = 0   # expert-rows streamed by prefill sweeps
         self.sweep_resident = 0  # routed by a sweep, taken from the pool
         self.sweep_fetch_s = 0.0
@@ -390,6 +392,29 @@ class StreamingSwitchMLP:
 
     def resident(self, e: int) -> bool:
         return e in self.id2slot
+
+    def fill(self) -> int:
+        """When the slots can hold every expert of the layer, read the ones
+        not resident: a model whose experts all fit is read whole up front,
+        as a resident load reads it, and its decoding never waits on the
+        drive. Not counted as misses. Call it between requests, like
+        resize(). Returns how many it read."""
+        if self.n_slots < self.n_experts:
+            return 0
+        missing = [e for e in range(self.n_experts) if e not in self.id2slot]
+        if not missing:
+            return 0
+        for e in missing:
+            self._take_slot_for(e)
+        t0 = time.perf_counter()
+        try:
+            self.reader.read_into(self.slot_requests(missing))
+        except BaseException:
+            self.forget(missing)       # no read is still writing them
+            raise
+        self.fill_s += time.perf_counter() - t0
+        self.filled += len(missing)
+        return len(missing)
 
     def resize(self, n_slots: int) -> int:
         """Change the slot count, within [min_slots, the layer's experts].
