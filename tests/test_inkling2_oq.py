@@ -48,5 +48,31 @@ class LoopMapping(unittest.TestCase):
             self.assertTrue(np.array_equal(np.array(got[name]), v), name)
 
 
+class LoopedModelInstall(unittest.TestCase):
+    """A looped Inkling 2 checkpoint (the Mini) on an mlx-lm without the
+    looped model is refused with the pull request that has it, not passed on
+    to fail in mlx-lm."""
+
+    def test_names_the_looped_model(self):
+        import json
+        import tempfile
+        from unittest import mock
+
+        from streamlx import integrate
+
+        with tempfile.TemporaryDirectory() as d:
+            with open(f"{d}/config.json", "w") as f:
+                json.dump({"model_type": "inkling2_loop"}, f)
+            try:
+                import mlx_lm.models.inkling2  # noqa: F401
+            except ImportError:
+                self.skipTest("needs an mlx-lm with the inkling2 model")
+            with mock.patch.object(integrate, "_has_loop", lambda: False):
+                with self.assertRaisesRegex(ImportError, "pull/2086"):
+                    integrate._checkpoint_loader(d)
+            with mock.patch.object(integrate, "_has_loop", lambda: True):
+                self.assertIsNone(integrate._checkpoint_loader(d))
+
+
 if __name__ == "__main__":
     unittest.main()

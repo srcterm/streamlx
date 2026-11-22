@@ -834,11 +834,28 @@ def _checkpoint_loader(model_dir: str):
                 "pull request: pip install "
                 "git+https://github.com/ml-explore/mlx-lm@refs/pull/2061/head"
             ) from e
+        if cfg["model_type"] == "inkling2_loop" and not _has_loop():
+            raise ImportError(
+                "Inkling 2 Mini needs mlx-lm with the looped inkling2 model, "
+                "still an open pull request: pip install "
+                "git+https://github.com/ml-explore/mlx-lm@refs/pull/2086/head")
         from .inkling2 import is_oq_export, load_inkling2
 
         if is_oq_export(cfg):
             return load_inkling2
     return None
+
+
+def _has_loop() -> bool:
+    """Whether the installed mlx-lm's inkling2 has the looped stack (Inkling 2
+    Mini's: its text config takes a loop_config)."""
+    try:    # mlx-lm's layout from #2082: the model is a package
+        from mlx_lm.models.inkling2.config import TextArgs
+    except ImportError:
+        import mlx_lm.models.inkling2 as stock
+
+        TextArgs = getattr(stock, "TextArgs", None)
+    return "loop_config" in getattr(TextArgs, "__dataclass_fields__", {})
 
 
 def load_streaming_model(model_dir: str, budget_bytes: int,
