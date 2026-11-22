@@ -85,6 +85,7 @@ the text.
 from __future__ import annotations
 
 import argparse
+import collections
 import itertools
 import json
 import os
@@ -130,7 +131,22 @@ _orig_sampler = srv._make_sampler
 def _recording_sampler(args, tokenizer):
     # What the request asked for: stream_generate only gets the closures.
     _STATE["args"] = args
-    return _orig_sampler(args, tokenizer)
+    sampler = _orig_sampler(args, tokenizer)
+    picked = _STATE["picked"] = collections.deque(maxlen=8)
+
+    def sample(logprobs):
+        """The request's sampler, the chosen token's log-probability
+        computed with it: the step that evaluates the token evaluates it too
+        (_HostLogprobs reads it for the server)."""
+        y = sampler(logprobs)
+        if logprobs.ndim != 2 or y.ndim != 1:
+            return y
+        lp = mx.take_along_axis(logprobs, y[:, None], axis=-1)
+        y = mx.depends(y, lp)
+        picked.append((y, lp))
+        return y
+
+    return sample
 
 
 srv._make_sampler = _recording_sampler
@@ -416,6 +432,44 @@ class _NoLogprobs:
         return mx.array(0.0)
 
 
+class _HostLogprobs:
+    """A plain step's log-probabilities as mlx-lm's server reads them. It
+    takes the chosen token's for every token (`logprobs[token].item()`), and
+    as a new MLX op that read is handed to the GPU behind the next token's
+    step, already queued (generate_step runs one ahead), and waits for it:
+    the server then decodes at the rate of steps run in turn (a model in
+    memory lost a tenth to it). The request's sampler computed that value
+    in the token's own step (_recording_sampler), so it is at hand. Any
+    other use (a request's top logprobs) gets the array."""
+
+    def __init__(self, arr: mx.array, token: int, picked):
+        self._arr, self._token, self._picked = arr, token, picked
+
+    def __getitem__(self, token):
+        y, lp = self._picked
+        if (isinstance(token, int) and token == self._token
+                and y.size == 1 and y.item() == token):
+            return lp
+        return self._arr[token]
+
+    def __neg__(self):
+        return -self._arr
+
+    def __getattr__(self, name):
+        return getattr(self._arr, name)
+
+
+def _host_logprobs(responses):
+    """stream_generate's responses, each token's log-probability the one its
+    step computed (in order: generate_step samples one token ahead of the
+    one it yields)."""
+    picked = _STATE.get("picked")
+    for r in responses:
+        if picked and isinstance(r.logprobs, mx.array):
+            r.logprobs = _HostLogprobs(r.logprobs, r.token, picked.popleft())
+        yield r
+
+
 def _pipelined(dec, kwargs: dict):
     """stream_generate's responses from the pipelined decoder, for the prompt
     tokens _prefill_history left."""
@@ -518,7 +572,7 @@ def _instrumented(fn):
         last = None
         try:
             for last in (_pipelined(dec, kwargs) if dec is not None
-                         else fn(*args, **kwargs)):
+                         else _host_logprobs(fn(*args, **kwargs))):
                 yield last
         finally:
             # The server breaks out of its loop on stop conditions, which

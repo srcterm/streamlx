@@ -1,6 +1,7 @@
 """A served request's end: the prompt cache must end where the stock loop
 leaves it (after the last token out, run once), because the next turn
 continues from it. A pipelined step can have run that token already."""
+import types
 import unittest
 
 import mlx.core as mx
@@ -100,6 +101,54 @@ class RequestEnd(unittest.TestCase):
                     a = ref(mx.array([[nxt]]), cache=want)
                     b = m(mx.array([[nxt]]), cache=cache)
                     self.assertTrue(bool(mx.array_equal(a, b)))
+
+
+class TokenLogprob(unittest.TestCase):
+    """The plain path's log-probabilities for mlx-lm's server: the chosen
+    token's comes from the token's own step (the request's sampler computes
+    it), with the value an index into the array gives; other uses reach the
+    array."""
+
+    def _steps(self, dtype, n=4):
+        args = types.SimpleNamespace(temperature=0.0, top_p=1.0, top_k=0,
+                                     min_p=0.0, xtc_probability=0.0,
+                                     xtc_threshold=0.0)
+        tok = types.SimpleNamespace(eos_token_ids=[0], encode=lambda s: [1])
+        real = serve._orig_sampler
+        serve._orig_sampler = lambda a, t: (lambda lp: mx.argmax(lp, axis=-1))
+        try:
+            sampler = serve._recording_sampler(args, tok)
+        finally:
+            serve._orig_sampler = real
+        mx.random.seed(3)
+        out = []
+        for _ in range(n):               # generate_step: sample, then yield
+            x = mx.random.normal((1, 50)).astype(dtype)
+            logprobs = x - mx.logsumexp(x, keepdims=True)
+            y = sampler(logprobs)
+            mx.eval(y)
+            out.append(types.SimpleNamespace(token=y.item(),
+                                             logprobs=logprobs.squeeze(0)))
+        return out
+
+    def test_value_and_order(self):
+        for dtype in (mx.float32, mx.bfloat16):
+            steps = self._steps(dtype)
+            arrays = [s.logprobs for s in steps]
+            for r, a in zip(serve._host_logprobs(iter(steps)), arrays):
+                self.assertIsInstance(r.logprobs, serve._HostLogprobs)
+                self.assertEqual(r.logprobs[r.token].item(),
+                                 a[r.token].item())
+                other = (r.token + 1) % 50
+                self.assertEqual(r.logprobs[other].item(), a[other].item())
+                self.assertEqual((-r.logprobs).tolist(), (-a).tolist())
+                self.assertEqual(r.logprobs.shape, a.shape)
+
+    def test_without_a_recorded_step(self):
+        steps = self._steps(mx.float32, 2)
+        serve._STATE["picked"].clear()       # e.g. another generator's
+        for r in serve._host_logprobs(iter(steps)):
+            self.assertIsInstance(r.logprobs, mx.array)
 
 
 if __name__ == "__main__":
