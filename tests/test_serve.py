@@ -103,6 +103,42 @@ class RequestEnd(unittest.TestCase):
                     self.assertTrue(bool(mx.array_equal(a, b)))
 
 
+class PoolsGrowBack(unittest.TestCase):
+    """--memory-gib's pool sizing: a prompt chunk that takes less from the
+    pools than the regrow threshold must not leave a model that fits short
+    of its experts for good (it decodes from memory only while every pool
+    holds its layer's)."""
+
+    def test_whole_again(self):
+        from unittest import mock
+
+        from streamlx.integrate import pool_bytes, resize_pools
+        from streamlx.pool import all_held
+
+        ck = toy.Checkpoint()
+        self.addCleanup(ck.close)
+        _, pools = ck.streaming(8)
+        every = sum(p.n_experts * p.expert_bytes for p in pools.values())
+        resize_pools(pools, every)
+        self.assertTrue(all_held(pools))
+        state = {"pools": pools}
+        cfg = {"budget_bytes": 2 * every}
+        with mock.patch.object(serve, "_STATE", state), \
+                mock.patch.object(serve, "_CFG", cfg), \
+                mock.patch.object(serve, "_HYST", every // 8), \
+                mock.patch.object(serve, "_GROW", every):
+            serve._fit_pools(0.75 * every, "a prompt chunk")
+            self.assertFalse(all_held(pools))
+            self.assertLess(pool_bytes(pools), every)
+            # short of the regrow threshold and of every expert: as it is
+            have = pool_bytes(pools)
+            serve._fit_pools(0.9 * every, "decoding")
+            self.assertEqual(pool_bytes(pools), have)
+            # room for every expert again, still less than _GROW more
+            serve._fit_pools(1.05 * every, "decoding")
+            self.assertTrue(all_held(pools))
+
+
 class TokenLogprob(unittest.TestCase):
     """The plain path's log-probabilities for mlx-lm's server: the chosen
     token's comes from the token's own step (the request's sampler computes

@@ -190,11 +190,18 @@ def _cache_bytes(cache) -> int:
 def _fit_pools(target: float, why: str) -> None:
     """Resize every expert pool (trunk and draft head) to `target` bytes in
     all, at most --budget-gib: down by _HYST or more, up by _GROW or more
-    (a resize copies every kept slot, ~1 s for 16 GiB)."""
+    (a resize copies every kept slot, ~1 s for 16 GiB), and up by any amount
+    that lets the pools hold every expert again: a model that fits decodes
+    from memory only while they do (no host sync a layer, plain steps run
+    ahead), and a prompt chunk that took less than _GROW from them would
+    otherwise leave it reading from the drive for good."""
     pools = _STATE["pools"] or {}
     have = pool_bytes(pools)
     target = min(target, _CFG["budget_bytes"])
-    if not pools or not (have - target >= _HYST or target - have >= _GROW):
+    every = sum(p.n_experts * p.expert_bytes for p in pools.values())
+    whole = have < every <= target
+    if not pools or not (have - target >= _HYST or target - have >= _GROW
+                         or whole):
         return
     t0 = time.perf_counter()
     got = resize_pools(pools, max(target, 0))
