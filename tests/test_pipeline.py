@@ -487,6 +487,18 @@ class InklingLoop(unittest.TestCase):
                             for x, y in zip(g[1:], got[0][1:]):
                                 self.assertTrue(mx.array_equal(x, y))
 
+    def test_next_layer_links_follow_the_loop(self):
+        """Prefill reads ahead for the layer that runs next: every layer of
+        the looped toy (layers 2 and 3 run three times) points at the one
+        after it but the loop's last, which is followed by layer 2 on two
+        passes and by layer 4 on the third."""
+        m, _pools = self.ck.streaming(8)
+        ws = [layer.mlp.experts for layer in m.layers]
+        # (by identity: a module's == compares what it holds)
+        nxt = [next((i for i, v in enumerate(ws) if v is w._next), None)
+               for w in ws]
+        self.assertEqual(nxt, [1, 2, 3, None, 5, None])
+
     def test_decode_with_the_head(self):
         from streamlx.inkling2 import Inkling2LoopAdapter
         from streamlx.pipeline import BatchedDecoder

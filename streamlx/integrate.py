@@ -707,12 +707,27 @@ def install_streaming(model, model_dir: str, n_slots: int):
 
 
 def _link_next_layers(model, pools: dict) -> None:
-    """Point each streamed layer at the next streamed one for prefill
-    next-layer reads (dense layers between them see the same tokens too)."""
-    blocks = [_moe_block(model.layers[i]) for i in sorted(pools)]
-    ws = [getattr(m, _switch_name(m)) for m in blocks]
-    for a, b in itertools.pairwise(ws):
-        a._next = b
+    """Point each streamed layer at the streamed one that runs after it, for
+    prefill next-layer reads (dense layers between them see the same tokens
+    too). In the order the layers run: a looped stack (Inkling 2 Mini) goes
+    from its loop's last layer back to the loop's first on some passes and
+    on to the next layer on the last, so that layer gets no link (reads
+    queued for the layer after the loop would be held through every pass)."""
+    lm = getattr(getattr(model, "model", None), "language_model", None)
+    visits = getattr(lm, "layer_visits", None) or model.layers
+    at = {id(layer): i for i, layer in enumerate(model.layers)}
+    order = [at[id(layer)] for layer in visits if at.get(id(layer)) in pools]
+    after: dict = {}
+    for a, b in itertools.pairwise(order):
+        after.setdefault(a, set()).add(b)
+
+    def switch(i):
+        m = _moe_block(model.layers[i])
+        return getattr(m, _switch_name(m))
+
+    for a, bs in after.items():
+        if len(bs) == 1:
+            switch(a)._next = switch(next(iter(bs)))
 
 
 def _set_visits(model, pools: dict) -> None:
