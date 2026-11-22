@@ -112,6 +112,10 @@ class StreamingSwitchGLU(nn.Module):
         self._todo = None
         self._early = None
         self._hist = None
+        # The pool's slot table on the GPU while every expert is resident
+        # (_resident_slots), and the table it was made from.
+        self._slots_mx = None
+        self._slots_key = None
         # Hosts probe these to pick fused resident-tensor fast paths; None
         # sends them down the standard switch_mlp(x, indices) call.
         self.gate_proj = None
@@ -147,6 +151,18 @@ class StreamingSwitchGLU(nn.Module):
         if states:
             mx.async_eval(states)
         _PREFILL["done"] = upto
+
+    def _resident_slots(self) -> mx.array | None:
+        """With every expert of the layer resident, the slot of each expert as
+        a GPU array (rebuilt when the table changes, as a resize may move
+        experts); else None."""
+        p = self.pool
+        if not p.holds_all():
+            return None
+        key = p.slot_table.tobytes()
+        if key != self._slots_key:
+            self._slots_mx, self._slots_key = mx.array(p.slot_table), key
+        return self._slots_mx
 
     def _remap(self, idx: np.ndarray) -> np.ndarray:
         slots = self.pool.slot_table[idx]
@@ -543,6 +559,23 @@ class StreamingSwitchGLU(nn.Module):
             idx = (np.array(indices) if hint.idx is None
                    else hint.idx.reshape(indices.shape))
             return self._stream_forward(x, idx, hint.rows, w)
+        # Every expert of the layer resident (a model that fits: fill() read
+        # it whole) and a call on the per-row kernel (decode, a verify, a
+        # short chunk): the expert ids map to slots on the GPU, with no host
+        # sync, so the token's graph builds ahead of the GPU as the stock
+        # module's does. The same slots and kernel as the path below, which
+        # leaves the GPU idle while the host maps each layer's routing.
+        # Routes count as hits; the LRU order stays as it was.
+        if (hint is None and self._early is None
+                and not _stock_sorted(indices.size, self.pool.n_experts)):
+            slots = self._resident_slots()
+            if slots is not None:
+                if not decode and _PREFILL["cache"] is not None:
+                    self._own_cache_states()
+                self.pool.hits += indices.size
+                return switch_forward(x, slots[indices], self.pool.pool,
+                                      self.pool.qparams, self.pool.act,
+                                      escales=self._esc(indices), weights=w)
         t0 = time.perf_counter()
         idx = np.array(indices)  # materializes the gate's selection (sync)
         if decode:

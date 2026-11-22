@@ -240,6 +240,13 @@ def switch_forward(x: mx.array, indices: mx.array, triples: dict,
     return x.squeeze(-2)
 
 
+def all_held(pools) -> bool:
+    """Every pool holds every expert of its layer: a forward then never waits
+    on the host (each call maps its routing to slots on the GPU) and no read
+    writes a slot, so a step can be queued while the one before it runs."""
+    return bool(pools) and all(p.holds_all() for p in pools.values())
+
+
 class StreamingSwitchMLP:
     def __init__(self, model_dir: str, layer: int, n_slots: int,
                  index: SafetensorsIndex | None = None,
@@ -392,6 +399,10 @@ class StreamingSwitchMLP:
 
     def resident(self, e: int) -> bool:
         return e in self.id2slot
+
+    def holds_all(self) -> bool:
+        """Every expert of the layer resident (fill, or a model that fits)."""
+        return len(self.id2slot) >= self.n_experts
 
     def fill(self) -> int:
         """When the slots can hold every expert of the layer, read the ones
