@@ -13,7 +13,7 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 
 import toy
 from streamlx import pipeline
-from streamlx.integrate import prefill_cache
+from streamlx.integrate import prefill_cache, resize_pools
 from streamlx.pipeline import PipelinedDecoder
 from streamlx.pipeline_adapters import adapter_for
 
@@ -188,6 +188,23 @@ class OneForward(unittest.TestCase):
                     i += a
                 self.assertEqual(same, n)
                 self.assertGreater(rolled, 0)
+
+    def test_a_new_kind_of_step(self):
+        # pools resized between requests (--memory-gib) so that the steps go
+        # from one forward to streams: the self-gate's and the K controller's
+        # times, of one-forward steps, are dropped
+        m, pools = self.ck.held()
+        ad = adapter_for(m, SimpleNamespace(tap_layers=(3,)))
+        dec = PipelinedDecoder(ad, pools, [], k_max=4, plain_fn=ad.plain)
+        self.assertTrue(dec.one_forward and dec.self_gate)
+        dec._g_spt, dec._t_step = {"on": 0.02, "off": 0.03}, {4: 0.1}
+        dec._mode()                                   # the same kind: kept
+        self.assertEqual(dec._g_spt["on"], 0.02)
+        resize_pools(pools, sum(8 * p.expert_bytes for p in pools.values()))
+        dec._mode()
+        self.assertFalse(dec.one_forward)
+        self.assertEqual((dec._g_spt, dec._t_step),
+                         ({"on": None, "off": None}, {}))
 
     def test_streams_where_experts_are_read(self):
         m, pools = self.ck.streaming(8)
@@ -594,6 +611,12 @@ class CopiedDrafts(unittest.TestCase):
         # the tokens of a copy reach the head with its next draft
         self.assertGreaterEqual(dec.ad.drafter.pos, N - 13)
 
+    def test_lookup_setting(self):
+        # STREAMLX_LOOKUP: the match length, or off
+        for v, n in ((None, 3), ("", 3), ("0", 0), ("off", 0), ("False", 0),
+                     ("no", 0), ("on", 3), ("yes", 3), ("5", 5), (" 2 ", 2)):
+            self.assertEqual(pipeline._lookup_n(v), n, v)
+
     def test_counts_are_the_decode_s(self):
         # a decode's setup runs when it is called: one that ends before its
         # first id is read (a request for one token) leaves no copy counts
@@ -709,6 +732,35 @@ class Inkling2(unittest.TestCase):
                     self.assertEqual(same, n)
                     self.assertEqual(rows_same, n)
                     self.assertEqual(rolled > 0, wrong > 0)
+
+    def test_copies_within_the_rollback(self):
+        # copies as streams, no head, --draft-k past the positions whose
+        # fourth convolution state the adapter keeps for a rollback: no step
+        # takes more streams than that, and rejected copies leave plain
+        # decoding's tokens
+        import toy_inkling2 as ink
+
+        n, prompt = 48, [t % ink.VOCAB for t in toy.prompt(14)]
+        ck = ink.Checkpoint()
+        self.addCleanup(ck.close)
+        ref = ck.stock()
+        seq, _ = toy.greedy(ref, prompt, n, ref.make_cache())
+        rng = np.random.default_rng(0)
+        spoiled = prompt + [(_other(rng, t, ink.VOCAB) if i % 13 == 12 else t)
+                            for i, t in enumerate(seq)]
+        m, pools = ck.streaming(8)
+        ad = adapter_for(m, None)
+        cache = m.make_cache()
+        with prefill_cache(cache):
+            mx.eval(m(mx.array([prompt]), cache=cache))
+        dec = PipelinedDecoder(ad, pools, ad.views(cache), k_max=12,
+                               plain_fn=ad.plain, adaptive=False,
+                               self_gate=False)
+        with mock.patch.object(pipeline, "_LK_MIN", 4):
+            out = dec.generate(seq[0], None, len(prompt), n, context=spoiled)
+        self.assertEqual(out, seq[:n])
+        self.assertGreater(dec.lookup.proposed, dec.lookup.kept)   # rejected
+        self.assertLessEqual(max(dec.k_hist), ad.max_streams)
 
 
 def _has_loop() -> bool:

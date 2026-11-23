@@ -83,9 +83,13 @@ the text.
 Drafts by copy (pipeline.Lookup) need no head: where the reply repeats text
 of the conversation (a file written out again, a quoted passage, a loop) for
 eight tokens, what followed there is drafted, 16 tokens a forward for a model
-in memory, as many streams as a head's drafts for a streamed one. Every
-model gets them, one with no draft head too; --draft-head none, or
-STREAMLX_LOOKUP=0 in the environment, turns them off.
+whose experts are all in memory and for Inkling 2 Mini, as many streams as
+--draft-k for a streamed one (eight at most on Inkling 2). A model with no
+draft head, or one whose head did not load, gets them too; one whose layers
+no adapter splits (Qwen3.5/3.6's hybrid stack, HunYuan) only while its
+experts are all in memory, and one whose experts streamlx does not stream
+decodes as mlx-lm's. --draft-head none, or STREAMLX_LOOKUP=0 (or off) in the
+environment, turns them off.
 """
 
 from __future__ import annotations
@@ -566,6 +570,10 @@ def _pipelined(dec, kwargs: dict):
             if ad.offset(dec.cache) < start + n:
                 ad.plain(token, dec.cache)
                 mx.eval([c.state for c in cache])
+            # the decoder outlives the request: its cache must not, or the
+            # next request's restore and prefill run beside it, and the
+            # memory governor counts it in theirs
+            dec.cache = []
 
         try:
             for token in itertools.chain((first,), later):
@@ -695,7 +703,7 @@ class StreamingModelProvider(srv.ModelProvider):
                 if _CFG["draft_head"] != "auto":   # one that was asked for
                     raise
                 print(f"[streamlx] the checkpoint's draft head did not load "
-                      f"({type(e).__name__}: {e}): plain decoding",
+                      f"({type(e).__name__}: {e}): decoding without it",
                       file=sys.stderr)
         ad = None
         if drafter is not None:
@@ -703,7 +711,7 @@ class StreamingModelProvider(srv.ModelProvider):
             print(f"[streamlx] draft head in {time.time()-t0:.1f}s, up to "
                   f"{k} tokens " + ("a forward" if getattr(ad, "batched", 0)
                                     else "in flight"), file=sys.stderr)
-        elif _CFG["draft_head"] == "auto" and not head:
+        elif _CFG["draft_head"] == "auto":    # none, or one that did not load
             ad = headless_adapter(model, pools)    # drafts by copy alone
         if ad is not None:
             from streamlx.pipeline import PipelinedDecoder

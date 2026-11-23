@@ -16,14 +16,17 @@ template (--raw: as it is), and a checkpoint that carries a draft head
 
 A draft head decodes through streamlx.pipeline: K tokens in flight, so each
 token's expert reads overlap the others' compute; greedy output identical
-to plain decoding. A self-gate times drafting against plain decoding and
-keeps whichever is faster. DeepSeek-V4.1, Qwen3.8 and Inkling 2 carry their
-heads in the checkpoint (--draft-head <model dir> where it is not the
-default); otherwise --draft-head is an mlx-vlm block drafter's directory,
+to plain decoding, except where a step's drafts are checked in one forward
+(Inkling 2 Mini, or every expert in memory): there the text can take the
+other of two about tied tokens. A self-gate times drafting against plain
+decoding and keeps whichever is faster. DeepSeek-V4.1, Qwen3.8 and Inkling 2
+carry their heads in the checkpoint (--draft-head <model dir> where it is not
+the default); otherwise --draft-head is an mlx-vlm block drafter's directory,
 e.g. Mistral Large 4's DSpark head split out once with `python -m
 mlx_vlm.split_mtp --model <checkpoint> --output <dir> --q-bits 4`.
-Any model, with a head or none, also drafts by copy where the reply repeats
-the prompt or itself (pipeline.Lookup; --draft-head none: plain decoding).
+A model with a head or none also drafts by copy where the reply repeats the
+prompt or itself (pipeline.Lookup; which models, and how many tokens a step:
+streamlx.serve's docstring; --draft-head none: plain decoding).
 """
 
 from __future__ import annotations
@@ -113,12 +116,12 @@ def main() -> int:
             if args.draft_head != "auto":   # one that was asked for
                 raise
             print(f"[load] the checkpoint's draft head did not load "
-                  f"({type(e).__name__}: {e}): plain decoding",
+                  f"({type(e).__name__}: {e}): decoding without it",
                   file=sys.stderr)
     if drafter is not None:
         ad = adapter_for(model, drafter)
         print(f"[load] draft head in {time.time()-t0:.1f}s", file=sys.stderr)
-    elif args.draft_head == "auto" and not head:
+    elif args.draft_head == "auto":    # none, or one that did not load
         ad = headless_adapter(model, pools)    # drafts by copy alone
     # the memory limit, less what is resident, MLX's buffer cache and 2 GiB;
     # the pools take it, or every expert when that is less
@@ -157,7 +160,7 @@ def main() -> int:
             chunk = mx.array([ids[done:done + n]])
             done += n
             with prefill_cache(cache):
-                if ad is None:
+                if drafter is None:     # (no head: no context rows to keep)
                     logits = model(chunk, cache=cache)
                 else:
                     logits, h = ad.forward_taps(chunk, cache)

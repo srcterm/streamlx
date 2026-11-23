@@ -21,7 +21,7 @@ That is an OpenAI-compatible server on `http://localhost:8080/v1` for a coding a
 ![How streamlx serves a request](docs/pipeline.svg)
 
 - **Pipelined expert fetching.** A checkpoint's MTP draft head puts several tokens in flight one layer apart, so one token's expert reads hide behind the others' compute. Greedy output is unchanged, and a gate keeps plain decoding if that is faster ([paper](docs/pipelined-expert-fetching.pdf)).
-- **Lookup drafts.** Where a reply repeats text from the conversation, the tokens that followed it there are drafted and checked like a draft head's. Every model gets them, with or without a head ([below](#lookup-drafts)).
+- **Lookup drafts.** Where a reply repeats text from the conversation, the tokens that followed it there are drafted and checked like a draft head's. A model gets them with or without a draft head ([below](#lookup-drafts)).
 - **Reads overlap compute.** A missed expert is read straight into its pool slot by parallel threads while the experts already in RAM run. Prefill reads each layer's experts once per chunk, the next layer's while this one computes.
 - **Prompt cache on the SSD.** Prompts are stored as segments shared across turns and conversations; a request restores its longest stored prefix and prefills only the rest.
 - **Memory limit, on by default.** The pools shrink while a prompt chunk is prefilled and grow back for decoding, keeping MLX inside the GPU's working set.
@@ -47,7 +47,7 @@ M4 MacBook Air, 32 GB. `streamlx serve <model>` with its defaults and thinking o
 
 A coding agent's replies often repeat text that is already in the conversation: a file written out again with an edit, a function quoted back, a tool's output. streamlx indexes every three-token sequence of the prompt and of the reply so far. When the reply's last three tokens occurred earlier, and what followed them there has matched the next eight tokens the model wrote, the tokens after that are drafted from the earlier text. They are checked in one step like a draft head's, and any that the model would not have written are rolled back.
 
-On ordinary text a copy rarely holds for eight tokens, so little is drafted and decoding keeps its usual speed. A model in memory checks up to 16 copied tokens in one forward; a streamed model checks as many as its draft head puts in flight. `STREAMLX_LOOKUP=0` turns lookup drafts off.
+On ordinary text a copy rarely holds for eight tokens, so little is drafted and decoding keeps its usual speed. A model whose experts are all in memory, and Inkling 2 Mini always, checks up to 16 copied tokens in one forward; a streamed model checks as many as it has tokens in flight (`--draft-k`, at most eight on Inkling 2). A model whose layers streamlx does not split (Qwen3.5/3.6's hybrid stack) gets lookup drafts only while its experts are all in memory. `STREAMLX_LOOKUP=0` turns lookup drafts off.
 
 Decode speed on a reply that writes a file from the prompt out again with one rename:
 
@@ -72,7 +72,7 @@ Decode speed on a reply that writes a file from the prompt out again with one re
 | `--prefill-step-size` | 4096 | prefill chunk; larger chunks read fewer bytes per prompt |
 | `--tokenizer-config`, `--trust-remote-code` | | passed to the tokenizer |
 
-Requests run one at a time. `STREAMLX_KEEPALIVE=0` turns off the small GPU jobs that keep the GPU at speed while a decode waits on reads; `STREAMLX_LOOKUP=0` turns off lookup drafts.
+Requests run one at a time. `STREAMLX_KEEPALIVE=0` turns off the small GPU jobs that keep the GPU at speed while a decode waits on reads; `STREAMLX_LOOKUP=0` (or `off`) turns off lookup drafts.
 
 ## Python API
 
@@ -103,7 +103,7 @@ print(aggregate_stats(pools))      # hits, misses, fetch time
 - Apple Silicon with macOS 14 or later (MLX's requirement), one request at a time, local checkpoint directories.
 - Pipelined decoding covers greedy requests; requests that sample or ask for logprobs decode plainly.
 - On models with attention head size 256 (Qwen3.5 / 3.6), long prefills use MLX's fused attention kernel, which differs from the stock path in the last bits.
-- Drafts checked in one forward (Inkling 2 Mini's draft head; lookup drafts on any model in memory) go through other kernels than a forward of one token, so where two tokens are about tied the text can take the other one. `--draft-head none` decodes plainly.
+- Drafts checked in one forward (Inkling 2 Mini's draft head; any draft head or lookup drafts on a model whose experts are all in memory) go through other kernels than a forward of one token, so where two tokens are about tied the text can take the other one. `--draft-head none` decodes plainly.
 
 ## Notes
 

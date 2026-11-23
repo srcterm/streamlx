@@ -86,9 +86,17 @@ from .pool import KEEPALIVE, all_held, keepalive_wait
 # many they are fed (one wait for the step in flight) to bound what is held.
 _PAIRS_HELD = 256
 
-# Drafts by copy (Lookup): how many tokens must repeat to find one; 0: none
-# (STREAMLX_LOOKUP=0: the head's drafts only, plain decoding with no head).
-LOOKUP = int(os.environ.get("STREAMLX_LOOKUP", "3"))
+def _lookup_n(v: str | None) -> int:
+    """STREAMLX_LOOKUP: how many tokens must repeat to find a copy (Lookup),
+    default 3; 0, off, false or no: none (the head's drafts only, plain
+    decoding with no head). Any other word is the default."""
+    v = (v or "").strip().lower()
+    if v in ("off", "false", "no"):
+        return 0
+    return int(v) if v.isdigit() else 3
+
+
+LOOKUP = _lookup_n(os.environ.get("STREAMLX_LOOKUP"))
 # A copy is drafted from once it has predicted this many committed tokens in
 # a row. Ordinary text repeats phrases of the prompt and of itself and then
 # goes on otherwise: drafted from at once, three in four such copies were
@@ -529,14 +537,29 @@ class PipelinedDecoder:
         head, none where the adapter does not split the layers. One
         forward: 16, its rows share every weight but their experts (the
         Mini's own head at 8 a step lost 7 to 16% on ordinary text against
-        4, a held copy at 16 gained a third: F172)."""
+        4, a held copy at 16 gained a third: F172). No step as streams is
+        wider than the adapter can roll back (`max_streams`: Inkling 2).
+
+        Where the kind of step changes, the self-gate's and the K
+        controller's times, measured on the other kind, are dropped."""
         ad = self.ad
+        was = getattr(self, "one_forward", None)
         self.one_forward = getattr(ad, "verify", None) is not None and (
             getattr(ad, "batched", False) or all_held(self.pools))
         self.k_copy = self._k_copy or (
             16 if self.one_forward else self.k_max if self.k_max > 1 else 4)
+        self._streams = (None if self.one_forward
+                         else getattr(ad, "max_streams", None))
         if not self.one_forward and getattr(ad, "begin", None) is None:
             self.k_copy = 1         # layers the adapter does not split
+        elif self._streams:
+            self.k_copy = min(self.k_copy, self._streams)
+        if was is not None and was != self.one_forward:
+            self._t_step, self._t_n, self._t_last = {}, {}, {}
+            self._g_spt = {"on": None, "off": None}
+            self._g_hold_cur = self.gate_hold
+            if self.self_gate:
+                self._g_begin("off")
 
     def step(self, toks: list[int], offset: int):
         """Returns (outputs, hiddens, snaps): outputs[i] = the greedy token
@@ -770,7 +793,7 @@ class PipelinedDecoder:
         n = 1
         cur = first_tok
         pairs = [(first_hidden, first_tok)]
-        depth = self.k_max - 1
+        depth = min(self.k_max, self._streams or self.k_max) - 1
         # With every expert held a forward never waits on the host, so plain
         # steps run one ahead: the next one is built and queued on this one's
         # argmax while the GPU computes it (as mlx-lm's generate_step; same

@@ -98,6 +98,7 @@ class RequestEnd(unittest.TestCase):
                         stream=self.stream))]
                     self.assertEqual(out, seq[:n])
                     self.assertGreater(dec.draft_ok, 0)
+                    self.assertEqual(dec.cache, [])  # (the decoder lives on)
                     self.assertEqual(cache[0].offset, want[0].offset)
                     self.assertEqual(ad.offset(cache), len(PROMPT) + n)
                     a = ref(mx.array([[nxt]]), cache=want)
@@ -126,6 +127,7 @@ class RequestEnd(unittest.TestCase):
                 for _ in range(n):
                     next(gen)
                 gen.close()
+                self.assertEqual(dec.cache, [])
                 self.assertEqual(cache[1][0].offset, 3 + n)
                 self.assertEqual(ad.offset(cache), 3 + n)
 
