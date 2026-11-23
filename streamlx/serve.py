@@ -70,8 +70,12 @@ A draft head decodes greedy requests through streamlx.pipeline: K tokens in
 flight, so each token's expert reads overlap the others' compute, with plain
 decoding's output. A checkpoint that carries one (Qwen3.8, DeepSeek-V4.1,
 Inkling 2) uses it by default; --draft-head takes an mlx-vlm drafter
-directory for other models, or none for plain decoding. The self-gate's
-verdict carries across requests.
+directory for other models, or none for plain decoding. Inkling 2 Mini (a
+looped stack) checks each step's drafts in one forward instead
+(pipeline.BatchedDecoder), which pays when its experts are in memory; its
+text can then leave plain decoding's where two tokens are about tied
+(--draft-head none keeps plain's). The self-gate's verdict carries across
+requests.
 Requests that sample, process logits or ask for logprobs decode plainly. On a
 prompt-cache hit the head's context starts at the tokens this request
 prefills: drafts are verified, so that can only cost acceptance, not change
@@ -81,6 +85,7 @@ the text.
 from __future__ import annotations
 
 import argparse
+import collections
 import itertools
 import json
 import os
@@ -126,7 +131,22 @@ _orig_sampler = srv._make_sampler
 def _recording_sampler(args, tokenizer):
     # What the request asked for: stream_generate only gets the closures.
     _STATE["args"] = args
-    return _orig_sampler(args, tokenizer)
+    sampler = _orig_sampler(args, tokenizer)
+    picked = _STATE["picked"] = collections.deque(maxlen=8)
+
+    def sample(logprobs):
+        """The request's sampler, the chosen token's log-probability
+        computed with it: the step that evaluates the token evaluates it too
+        (_HostLogprobs reads it for the server)."""
+        y = sampler(logprobs)
+        if logprobs.ndim != 2 or y.ndim != 1:
+            return y
+        lp = mx.take_along_axis(logprobs, y[:, None], axis=-1)
+        y = mx.depends(y, lp)
+        picked.append((y, lp))
+        return y
+
+    return sample
 
 
 srv._make_sampler = _recording_sampler
@@ -170,11 +190,18 @@ def _cache_bytes(cache) -> int:
 def _fit_pools(target: float, why: str) -> None:
     """Resize every expert pool (trunk and draft head) to `target` bytes in
     all, at most --budget-gib: down by _HYST or more, up by _GROW or more
-    (a resize copies every kept slot, ~1 s for 16 GiB)."""
+    (a resize copies every kept slot, ~1 s for 16 GiB), and up by any amount
+    that lets the pools hold every expert again: a model that fits decodes
+    from memory only while they do (no host sync a layer, plain steps run
+    ahead), and a prompt chunk that took less than _GROW from them would
+    otherwise leave it reading from the drive for good."""
     pools = _STATE["pools"] or {}
     have = pool_bytes(pools)
     target = min(target, _CFG["budget_bytes"])
-    if not pools or not (have - target >= _HYST or target - have >= _GROW):
+    every = sum(p.n_experts * p.expert_bytes for p in pools.values())
+    whole = have < every <= target
+    if not pools or not (have - target >= _HYST or target - have >= _GROW
+                         or whole):
         return
     t0 = time.perf_counter()
     got = resize_pools(pools, max(target, 0))
@@ -412,6 +439,44 @@ class _NoLogprobs:
         return mx.array(0.0)
 
 
+class _HostLogprobs:
+    """A plain step's log-probabilities as mlx-lm's server reads them. It
+    takes the chosen token's for every token (`logprobs[token].item()`), and
+    as a new MLX op that read is handed to the GPU behind the next token's
+    step, already queued (generate_step runs one ahead), and waits for it:
+    the server then decodes at the rate of steps run in turn (a model in
+    memory lost a tenth to it). The request's sampler computed that value
+    in the token's own step (_recording_sampler), so it is at hand. Any
+    other use (a request's top logprobs) gets the array."""
+
+    def __init__(self, arr: mx.array, token: int, picked):
+        self._arr, self._token, self._picked = arr, token, picked
+
+    def __getitem__(self, token):
+        y, lp = self._picked
+        if (isinstance(token, int) and token == self._token
+                and y.size == 1 and y.item() == token):
+            return lp
+        return self._arr[token]
+
+    def __neg__(self):
+        return -self._arr
+
+    def __getattr__(self, name):
+        return getattr(self._arr, name)
+
+
+def _host_logprobs(responses):
+    """stream_generate's responses, each token's log-probability the one its
+    step computed (in order: generate_step samples one token ahead of the
+    one it yields)."""
+    picked = _STATE.get("picked")
+    for r in responses:
+        if picked and isinstance(r.logprobs, mx.array):
+            r.logprobs = _HostLogprobs(r.logprobs, r.token, picked.popleft())
+        yield r
+
+
 def _pipelined(dec, kwargs: dict):
     """stream_generate's responses from the pipelined decoder, for the prompt
     tokens _prefill_history left."""
@@ -514,7 +579,7 @@ def _instrumented(fn):
         last = None
         try:
             for last in (_pipelined(dec, kwargs) if dec is not None
-                         else fn(*args, **kwargs)):
+                         else _host_logprobs(fn(*args, **kwargs))):
                 yield last
         finally:
             # The server breaks out of its loop on stop conditions, which
@@ -589,7 +654,7 @@ class StreamingModelProvider(srv.ModelProvider):
                                 _CFG["draft_k"])
         drafter = None
         if head:
-            from streamlx.pipeline import PipelinedDecoder
+            from streamlx.pipeline import BatchedDecoder, PipelinedDecoder
             from streamlx.pipeline_adapters import adapter_for, load_drafter
 
             t0 = time.time()
@@ -603,10 +668,13 @@ class StreamingModelProvider(srv.ModelProvider):
                       file=sys.stderr)
         if drafter is not None:
             ad = adapter_for(model, drafter)
-            _STATE["decoder"] = PipelinedDecoder(ad, pools, [], k_max=k,
-                                                 plain_fn=ad.plain)
+            batched = getattr(ad, "batched", False)
+            _STATE["decoder"] = (BatchedDecoder if batched
+                                 else PipelinedDecoder)(
+                ad, pools, [], k_max=k, plain_fn=ad.plain)
             print(f"[streamlx] draft head in {time.time()-t0:.1f}s, up to "
-                  f"{k} tokens in flight", file=sys.stderr)
+                  f"{k} tokens " + ("a forward" if batched else "in flight"),
+                  file=sys.stderr)
         if auto:
             # what the memory limit leaves beside the trunk and the head is
             # the most the pools may take; they start at what the first
@@ -619,11 +687,15 @@ class StreamingModelProvider(srv.ModelProvider):
                      if lim else _CFG["budget_bytes"])
         else:
             start = _CFG["budget_bytes"]
+        t1 = time.perf_counter()
         got = resize_pools(_STATE["pools"], max(start, 2**30))
         slots = sum(p.n_slots for p in _STATE["pools"].values())
+        whole = all(p.n_slots == p.n_experts
+                    for p in _STATE["pools"].values())
         print(f"[streamlx] expert pools: {slots} slots, {got / 2**30:.1f} GiB"
-              f" (at most {_CFG['budget_bytes'] / 2**30:.1f})",
-              file=sys.stderr)
+              f" (at most {_CFG['budget_bytes'] / 2**30:.1f})"
+              + (f"; every expert read in {time.perf_counter() - t1:.1f}s"
+                 if whole else ""), file=sys.stderr)
 
         if (self.cli_args.use_default_chat_template
                 and tokenizer.chat_template is None):

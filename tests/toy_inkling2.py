@@ -2,7 +2,9 @@
 inkling2 model class (sliding windows written in place, convolution states,
 block residuals; experts in nvfp4 with a scale per expert and in affine
 4-bit), in mlx-lm's own checkpoint layout. Importing it needs an mlx-lm
-that has the model (see the README's note on Inkling 2).
+that has the model (see the README's note on Inkling 2). Checkpoint(loop=
+True) is the looped stack of Inkling 2 Mini (layers 2 and 3 run three times
+a token; needs an mlx-lm with inkling2_loop, `HAS_LOOP`).
 """
 import json
 import shutil
@@ -32,6 +34,21 @@ TEXT = dict(hidden_size=64, num_hidden_layers=6, vocab_size=256,
             mlp_up_softcap=25.0, route_scale=8.0,
             final_logit_softcapping=30.0)
 VOCAB, K = TEXT["unpadded_vocab_size"], TEXT["num_experts_per_tok"]
+LOOP = dict(core_start=2, core_end=4, num_passes=3, gate_rank=8,
+            is_varloop=False)
+# the looped toy's draft head (written as mtp.safetensors): taps at visits 2
+# and 5 and past the last of its 10 visits
+HEAD = dict(hidden_size=TEXT["hidden_size"], num_hidden_layers=2,
+            num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+            intermediate_size=128, rms_norm_eps=1e-6, rope_theta=10000.0,
+            local_layer_ids=[0], sliding_window_size=8, block_size=4,
+            markov_rank=64, markov_head_type="rnn_hidden",
+            target_layer_ids=[2, 5, 10])
+try:    # mlx-lm's layout from 11-19 (#2082): the model is a package
+    from mlx_lm.models.inkling2.config import TextArgs as _TextArgs
+except ImportError:
+    _TextArgs = getattr(stock, "TextArgs", None)
+HAS_LOOP = "loop_config" in getattr(_TextArgs, "__dataclass_fields__", {})
 NVFP4 = dict(group_size=16, bits=4, mode="nvfp4")
 AFF4 = dict(group_size=64, bits=4, mode="affine")
 DENSE = dict(group_size=32, bits=8, mode="affine")
@@ -39,9 +56,9 @@ NV_LAYERS = (0, 1, 2, 3)          # the others' experts are affine
 ROOT = "model.language_model."
 
 
-def build():
-    m = stock.Model(stock.ModelArgs(model_type="inkling2",
-                                    text_config=dict(TEXT)))
+def build(text=TEXT, model_type="inkling2"):
+    m = stock.Model(stock.ModelArgs(model_type=model_type,
+                                    text_config=dict(text)))
     keep = m.cast_predicate
     out = []
     for k, v in tree_flatten(m.parameters()):
@@ -60,6 +77,8 @@ def build():
     m.load_weights(out, strict=True)
 
     def pred(path, mod):
+        if "_message_gate." in path:          # mlx-lm keeps these dense
+            return False
         if path.endswith(("gate_up_proj", "down_proj")):
             n = int(path.split(".layers.")[1].split(".")[0])
             return (dict(NVFP4, global_scale=True) if n in NV_LAYERS
@@ -73,18 +92,30 @@ def build():
 
 
 class Checkpoint:
-    def __init__(self, seed: int = 0):
+    def __init__(self, seed: int = 0, loop: bool = False):
         mx.random.seed(seed)
         self.dir = tempfile.mkdtemp(prefix="streamlx-test-inkling2-")
+        text = dict(TEXT, loop_config=LOOP) if loop else TEXT
+        mt = "inkling2_loop" if loop else "inkling2"
         quant = dict(DENSE)
         for n in range(TEXT["num_hidden_layers"]):
             if n not in NV_LAYERS:
                 for p in ("gate_up_proj", "down_proj"):
                     quant[f"{ROOT}layers.{n}.mlp.experts.{p}"] = dict(AFF4)
         mx.save_safetensors(f"{self.dir}/model-00001-of-00001.safetensors",
-                            dict(tree_flatten(build().parameters())))
+                            dict(tree_flatten(build(text, mt).parameters())))
+        extra = {}
+        if loop:
+            from streamlx.inkling2_dspark import _Head
+
+            head = _Head(HEAD, TEXT["vocab_size"])
+            mx.save_safetensors(f"{self.dir}/mtp.safetensors", {
+                k: ((1 + 0.1 * mx.random.normal(v.shape)) if "norm" in k
+                    else 0.3 * mx.random.normal(v.shape)).astype(mx.bfloat16)
+                for k, v in tree_flatten(head.parameters())})
+            extra["mtp_config"] = HEAD
         with open(f"{self.dir}/config.json", "w") as f:
-            json.dump({"model_type": "inkling2", "text_config": TEXT,
+            json.dump({**extra, "model_type": mt, "text_config": text,
                        "quantization": quant,
                        "vision_config": {"hidden_size": 32}}, f)
 

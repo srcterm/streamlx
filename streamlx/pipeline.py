@@ -69,7 +69,12 @@ from types import SimpleNamespace
 import mlx.core as mx
 import numpy as np
 
-from .pool import KEEPALIVE, keepalive_wait
+from .pool import KEEPALIVE, all_held, keepalive_wait
+
+# While drafting is off and plain steps run ahead (decode), the committed
+# pairs wait for the head's next draft instead of a feed per token; past this
+# many they are fed (one wait for the step in flight) to bound what is held.
+_PAIRS_HELD = 256
 
 # -- generic cache snapshot ---------------------------------------------------
 
@@ -177,10 +182,11 @@ class PipelinedDecoder:
         self.pools = pools
         self.cache = cache
         # plain_fn(tok, cache) -> (logits [1,1,V], hidden): the host's own
-        # one-token forward. A step with no drafts to launch runs through it
-        # instead of a lone K=1 pipeline step (which would compute nothing
-        # while its experts are read). The hidden must be what the adapter's
-        # draft() consumes.
+        # one-token forward, tok an id or the step before's argmax still
+        # being computed (a step queued ahead: _plain_queue). A step with no
+        # drafts to launch runs through it instead of a lone K=1 pipeline
+        # step (which would compute nothing while its experts are read). The
+        # hidden must be what the adapter's draft() consumes.
         self.plain_fn = plain_fn
         # Self-gate: the pipeline pays only when fetch is a fraction of the
         # step and the drafter is byte-cheap and confident; elsewhere
@@ -257,6 +263,13 @@ class PipelinedDecoder:
         self._t_clock = 0
         self._warm = self._warm_gate = 0          # steps since sequence start
         self._stale_drafter = False               # gated off with no feed
+        # every expert held (decode): a drafted step that loses costs at most
+        # about a plain step and a half, not seconds of reads, so a drafting
+        # probe runs to its end: cut after gate_min steps, one that began on
+        # less predictable text (a docstring before the code) misjudged the
+        # arm, the more so as plain steps that run ahead are cheaper
+        self._held = False
+        self._built = 0.0             # host seconds building the last queued
         # A stream's misses are read straight into pool slots and computed
         # from the pool like its resident experts. A slot is given up during
         # a step only by an expert that neither this step's streams nor the
@@ -511,10 +524,31 @@ class PipelinedDecoder:
         t0 = time.perf_counter()
         logits, hidden = self.plain_fn(tok, self.cache)
         mx.eval(logits)
+        self._plain_done(time.perf_counter() - t0)
+        return int(mx.argmax(logits[0, -1]).item()), logits, hidden
+
+    def _plain_queue(self, tok):
+        """A plain step on `tok` (an id, or the step before's argmax still
+        being computed), queued on the GPU and not waited on: (argmax,
+        hidden)."""
+        t0 = time.perf_counter()
+        logits, hidden = self.plain_fn(tok, self.cache)
+        nxt = mx.argmax(logits[0, -1])
+        self._built = time.perf_counter() - t0      # the host's build
+        mx.async_eval(nxt, *([] if hidden is None else [hidden]))
+        return nxt, hidden
+
+    def _plain_next(self, depth: int) -> bool:
+        """The next step is plain whatever the head has: nothing drafts."""
+        return depth <= 0 or not self.drafting or self._stale_drafter
+
+    def _plain_done(self, dt: float, charge: bool = True) -> None:
         self.plain_steps += 1
         self.k_hist[1] = self.k_hist.get(1, 0) + 1
-        self._gate_account(time.perf_counter() - t0, 1)
-        return int(mx.argmax(logits[0, -1]).item()), logits, hidden
+        if charge:
+            self._gate_account(dt, 1)
+        else:
+            self._g_draft = 0.0
 
     def _gate_account(self, dt: float, tokens: int) -> None:
         """Charge `dt` seconds, plus the step's draft (or feed) time, for
@@ -548,7 +582,8 @@ class PipelinedDecoder:
         spt = self._g_t / max(self._g_tok, 1)
         other = self._g_spt[self._other()]
         early = (other is not None and self._g_n >= self.gate_min
-                 and spt > other * (1.0 + self.gate_early))
+                 and spt > other * (1.0 + self.gate_early)
+                 and not (self._held and self._g_phase == "on"))
         if self._g_n >= self.gate_probe or early:
             self._g_spt[self._g_phase] = spt
             on, off = self._g_spt["on"], self._g_spt["off"]
@@ -597,7 +632,8 @@ class PipelinedDecoder:
         """generate() one token at a time: yields the ids after first_tok. A
         server stops reading wherever a request ends, so however this ends,
         closed early included, the cache ends just after the last id out when
-        a later stream of its step ran it, else just before it."""
+        a later stream of its step, or a plain step queued after it, ran it,
+        else just before it."""
         self._warm = self._warm_gate = 0           # a sequence's cold steps
         if first_tok in stop:
             return
@@ -605,11 +641,50 @@ class PipelinedDecoder:
         cur = first_tok
         pairs = [(first_hidden, first_tok)]
         depth = self.k_max - 1
+        # With every expert held a forward never waits on the host, so plain
+        # steps run one ahead: the next one is built and queued on this one's
+        # argmax while the GPU computes it (as mlx-lm's generate_step; same
+        # ids). The committed pairs then wait for the head's next draft,
+        # which takes any number, instead of a feed per token, whose eval
+        # would wait behind the step in flight. Not where the forward reads
+        # the token on the host (plain_lazy): building the next step would
+        # wait for this one, and the gate, which is charged the build on top
+        # of the step, would count the step twice.
+        ahead = (self.plain_fn is not None and all_held(self.pools)
+                 and getattr(self.ad, "plain_lazy", True))
+        self._held = ahead
+        pend = None                    # (argmax, hidden) queued on `cur`
         while n < n_tokens:
-            drafts, conf = self._draft_for(pairs, depth)
-            pairs = []
+            drafts, conf = [], []
+            queued = pend is not None
+            if depth <= 0:
+                pairs = []                          # no head to keep exact
+            elif queued or (ahead and self._plain_next(depth)):
+                if len(pairs) >= _PAIRS_HELD:
+                    self._feed(pairs)
+                    pairs = []
+            else:
+                drafts, conf = self._draft_for(pairs, depth)
+                pairs = []
             if not drafts and self.plain_fn is not None:
-                nxt, _lg, h = self.plain_step(cur)
+                if ahead:
+                    t0 = time.perf_counter()
+                    tok, h = pend if queued else self._plain_queue(cur)
+                    self._built = 0.0
+                    pend = (self._plain_queue(tok) if self._plain_next(depth)
+                            and n + 1 < n_tokens else None)
+                    nxt = int(tok.item())
+                    # The gate is charged what the step costs without running
+                    # ahead (plus the next one's build, hidden here): with
+                    # the arms some percent apart, its probes, on different
+                    # stretches of text, cannot resolve the overlap's tenth,
+                    # and charged as it runs the plain arm took code text
+                    # from drafting at a loss (F170). A step queued before
+                    # the gate re-armed drafting is neither arm's rate.
+                    self._plain_done(time.perf_counter() - t0 + self._built,
+                                     charge=not (queued and self.drafting))
+                else:
+                    nxt, _lg, h = self.plain_step(cur)
                 self.steps += 1
                 pairs.append((h, nxt))
                 n += 1
@@ -752,19 +827,7 @@ class PipelinedDecoder:
         if depth <= 0 or not tok_pairs:
             return [], []
         if not self.drafting:
-            # gated OFF: no head call, no stage bytes — but the head's own
-            # cache must stay exact for when the gate re-arms, so feed it
-            # the committed pairs without proposing (adapters that cannot
-            # feed silently just re-prime on the next prefill)
-            feed = getattr(self.ad, "feed_pairs", None)
-            if feed is not None:
-                t0 = time.perf_counter()
-                feed(tok_pairs)
-                dt = time.perf_counter() - t0
-                self.t_draft += dt
-                self._g_draft = dt          # this arm's cost as it runs
-            else:
-                self._stale_drafter = True
+            self._feed(tok_pairs)
             return [], []
         if self._stale_drafter:
             return [], []
@@ -777,6 +840,21 @@ class PipelinedDecoder:
             K = self._choose_k(conf)
             return drafts[:K - 1], conf[:K - 1]
         return drafts, conf
+
+    def _feed(self, pairs) -> None:
+        """Gated OFF: no head call, no stage bytes, but the head's own cache
+        must stay exact for when the gate re-arms, so feed it the committed
+        pairs without proposing (adapters that cannot feed silently just
+        re-prime on the next prefill)."""
+        feed = getattr(self.ad, "feed_pairs", None)
+        if feed is None:
+            self._stale_drafter = True
+            return
+        t0 = time.perf_counter()
+        feed(pairs)
+        dt = time.perf_counter() - t0
+        self.t_draft += dt
+        self._g_draft = dt                  # this arm's cost as it runs
 
     def stats(self) -> dict:
         return {
@@ -804,3 +882,37 @@ class PipelinedDecoder:
             },
         }
 
+
+
+class BatchedDecoder(PipelinedDecoder):
+    """Speculative decoding with each step's drafts checked in ONE forward of
+    all its tokens, the model's own code over K positions: for a model held
+    in memory that costs well under K forwards of a token (each weight is
+    read once for all of them), where the pipelined streams above only pay
+    when there are expert reads to hide. The adapter runs the forward and
+    rolls the caches back to the tokens accepted:
+        verify(toks, cache) -> (logits [1, K, V], draft rows [1, K, ...],
+                                record)
+        rollback(cache, record, keep)
+    Drafting, the adaptive K, the self-gate against plain decoding and the
+    decode loop are the pipelined decoder's. Unlike the streams above, this
+    is not plain decoding bit for bit: a forward of K tokens computes each
+    one through other kernels than a forward of one (matrix products,
+    attention), so logits differ in their last bits, as in stock's own
+    chunked prefill, and where plain's best two tokens are about tied the
+    text can take the other (Inkling 2 Mini: after some tens of tokens on a
+    long prompt; identical on short ones)."""
+
+    def step(self, toks: list[int], offset: int):
+        logits, rows, rec = self.ad.verify(toks, self.cache)
+        outs = mx.argmax(logits[0], axis=-1)
+        mx.eval(outs, [] if rows is None else rows)
+        return (outs.tolist(), [None if rows is None else rows[:, i:i + 1]
+                                for i in range(len(toks))], rec)
+
+    def rollback(self, rec, a: int) -> None:
+        if rec is None:
+            return
+        t0 = time.perf_counter()
+        self.ad.rollback(self.cache, rec, a)
+        self.t_rollback += time.perf_counter() - t0

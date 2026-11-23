@@ -35,6 +35,15 @@ _NORM2 = ("post_attention_layernorm", "ffn_norm", "ln_2", "pre_mlp_layernorm")
 _MLP = ("mlp", "ffn", "feed_forward", "block_sparse_moe")
 
 
+def token_ids(tok) -> mx.array:
+    """[1, 1] ids of one token for a plain step: an id, or the step before's
+    argmax still being computed (a step queued ahead; the pipeline's
+    _plain_queue)."""
+    if isinstance(tok, mx.array):
+        return tok.reshape(1, 1).astype(mx.int32)
+    return mx.array([[tok]])
+
+
 def _pick(obj, names, what):
     for n in names:
         if getattr(obj, n, None) is not None:
@@ -61,6 +70,11 @@ class StandardMoEAdapter:
     # begin() routes with the block's own code (the switch stub), so the
     # pipeline may hand that routing to the block's switch call in finish()
     exact_routing = True
+    # plain() takes a token id still being computed without waiting for it
+    # (the decoder may then queue a plain step on the one before's argmax);
+    # False where the forward reads the id on the host (embedding rows
+    # looked up from the SSD)
+    plain_lazy = True
 
     def __init__(self, model, drafter=None):
         self.model = model
@@ -164,12 +178,13 @@ class StandardMoEAdapter:
             return h
         return mx.concatenate([pos.taps[i] for i in self.tap_layers], axis=-1)
 
-    def plain(self, tok: int, cache):
-        """The model's own one-token forward: the pipeline's plain_fn.
-        Returns (logits, the hidden draft_hidden gives)."""
+    def plain(self, tok, cache):
+        """The model's own one-token forward: the pipeline's plain_fn (tok an
+        id or a queued step's argmax, token_ids). Returns (logits, the hidden
+        draft_hidden gives)."""
         want = self.tap_layers or (len(self.layers) - 1,)
         with capture_layer_outputs(self.model, want) as got:
-            logits = self.model(mx.array([[tok]]), cache=cache)
+            logits = self.model(token_ids(tok), cache=cache)
         if not self.taps:
             return logits, got[want[0]][-1]
         return logits, mx.concatenate([got[i][-1] for i in self.tap_layers],
@@ -258,6 +273,19 @@ class MistralLarge4Adapter(StandardMoEAdapter):
 def adapter_for(model, drafter=None):
     """The pipeline adapter for `model`'s decoder shape."""
     mt = getattr(getattr(model, "args", None), "model_type", None)
+    lm = getattr(getattr(model, "model", None), "language_model", None)
+    visits = getattr(lm, "layer_visits", None)
+    if visits is not None and len(visits) != len(model.layers):
+        # a looped stack (Inkling 2 Mini) runs some layers more than once a
+        # token, with caches and inputs of each pass: its drafts are checked
+        # in one forward of the model's own (pipeline.BatchedDecoder)
+        if mt != "inkling2_loop":
+            raise NotImplementedError(
+                f"draft heads do not support looped models ({mt}): "
+                "serve it with --draft-head none")
+        from .inkling2 import Inkling2LoopAdapter
+
+        return Inkling2LoopAdapter(model, drafter)
     if mt == "mistral_large4":
         return MistralLarge4Adapter(model, drafter)
     if mt == "deepseek_v41":
@@ -418,7 +446,8 @@ def _vlm_target(model, cfg):
 
 # Model types whose checkpoints carry their own draft head, and the tokens in
 # flight that suit it.
-HEAD_K = {"qwen4_exp": 3, "deepseek_v41": 6, "inkling2": 3}
+HEAD_K = {"qwen4_exp": 3, "deepseek_v41": 6, "inkling2": 3,
+          "inkling2_loop": 4}
 
 
 def checkpoint_head(model_dir) -> str | None:
@@ -481,7 +510,7 @@ def load_drafter(path: str, model, reader=None):
         from .deepseek_v41_dspark import V41DSpark
 
         return V41DSpark(model, path, reader.index, reader)
-    if mt == "inkling2":
+    if mt in ("inkling2", "inkling2_loop"):
         from .inkling2_dspark import Inkling2Draft
 
         return Inkling2Draft(model, path)

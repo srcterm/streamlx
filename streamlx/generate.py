@@ -48,6 +48,8 @@ from streamlx.integrate import (
     prefill_plan,
     resize_pools,
 )
+from streamlx.pipeline_adapters import token_ids
+from streamlx.pool import all_held
 
 PREFILL_STEP = 4096
 
@@ -118,7 +120,9 @@ def main() -> int:
     # the pools take it, or every expert when that is less
     room = (budget_within(memory_limit(), pools, reserve=4 * 2**30)
             if auto else int(args.budget_gib * 2**30))
-    budget = resize_pools(pools, room)
+    # (sized, not read yet: a prompt whose chunks need the pools smaller
+    # would drop what was read and read it again after the prefill)
+    budget = resize_pools(pools, room, fill=False)
     print(f"machine RAM: {ram:.0f} GB  |  expert budget: "
           f"{budget / 2**30:.1f} GiB\n")
 
@@ -142,6 +146,8 @@ def main() -> int:
                       f" expert pools {got / 2**30:.1f} GiB", file=sys.stderr)
         else:
             sizes, pre = prefill_chunks(len(ids), PREFILL_STEP), budget
+        if pre >= budget:      # the pools stay: what fits whole is read now
+            resize_pools(pools, room)
         done = 0
         for n in sizes:
             chunk = mx.array([ids[done:done + n]])
@@ -172,7 +178,7 @@ def main() -> int:
         t0 = time.time()
         dec = None
         if drafter is not None:
-            from streamlx.pipeline import PipelinedDecoder
+            from streamlx.pipeline import BatchedDecoder, PipelinedDecoder
 
             hidden = mx.concatenate(context, axis=1)
             del context
@@ -180,19 +186,35 @@ def main() -> int:
             drafter.prime_pairs(hidden[:, :-1],
                                 mx.array([ids[1:]], dtype=mx.int32))
             # plain_fn arms the self-gate: drafting only while it is faster
-            dec = PipelinedDecoder(ad, pools, ad.views(cache),
-                                   k_max=draft_k, plain_fn=ad.plain)
+            cls = (BatchedDecoder if getattr(ad, "batched", False)
+                   else PipelinedDecoder)
+            dec = cls(ad, pools, ad.views(cache), k_max=draft_k,
+                      plain_fn=ad.plain)
             emit(first)
             out = dec.generate(first, hidden[:, -1:], len(ids),
                                args.max_tokens, on_token=emit, stop=eos)
         else:
-            out, tok = [first], first
+            def queue(t):
+                """The forward of `t` (an id, or the step before's argmax
+                still being computed), queued: its argmax."""
+                y = mx.argmax(model(token_ids(t), cache=cache)[0, -1])
+                mx.async_eval(y)
+                return y
+
+            # every expert held: a forward never waits on the host, so the
+            # next one is queued on this one's argmax while the GPU computes
+            # it (as mlx-lm's generate_step; same ids)
+            ahead = all_held(pools)
+            out, tok, y = [first], first, None
             emit(first)
             while len(out) < args.max_tokens and tok not in eos:
-                logits = model(mx.array([[tok]]), cache=cache)
-                tok = int(mx.argmax(logits[0, -1]).item())
+                y = queue(tok) if y is None else y
+                nxt = (queue(y) if ahead and len(out) + 1 < args.max_tokens
+                       else None)
+                tok = int(y.item())
                 out.append(tok)
                 emit(tok)
+                y = nxt
         n = len([t for t in out if t not in eos])
         detok.finalize()
         print(detok.last_segment)

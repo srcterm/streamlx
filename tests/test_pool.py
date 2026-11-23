@@ -1,5 +1,6 @@
 """A failed expert read must leave no expert resident: an expert is in a
-pool only once its bytes are."""
+pool only once its bytes are. Pools that can hold every expert read them all
+when sized, and decoding then reads nothing."""
 import errno
 import os
 import unittest
@@ -9,8 +10,10 @@ import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache
 
 import toy
+from streamlx.integrate import StreamingSwitchGLU, resize_pools
 from streamlx.pipeline import PipelinedDecoder
 from streamlx.pipeline_adapters import adapter_for
+from streamlx.pool import all_held
 
 N, PROMPT = 24, toy.prompt()
 
@@ -96,6 +99,69 @@ class ReadFailure(unittest.TestCase):
                 self.assertEqual(same, N)
                 self.assertEqual(toy.wrong_slots(self.ck.ref, pools), [])
 
+
+
+class WholeModel(unittest.TestCase):
+    """resize_pools with room for every expert reads them all (fill): the
+    model is read whole up front, as a resident load reads it, decoding then
+    reads nothing, maps its routing to slots on the GPU (no host sync) and
+    gives the stock logits bit for bit. Pools short of their experts read
+    nothing up front."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ck = toy.Checkpoint()
+        cls.seq, cls.want = toy.greedy(cls.ck.ref, PROMPT, N)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ck.close()
+
+    def test_fits(self):
+        m, pools = self.ck.streaming(8)
+        reader = next(iter(pools.values())).reader
+        every = sum(p.n_experts * p.expert_bytes for p in pools.values())
+        b0 = reader.bytes_read
+        resize_pools(pools, every)
+        self.assertEqual(reader.bytes_read - b0, every)
+        for p in pools.values():
+            self.assertEqual(sorted(p.id2slot), list(range(p.n_experts)))
+            self.assertEqual(p.misses, 0)
+        self.assertTrue(all_held(pools))
+        self.assertEqual(toy.wrong_slots(self.ck.ref, pools), [])
+        b1 = reader.bytes_read
+        # no call's routing goes through the host
+        with mock.patch.object(StreamingSwitchGLU, "_remap",
+                               side_effect=AssertionError("host remap")):
+            seq, logits = toy.greedy(m, PROMPT, N)
+        self.assertEqual(reader.bytes_read, b1)
+        self.assertEqual(seq, self.seq)
+        for got, want in zip(logits, self.want):
+            self.assertTrue(mx.array_equal(got, want))
+
+    def test_sized_without_reading(self):
+        """fill=False sizes the pools and reads nothing (a size about to
+        change); the next sizing reads."""
+        _, pools = self.ck.streaming(8)
+        reader = next(iter(pools.values())).reader
+        every = sum(p.n_experts * p.expert_bytes for p in pools.values())
+        b0 = reader.bytes_read
+        self.assertEqual(resize_pools(pools, every, fill=False), every)
+        self.assertEqual(reader.bytes_read, b0)
+        self.assertFalse(all_held(pools))
+        resize_pools(pools, every)
+        self.assertEqual(reader.bytes_read - b0, every)
+        self.assertTrue(all_held(pools))
+
+    def test_short(self):
+        _, pools = self.ck.streaming(8)
+        reader = next(iter(pools.values())).reader
+        every = sum(p.n_experts * p.expert_bytes for p in pools.values())
+        b0 = reader.bytes_read
+        resize_pools(pools, every // 2)
+        self.assertEqual(reader.bytes_read, b0)
+        self.assertTrue(all(p.n_slots < p.n_experts for p in pools.values()))
+        self.assertFalse(all_held(pools))
 
 if __name__ == "__main__":
     unittest.main()

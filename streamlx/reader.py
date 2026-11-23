@@ -210,6 +210,9 @@ class ExpertReader:
         """A tensor with one value per expert (nvfp4's global_scale), read
         whole the first time and kept."""
         v = self._vectors.get(loc.name)
+        if v is None and loc.derived:
+            raise RuntimeError(f"{loc.name}: its values are computed at load "
+                               "and were not handed to the reader")
         if v is None:
             n = loc.shape[0] * loc.row_stride
             raw = os.pread(self._fd(loc.path), n, loc.abs_start)

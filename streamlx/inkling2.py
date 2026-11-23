@@ -1,12 +1,13 @@
 """Inkling 2 through mlx-lm's inkling2: the loader for an oQ export.
 
 mlx-lm builds the model. A checkpoint saved in mlx-lm's own layout
-(mlx-community's conversions) needs nothing from here. The published source
-checkpoint does not stream: mlx-lm loads it, but its expert tensors
-(`w13_weight` / `w2_weight`, their scales derived at load) are not what the
-shard index reads, so convert it with mlx-lm first. An oQ export stores the
-same weights under oMLX's runtime layout, which `load_inkling2` maps onto
-mlx-lm's parameter tree without requantizing:
+(mlx-community's conversions) needs nothing from here, nor does a published
+source checkpoint (Inkling 2 Mini's): the shard index reads its experts
+(`w13_weight` / `w2_weight`, NVFP4 or MXFP8) with their bytes as they are,
+and the global scale mlx-lm derives from them at load comes from the stock
+module. An oQ export stores the same weights under oMLX's runtime layout,
+which `load_inkling2` maps onto mlx-lm's parameter tree without
+requantizing:
   - renames (attn -> self_attn, mlp.router_weight -> mlp.gate.weight, ...);
   - the attention projections oQ stacks row-wise into one quantized matrix,
     split back by rows (a row keeps its own scales and biases, so a slice
@@ -14,25 +15,36 @@ mlx-lm's parameter tree without requantizing:
       sliding layers  attn.in_proj = q | k | v | r | gate | sink
       full layers     attn.q_proj  = q | r | gate | sink
                       attn.k_proj  = k | k_sconv.weight_proj   (v likewise)
-  - conv weights and attention-residual queries reshaped.
+  - conv weights and attention-residual queries reshaped;
+  - the looped layers' message gates (the Mini's), stacked over the four
+    inputs a gate feeds (query, key, value, mlp): loop_down [4, 2, dims,
+    rank] = each gate's down_proj, transposed and split into the hidden
+    state's and the message's halves; loop_gain_forget [4, rank, 2 * dims]
+    = its message_gate_proj | forget_gate_proj, transposed; and the layer's
+    four message queries, loop_message.query [4, dims] (one row of mlx-lm's
+    message_input).
 The routed experts (w13 = gate and up in one projection, w2 = down) keep
-their bytes. mlx-lm reads every module's bits, group size and mode off its
+their bytes (NVFP4 ones with their global scale). mlx-lm reads every module's bits, group size and mode off its
 packed shapes, so the export's quantization table needs no translation.
 Text only: the vision tower is not built and its tensors are dropped.
 
 Also the pipeline's adapter for the model (`Inkling2Adapter`): its layers
 pass the residual blocks along and store four convolution states, the last
-one after the expert call.
+one after the expert call. The looped Mini's (`Inkling2LoopAdapter`) checks
+a step's drafts in one forward of mlx-lm's own loop instead.
 """
 from __future__ import annotations
 
+import inspect
 import re
+import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import mlx.core as mx
 
 from .pipeline import snapshot_cache
-from .pipeline_adapters import StandardMoEAdapter, capture_layer_outputs
+from .pipeline_adapters import StandardMoEAdapter, capture_layer_outputs, token_ids
 
 _LAYER = re.compile(r"^model\.layers\.(\d+)\.(.+)$")
 _ROOT = "model.language_model."
@@ -64,6 +76,8 @@ _CONVS = {"attn.k_conv": "self_attn.k_sconv.conv1d.weight",
 # [n, dims] -> [dims] for one query, as it is for a full layer's three
 _QUERIES = {"attn_input.query": "attention_input.query",
             "mlp_input.query": "mlp_input.query"}
+# a looped layer's four message gates, in the order oQ stacks them
+_GATES = ("q", "k", "v", "mlp")
 
 
 def _splits(text: dict, sliding: bool) -> dict:
@@ -88,7 +102,7 @@ def from_oq_export(weights: dict, text: dict) -> dict:
     """An oQ export's tensors under mlx-lm's names (text model only). `text`
     is the checkpoint's text_config."""
     local = set(text["local_layer_ids"])
-    out = {}
+    out, messages = {}, {}
     for key, v in weights.items():
         if key.startswith("vision_tower."):
             continue
@@ -118,19 +132,36 @@ def from_oq_export(weights: dict, text: dict) -> dict:
             out[pre + _CONVS[rest]] = v[..., None]
         elif rest in _QUERIES:
             out[pre + _QUERIES[rest]] = v.reshape(-1) if v.shape[0] == 1 else v
+        elif rest == "loop_down":
+            for i, g in enumerate(_GATES):
+                out[f"{pre}{g}_message_gate.down_proj.weight"] = (
+                    v[i].reshape(-1, v.shape[-1]).T)
+        elif rest == "loop_gain_forget":
+            dims = v.shape[-1] // 2
+            for i, g in enumerate(_GATES):
+                out[f"{pre}{g}_message_gate.message_gate_proj.weight"] = (
+                    v[i, :, :dims].T)
+                out[f"{pre}{g}_message_gate.forget_gate_proj.weight"] = (
+                    v[i, :, dims:].T)
+        elif rest == "loop_message.query":
+            messages[n] = v
         else:
             new = next((n_ + rest[len(o):] for o, n_ in _RENAMES.items()
                         if rest.startswith(o)), None)
             if new is None:
                 raise ValueError(f"unmapped Inkling 2 tensor {key}")
             out[pre + new] = v
+    if messages:
+        # the looped layers in order: message_input.query [layers, 4, dims]
+        out[_ROOT + "message_input.query"] = mx.stack(
+            [messages[n] for n in sorted(messages)])
     return out
 
 
 def is_oq_export(cfg: dict) -> bool:
-    """Whether an inkling2 checkpoint is in oQ's layout (its quantization
-    table names oQ's modules)."""
-    return (cfg.get("model_type") == "inkling2"
+    """Whether an inkling2 checkpoint (the Mini's: inkling2_loop) is in oQ's
+    layout (its quantization table names oQ's modules)."""
+    return (cfg.get("model_type") in ("inkling2", "inkling2_loop")
             and "model.embed" in (cfg.get("quantization") or {}))
 
 
@@ -204,6 +235,10 @@ class Inkling2Adapter(StandardMoEAdapter):
         # id past the stack, the model's final normalized output
         self.tap_layers = tuple(getattr(drafter, "tap_layers", None) or ())
         self.taps = frozenset(self.tap_layers)
+        # mlx-lm's looped Inkling 2 (#2086) hands _self_attention the loop's
+        # messages too; a stack without a loop passes none
+        sa = inspect.signature(type(self.layers[0])._self_attention)
+        self._no_messages = (None,) if "messages" in sa.parameters else ()
         self._dated = {}     # layer -> the snapshot its next begin() dates
         self._late = {}      # layer -> {position: its fourth conv state}
 
@@ -270,7 +305,8 @@ class Inkling2Adapter(StandardMoEAdapter):
         inputs = None
         if layer.attention_input is not None:
             inputs = layer.attention_input(pos.blocks, normed)
-        x = layer._self_attention(h, inputs, entry, win, ctx)
+        x = layer._self_attention(h, inputs, entry, win, ctx,
+                                  *self._no_messages)
         x, win[2] = layer.post_attention_convolution(x, win[2], ctx)
         res = x = x.astype(mx.float32)
         blocks = pos.blocks
@@ -318,8 +354,8 @@ class Inkling2Adapter(StandardMoEAdapter):
                                for i in self.tap_layers], axis=-1)
 
     # -- the model's own forward -------------------------------------------
-    def plain(self, tok: int, cache):
-        return self.forward_taps(mx.array([[tok]]), [v.entry for v in cache])
+    def plain(self, tok, cache):
+        return self.forward_taps(token_ids(tok), [v.entry for v in cache])
 
     def forward_taps(self, ids, cache):
         """The model's logits plus the head's context for every position: the
@@ -335,3 +371,104 @@ class Inkling2Adapter(StandardMoEAdapter):
         return logits, mx.concatenate(
             [mx.concatenate(got[i - 1], axis=1) if i < n else hidden
              for i in self.tap_layers], axis=-1)
+
+
+class Inkling2LoopAdapter(Inkling2Adapter):
+    """The adapter for mlx-lm's looped Inkling 2 (Mini: layers 6 to 17 run
+    three times a token, each pass with caches of its own). Its drafts are
+    checked in one forward of the step's tokens (pipeline.BatchedDecoder),
+    mlx-lm's own loop: verify() runs it and records every convolution window
+    the layers build, rollback() takes a rejected draft's rows off the KV
+    caches and each convolution state from its window, at the last token
+    kept. A draft head's taps count layer visits: the residual entering
+    visit t, past the last visit the model's final normalized output."""
+    batched = True
+
+    def __init__(self, model, drafter=None):
+        super().__init__(model, drafter)
+        self.n_visits = len(self.lm.layer_visits)
+        self._classes = {type(layer) for layer in self.layers}
+        # the module whose _conv_state the layers call
+        self._module = sys.modules[type(self.layers[0]).__module__]
+        self._want = {t - 1 for t in self.tap_layers if t < self.n_visits}
+
+    @contextmanager
+    def _recording(self, windows=None):
+        """During the forward inside: {visit: its output} for the visits the
+        taps read and, appended to `windows`, every convolution window in
+        the order the layers build them (four a visit)."""
+        orig = {c: c.__call__ for c in self._classes}
+        outs, count, want = {}, [0], self._want
+
+        def wrap(f):
+            def call(layer, *a, **kw):
+                res = f(layer, *a, **kw)
+                if count[0] in want:
+                    outs[count[0]] = res[0]
+                count[0] += 1
+                return res
+            return call
+
+        conv_state = self._module._conv_state
+
+        def recorded(window, lengths, n):
+            windows.append(window)
+            return conv_state(window, lengths, n)
+
+        for c, f in orig.items():
+            c.__call__ = wrap(f)
+        if windows is not None:
+            self._module._conv_state = recorded
+        try:
+            yield outs
+        finally:
+            for c, f in orig.items():
+                c.__call__ = f
+            self._module._conv_state = conv_state
+
+    def forward_taps(self, ids, cache, windows=None):
+        """The model's logits plus the head's rows for every position."""
+        if not self.taps and windows is None:
+            return self.logits(self.lm(ids, cache=cache)), None
+        with self._recording(windows) as got:
+            hidden = self.lm(ids, cache=cache)
+        logits = self.logits(hidden)
+        if not self.taps:
+            return logits, None
+        return logits, mx.concatenate(
+            [got[t - 1] if t < self.n_visits else hidden
+             for t in self.tap_layers], axis=-1)
+
+    def verify(self, toks, views):
+        """The step's tokens through the model in one forward: (logits
+        [1, K, V], the head's rows [1, K, ...], what rollback() needs)."""
+        windows = []
+        logits, rows = self.forward_taps(mx.array([toks]),
+                                         [v.entry for v in views], windows)
+        return logits, rows, SimpleNamespace(windows=windows, n=len(toks))
+
+    def rollback(self, views, rec, keep: int) -> None:
+        """Keep only the step's first `keep` tokens in the caches. A window
+        (RotatingKVCache) holds its rows in order after a forward of several
+        tokens, the new ones last, so they come off its end; every cache
+        holds the rows that the next token's window reaches back to."""
+        r = rec.n - keep
+        if r <= 0:
+            return
+        if len(rec.windows) != 4 * len(views):
+            raise RuntimeError(
+                f"Inkling 2 rollback: {len(rec.windows)} convolution windows "
+                f"for {len(views)} layer visits (mlx-lm's layer changed?)")
+        n = self._keep
+        for v in views:
+            kv, conv = v.entry[0], v.entry[1]
+            if conv.lengths is not None:
+                raise RuntimeError("Inkling 2 rollback: a batched cache")
+            kv.offset -= r
+            if hasattr(kv, "max_size"):
+                kv._idx -= r
+                kv.keys = kv.keys[..., :kv._idx, :]
+                kv.values = kv.values[..., :kv._idx, :]
+            conv.cache = [w[:, keep:keep + n]
+                          for w in rec.windows[4 * v.layer:4 * v.layer + 4]]
+        rec.n = keep

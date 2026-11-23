@@ -19,8 +19,18 @@ pipeline_adapters.load_drafter.
             row and the mix of the last committed position's taps.
 Rejected proposals never enter the context, so nothing is rolled back.
 
-All dense, bf16 in the checkpoint (3.2 GiB); `bits` quantizes its
-projections at load (drafts are verified: precision only costs acceptance).
+All dense, bf16 in the checkpoint (3.2 GiB; Inkling 2 Mini's, 3 layers:
+0.6); `bits` quantizes its projections at load (drafts are verified:
+precision only costs acceptance).
+
+The recurrent head's correction goes through the target's output matrix once
+per proposal, one after another (each reads the previous proposal): for a
+bf16 matrix (a source checkpoint's: Mini's is 0.9 GB) that would cost as
+much as a token of the trunk. So the row's logits are computed once for all
+proposals (with a 4-bit copy of a bf16 matrix), each proposal is chosen
+among that row's best CANDIDATES, and only their correction (and their
+logits, from the target's own matrix) is computed; the rest of the
+vocabulary only enters a proposal's probability.
 """
 from __future__ import annotations
 
@@ -32,6 +42,7 @@ from mlx import nn
 
 BITS = 4     # the head's projections in RAM: 1.0 GiB (8: 1.7, None = bf16: 3.2)
 _PART = 512  # context positions projected at a time
+CANDIDATES = 64  # tokens a proposal is chosen among
 
 
 def _norm(x, weight, eps):
@@ -148,9 +159,16 @@ class Inkling2Draft:
         self.window = int(cfg["sliding_window_size"]) + self.block - 1
         text = model.args.text
         self._embed = model.model.language_model.embed
-        self._lm_head = model.lm_head
+        self._lm_head = lm = model.lm_head
         self._cap, self._vocab = (text.final_logit_softcapping,
                                   text.unpadded_vocab_size)
+        # the candidates' rows of the target's output matrix, and the matrix
+        # that picks them: the target's own if quantized, else a 4-bit copy
+        self._rows_of = self._quantized_rows if isinstance(
+            lm, nn.QuantizedLinear) else (lambda ids: lm.weight[ids])
+        self._pick = lm if isinstance(lm, nn.QuantizedLinear) else (
+            nn.QuantizedLinear.from_linear(lm, group_size=64, bits=4))
+        mx.eval(self._pick.parameters())
         weights = mx.load(str(root / "mtp.safetensors"))
         head = _Head(cfg, weights["markov_head.markov_w1.weight"].shape[0])
         head.load_weights(list(weights.items()), strict=True)
@@ -227,6 +245,17 @@ class Inkling2Draft:
             x = _norm(res, nxt.weight, self.eps)
         return x.astype(mx.bfloat16)
 
+    def _quantized_rows(self, ids):
+        """Rows `ids` of the target's quantized output matrix, dequantized."""
+        lm = self._lm_head
+        return mx.dequantize(lm.weight[ids], lm.scales[ids],
+                             None if lm.get("biases") is None else lm.biases[ids],
+                             group_size=lm.group_size, bits=lm.bits,
+                             mode=getattr(lm, "mode", "affine"))
+
+    def _softcap(self, x):
+        return mx.tanh(x / self._cap) * self._cap
+
     def draft(self, pairs, depth: int):
         """Proposals for the tokens after the last committed one, and the
         probability each got."""
@@ -244,21 +273,34 @@ class Inkling2Draft:
         prev = mx.array([anchor])
         toks, probs = [], []
         depth = min(depth, self.depth)
-        base = self._lm_head(rows[0, 1:depth + 1]).astype(mx.float32)
+        r = rows[0, 1:depth + 1]
+        # each row's candidates by its own logits, their rows of the output
+        # matrix, and the rest of the vocabulary's mass (for the probability)
+        base = self._softcap(self._pick(r).astype(mx.float32))[:, :self._vocab]
+        cand = mx.argpartition(-base, CANDIDATES - 1, axis=-1)[:, :CANDIDATES]
+        rest = mx.logsumexp(mx.put_along_axis(
+            base, cand, mx.array(-mx.inf, dtype=base.dtype), axis=-1), axis=-1)
+        w = self._rows_of(cand)                       # [depth, C, h]
         for i in range(1, depth + 1):
             row = rows[:, i]
             z = mk.rnn_proj(mx.concatenate(
                 [state, mk.markov_w1(prev).astype(mx.bfloat16), row, f], axis=-1))
-            gate, cand, out = mx.split(z.astype(mx.float32), 3, axis=-1)
+            gate, c, out = mx.split(z.astype(mx.float32), 3, axis=-1)
             gate = mx.sigmoid(gate)
             state = (gate * state.astype(mx.float32)
-                     + (1 - gate) * mx.tanh(cand)).astype(mx.bfloat16)
+                     + (1 - gate) * mx.tanh(c)).astype(mx.bfloat16)
             fix = mk.hidden_out(mx.tanh(out).astype(mx.bfloat16))
-            logits = base[i - 1:i] + self._lm_head(
-                fix.astype(row.dtype)).astype(mx.float32)
-            logits = (mx.tanh(logits / self._cap) * self._cap)[..., :self._vocab]
-            prev = mx.argmax(logits, axis=-1)
+            # the row's logit plus the correction's, for the candidates only
+            wi = w[i - 1]
+            lg = ((wi @ row[0].astype(wi.dtype)).astype(mx.float32)
+                  + (wi @ fix[0].astype(wi.dtype)).astype(mx.float32))
+            lg = self._softcap(lg)
+            best = mx.argmax(lg)
+            prev = cand[i - 1, best].reshape(1)
+            top = lg[best]
+            m = mx.maximum(top, rest[i - 1])
             toks.append(prev)
-            probs.append(mx.max(mx.softmax(logits, axis=-1), axis=-1))
+            probs.append(mx.exp(top - m) / (mx.exp(lg - m).sum()
+                                            + mx.exp(rest[i - 1] - m)))
         mx.eval(toks, probs)
         return ([int(t.item()) for t in toks], [float(p.item()) for p in probs])
