@@ -183,7 +183,9 @@ class StandardMoEAdapter:
     def plain(self, tok, cache):
         """The model's own one-token forward: the pipeline's plain_fn (tok an
         id or a queued step's argmax, token_ids). Returns (logits, the hidden
-        draft_hidden gives)."""
+        draft_hidden gives; None without a head)."""
+        if self.drafter is None:
+            return self.model(token_ids(tok), cache=cache), None
         want = self.tap_layers or (len(self.layers) - 1,)
         with capture_layer_outputs(self.model, want) as got:
             logits = self.model(token_ids(tok), cache=cache)
@@ -304,6 +306,18 @@ class MistralLarge4Adapter(StandardMoEAdapter):
                                blk=layer.mlp, pos=pos)
 
 
+class WholeModelAdapter(StandardMoEAdapter):
+    """A model whose layers no adapter here splits (Qwen3.5's hybrid stack),
+    with no draft head: no step runs as streams, but there is the model's
+    own forward, for plain steps and for copied drafts checked in one
+    forward (verify) while every expert is in memory."""
+    begin = None
+
+    def __init__(self, model):
+        self.model, self.layers = model, list(model.layers)
+        self.drafter, self.tap_layers, self.taps = None, (), frozenset()
+
+
 def adapter_for(model, drafter=None):
     """The pipeline adapter for `model`'s decoder shape."""
     mt = getattr(getattr(model, "args", None), "model_type", None)
@@ -335,6 +349,22 @@ def adapter_for(model, drafter=None):
 
         return Inkling2Adapter(model, drafter)
     return StandardMoEAdapter(model, drafter)
+
+
+def headless_adapter(model):
+    """The adapter of a model with no draft head, for a decoder whose drafts
+    are copies alone (pipeline.Lookup); None where they are off: the model
+    then decodes plainly."""
+    from .pipeline import LOOKUP
+
+    if LOOKUP <= 0:
+        return None
+    try:
+        return adapter_for(model)
+    except NotImplementedError:      # a looped stack that is not Inkling 2's
+        return None
+    except (AttributeError, StopIteration):
+        return WholeModelAdapter(model)
 
 
 @contextmanager

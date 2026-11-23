@@ -86,7 +86,7 @@ from .pool import KEEPALIVE, all_held, keepalive_wait
 _PAIRS_HELD = 256
 
 # Drafts by copy (Lookup): how many tokens must repeat to find one; 0: none
-# (STREAMLX_LOOKUP=0: the head's drafts only).
+# (STREAMLX_LOOKUP=0: the head's drafts only, plain decoding with no head).
 LOOKUP = int(os.environ.get("STREAMLX_LOOKUP", "3"))
 # A copy is drafted from once it has predicted this many committed tokens in
 # a row. Ordinary text repeats phrases of the prompt and of itself and then
@@ -280,7 +280,9 @@ class PipelinedDecoder:
         # per token on a slow model, a winning one gives up little. Steps
         # that pay for learning rather than reflect an arm's rate are not
         # charged: the first after a switch and the K controller's exploring.
-        self.self_gate = bool(self_gate) and plain_fn is not None
+        # With no head (drafts by copy alone) there is nothing to gate.
+        self.self_gate = (bool(self_gate) and plain_fn is not None
+                          and k_max > 1)
         self.gate_probe = 24          # steps (on) / tokens (off) per probe
         self.gate_min = 8             # samples before a probe may end early,
         self.gate_early = 0.15        # when this much slower than the other
@@ -529,14 +531,17 @@ class PipelinedDecoder:
 
         And the tokens of a step of copied drafts. Streams: the head's
         width (each stream in flight holds experts of its own), 4 with no
-        head. One forward: 16, its rows share every weight but their
-        experts (the Mini's own head at 8 a step lost 7 to 16% on ordinary
-        text against 4, a held copy at 16 gained a third: F172)."""
+        head, none where the adapter does not split the layers. One
+        forward: 16, its rows share every weight but their experts (the
+        Mini's own head at 8 a step lost 7 to 16% on ordinary text against
+        4, a held copy at 16 gained a third: F172)."""
         ad = self.ad
         self.one_forward = getattr(ad, "verify", None) is not None and (
             getattr(ad, "batched", False) or all_held(self.pools))
         self.k_copy = self._k_copy or (
             16 if self.one_forward else self.k_max if self.k_max > 1 else 4)
+        if not self.one_forward and getattr(ad, "begin", None) is None:
+            self.k_copy = 1         # layers the adapter does not split
 
     def step(self, toks: list[int], offset: int):
         """Returns (outputs, hiddens, snaps): outputs[i] = argmax after

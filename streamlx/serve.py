@@ -80,11 +80,12 @@ prompt-cache hit the head's context starts at the tokens this request
 prefills: drafts are verified, so that can only cost acceptance, not change
 the text.
 
-Drafts by copy (pipeline.Lookup): where the reply repeats text of the
-conversation (a file written out again, a quoted passage, a loop) for eight
-tokens, what followed there is drafted, 16 tokens a forward for a model in
-memory, as many streams as a head's drafts for a streamed one.
-STREAMLX_LOOKUP=0 in the environment turns them off.
+Drafts by copy (pipeline.Lookup) need no head: where the reply repeats text
+of the conversation (a file written out again, a quoted passage, a loop) for
+eight tokens, what followed there is drafted, 16 tokens a forward for a model
+in memory, as many streams as a head's drafts for a streamed one. Every
+model gets them, one with no draft head too; --draft-head none, or
+STREAMLX_LOOKUP=0 in the environment, turns them off.
 """
 
 from __future__ import annotations
@@ -506,16 +507,18 @@ def _pipelined(dec, kwargs: dict):
             with prefill_cache(cache):
                 _, rows = ad.forward_taps(
                     mx.array([prompt[done:done + k]]), cache)
-            mx.eval(rows, [c.state for c in cache])
-            ad.prime_pairs(rows, mx.array(
-                [prompt[done + 1:done + k + 1]], dtype=mx.int32))
+            mx.eval([c.state for c in cache], [] if rows is None else rows)
+            if rows is not None:
+                ad.prime_pairs(rows, mx.array(
+                    [prompt[done + 1:done + k + 1]], dtype=mx.int32))
             done += k
             cb(done, len(prompt))
             mx.clear_cache()
         with prefill_cache(cache):
             logits, rows = ad.forward_taps(mx.array([prompt[done:]]),
                                            cache)
-        mx.eval(logits, rows, [c.state for c in cache])
+        mx.eval(logits, [c.state for c in cache],
+                [] if rows is None else rows)
         cb(len(prompt), len(prompt))
         token = first = int(mx.argmax(logits[0, -1]).item())
         dec.cache = ad.views(cache)
@@ -539,9 +542,9 @@ def _pipelined(dec, kwargs: dict):
         whole = paged.request_tokens() if paged is not None else None
         if not whole or whole[-len(prompt):] != list(prompt):
             whole = prompt
-        later = dec.decode(first, rows[:, -1:], start,
-                           max_tokens if max_tokens > 0 else 2**62, stop=eos,
-                           context=whole)
+        later = dec.decode(first, None if rows is None else rows[:, -1:],
+                           start, max_tokens if max_tokens > 0 else 2**62,
+                           stop=eos, context=whole)
 
         def end():
             # Stock's cache ends after the last token: the next turn restores
@@ -617,13 +620,15 @@ def _instrumented(fn):
                 if paged is not None:
                     msg += (f" | kv: {paged.last[0]} of {paged.last[1]} tok "
                             f"from SSD, {paged.nbytes / 1e9:.1f} GB stored")
-                if dec is not None:
+                if dec is not None and (dec.ad.drafter is not None
+                                        or dec.draft_tried > drafted[1]):
                     msg += (f" | drafts {dec.draft_ok - drafted[0]}/"
                             f"{dec.draft_tried - drafted[1]}")
                     if dec.lookup is not None and dec.lookup.proposed:
                         msg += (f" ({dec.lookup.kept}/{dec.lookup.proposed} "
                                 "by copy)")
-                    msg += f", gate {'on' if dec.drafting else 'off'}"
+                    if dec.self_gate:
+                        msg += f", gate {'on' if dec.drafting else 'off'}"
                 peak = max(_STATE["mem"].get("peak_all", 0),
                            mx.get_peak_memory())
                 msg += f" | peak {peak / 2**30:.1f} GiB"
@@ -651,7 +656,7 @@ class StreamingModelProvider(srv.ModelProvider):
         if adapter_path is not None or draft_model_path is not None:
             raise ValueError("adapters/draft models not supported with "
                              "expert streaming")
-        from streamlx.pipeline_adapters import default_draft
+        from streamlx.pipeline_adapters import default_draft, headless_adapter
 
         t0 = time.time()
         auto = _CFG["budget_bytes"] is None
@@ -680,15 +685,19 @@ class StreamingModelProvider(srv.ModelProvider):
                 print(f"[streamlx] the checkpoint's draft head did not load "
                       f"({type(e).__name__}: {e}): plain decoding",
                       file=sys.stderr)
+        ad = None
         if drafter is not None:
-            from streamlx.pipeline import PipelinedDecoder
-
             ad = adapter_for(model, drafter)
-            _STATE["decoder"] = PipelinedDecoder(ad, pools, [], k_max=k,
-                                                 plain_fn=ad.plain)
             print(f"[streamlx] draft head in {time.time()-t0:.1f}s, up to "
                   f"{k} tokens " + ("a forward" if getattr(ad, "batched", 0)
                                     else "in flight"), file=sys.stderr)
+        elif _CFG["draft_head"] == "auto" and not head:
+            ad = headless_adapter(model)    # drafts by copy alone
+        if ad is not None:
+            from streamlx.pipeline import PipelinedDecoder
+
+            _STATE["decoder"] = PipelinedDecoder(ad, pools, [], k_max=k or 1,
+                                                 plain_fn=ad.plain)
         if auto:
             # what the memory limit leaves beside the trunk and the head is
             # the most the pools may take; they start at what the first

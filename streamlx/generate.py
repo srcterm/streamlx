@@ -22,6 +22,8 @@ heads in the checkpoint (--draft-head <model dir> where it is not the
 default); otherwise --draft-head is an mlx-vlm block drafter's directory,
 e.g. Mistral Large 4's DSpark head split out once with `python -m
 mlx_vlm.split_mtp --model <checkpoint> --output <dir> --q-bits 4`.
+Any model, with a head or none, also drafts by copy where the reply repeats
+the prompt or itself (pipeline.Lookup; --draft-head none: plain decoding).
 """
 
 from __future__ import annotations
@@ -84,7 +86,7 @@ def main() -> int:
                          "for Qwen3.8 and Inkling 2, 6 for DeepSeek-V4.1, "
                          "else 4)")
     args = ap.parse_args()
-    from streamlx.pipeline_adapters import default_draft
+    from streamlx.pipeline_adapters import default_draft, headless_adapter
 
     size = model_size_gb(args.model)
     ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
@@ -116,6 +118,8 @@ def main() -> int:
     if drafter is not None:
         ad = adapter_for(model, drafter)
         print(f"[load] draft head in {time.time()-t0:.1f}s", file=sys.stderr)
+    elif args.draft_head == "auto" and not head:
+        ad = headless_adapter(model)    # drafts by copy alone
     # the memory limit, less what is resident, MLX's buffer cache and 2 GiB;
     # the pools take it, or every expert when that is less
     room = (budget_within(memory_limit(), pools, reserve=4 * 2**30)
@@ -157,7 +161,7 @@ def main() -> int:
                     logits = model(chunk, cache=cache)
                 else:
                     logits, h = ad.forward_taps(chunk, cache)
-                    context.append(h)
+                    context.append([] if h is None else h)
             mx.eval(logits, context)
         if pre < budget:
             resize_pools(pools, budget)
@@ -177,21 +181,23 @@ def main() -> int:
 
         t0 = time.time()
         dec = None
-        if drafter is not None:
+        if ad is not None:
             from streamlx.pipeline import PipelinedDecoder
 
-            hidden = mx.concatenate(context, axis=1)
+            hidden = None
+            if drafter is not None:
+                hidden = mx.concatenate(context, axis=1)
+                drafter.reset()
+                drafter.prime_pairs(hidden[:, :-1],
+                                    mx.array([ids[1:]], dtype=mx.int32))
+                hidden = hidden[:, -1:]
             del context
-            drafter.reset()
-            drafter.prime_pairs(hidden[:, :-1],
-                                mx.array([ids[1:]], dtype=mx.int32))
             # plain_fn arms the self-gate: drafting only while it is faster
-            dec = PipelinedDecoder(ad, pools, ad.views(cache), k_max=draft_k,
-                                   plain_fn=ad.plain)
+            dec = PipelinedDecoder(ad, pools, ad.views(cache),
+                                   k_max=draft_k or 1, plain_fn=ad.plain)
             emit(first)
-            out = dec.generate(first, hidden[:, -1:], len(ids),
-                               args.max_tokens, on_token=emit, stop=eos,
-                               context=ids)
+            out = dec.generate(first, hidden, len(ids), args.max_tokens,
+                               on_token=emit, stop=eos, context=ids)
         else:
             def queue(t):
                 """The forward of `t` (an id, or the step before's argmax
@@ -226,7 +232,7 @@ def main() -> int:
           f"peak resident {peak:.1f} GB | "
           f"hit rate {1-st['miss_rate']:.1%} | "
           f"streamed {reader.bytes_read/1e9:.1f} GB from SSD ---")
-    if dec is not None:
+    if dec is not None and (drafter is not None or dec.draft_tried):
         gate = dec.stats()["gate"]
         lk = dec.lookup
         by_copy = (f" ({lk.kept}/{lk.proposed} by copy)"
@@ -234,8 +240,9 @@ def main() -> int:
         print(f"--- pipeline: {dec.draft_ok}/{dec.draft_tried} drafts "
               f"accepted{by_copy}, tokens per step "
               f"{dict(sorted(dec.accepted_hist.items()))}, "
-              f"{dec.plain_steps} plain steps, gate "
-              f"{gate['decisions'] or gate['arm']} ---")
+              f"{dec.plain_steps} plain steps"
+              + (f", gate {gate['decisions'] or gate['arm']}" if gate else "")
+              + " ---")
     return 0
 
 

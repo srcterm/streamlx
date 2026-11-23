@@ -199,6 +199,33 @@ class OneForward(unittest.TestCase):
         dec = PipelinedDecoder(ad, pools, [], k_max=1)
         self.assertFalse(dec.one_forward)
         self.assertEqual(dec.k_copy, 4)       # no head: four streams a copy
+        # and no head: a plain step is the model's forward, nothing recorded
+        self.assertIsNone(ad.plain(PROMPT[0], make_prompt_cache(m))[1])
+
+    def test_layers_the_adapter_does_not_split(self):
+        # (a hybrid stack: no streams, so copies only in one forward, and
+        # a draft head is refused)
+        from streamlx import pipeline_adapters
+
+        ck = toy.Checkpoint()
+        self.addCleanup(ck.close)
+        seq, _ = toy.greedy(ck.ref, PROMPT, N)
+        with mock.patch.object(pipeline_adapters, "_ATTN", ("no_such",)):
+            for held in (False, True):
+                m, pools = _held(ck) if held else ck.streaming(8)
+                ad = pipeline_adapters.headless_adapter(m)
+                self.assertIsNone(ad.begin)
+                cache = make_prompt_cache(m)
+                mx.eval(m(mx.array([PROMPT]), cache=cache))
+                dec = PipelinedDecoder(ad, pools, cache, k_max=1,
+                                       plain_fn=ad.plain)
+                out = dec.generate(seq[0], None, len(PROMPT), N,
+                                   context=PROMPT + seq)
+                self.assertEqual(out, seq[:N])
+                self.assertEqual((dec.one_forward, dec.lookup.kept > N // 3),
+                                 (held, held))
+            with self.assertRaises(AttributeError):
+                adapter_for(m, SimpleNamespace(tap_layers=(3,)))
 
 
 class _Clock:
@@ -416,7 +443,8 @@ class CopiedDrafts(unittest.TestCase):
     tokens. With the continuation in the conversation already, streamed
     decoding takes it in steps of k_copy and gives plain decoding's tokens;
     where the copy is wrong the drafts are rolled back; and a copy is
-    drafted from whatever the gate's arm, outside its accounts."""
+    drafted from with no head at all and whatever the gate's arm, outside
+    its accounts."""
 
     def test_lookup(self):
         lk = pipeline.Lookup(3)
@@ -455,9 +483,10 @@ class CopiedDrafts(unittest.TestCase):
         return ck, seq, pools, head, dec, row, context(seq)
 
     def test_a_copy_is_plain_decoding(self):
-        # with a head that proposes nothing, as streams and (every expert
-        # in memory) in one forward a step
-        for head, held in ((_MuteHead, False), (_MuteHead, True)):
+        # with a head that proposes nothing and with no head, as streams and
+        # (every expert in memory) in one forward a step
+        for head, held in ((_MuteHead, False), (_MuteHead, True),
+                           (None, False), (None, True)):
             ck, seq, pools, head, dec, row, ctx = self._decode(
                 lambda seq: PROMPT + seq, head, plain=head is None,
                 held=held, k_copy=4)
