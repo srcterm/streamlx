@@ -194,6 +194,28 @@ def _cache_bytes(cache) -> int:
         return 0
 
 
+def _grown_bytes(cache) -> int:
+    """_cache_bytes with each window (a rotating cache) at most its window:
+    after a prompt chunk it also holds the chunk, for the chunk's own
+    attention, until the next token. What a request adds to this is what
+    the conversation grows by (a window restored from the SSD holds only
+    its window, so the chunk's rows are not growth)."""
+    def one(c):
+        if type(c).__name__ == "CacheList":
+            return sum(one(m) for m in c.caches)
+        n, keys = c.nbytes, getattr(c, "keys", None)
+        size = getattr(c, "max_size", None)
+        if (type(c).__name__ == "RotatingKVCache" and keys is not None
+                and keys.shape[2] > size):
+            n = n * size // keys.shape[2]
+        return n
+
+    try:
+        return sum(one(c) for c in cache or ())
+    except Exception:  # noqa: BLE001 — a cache type without nbytes
+        return 0
+
+
 def _fit_pools(target: float, why: str) -> None:
     """Resize every expert pool (trunk and draft head) to `target` bytes in
     all, at most --budget-gib: down by _HYST or more, up by _GROW or more
@@ -240,7 +262,7 @@ def _govern_request(kwargs: dict) -> None:
                  - pool_bytes(_STATE["pools"] or {}))
     # decoding's share; on the first request what is resident now plus 2 GiB
     m["rest"] = m["F"] if m["F"] is not None else m["base"] + 2 * 2**30
-    m["cb0"], m["peak_rest"] = cb, 0
+    m["gb0"], m["peak_rest"] = _grown_bytes(cache), 0
     m["to_come"] = max(0, kwargs.get("max_tokens", 256))
     _STATE["plan"] = sizes = _plan(kwargs)
     chunk = sizes[0] if sizes else 0
@@ -324,7 +346,7 @@ def _govern_chunk(cache, done: int, n: int, later: list[int], left: int,
     if not lim:
         return later
     cb = _cache_bytes(cache)
-    _measure_slope(cb, done)
+    _measure_slope(_grown_bytes(cache), done)
     if n >= PREFILL_MIN:
         held = (mx.get_peak_memory() - cb
                 - pool_bytes(_STATE["pools"] or {})
@@ -343,13 +365,13 @@ def _govern_chunk(cache, done: int, n: int, later: list[int], left: int,
     return later
 
 
-def _measure_slope(cb: int, n_tokens: int) -> None:
-    """The cache bytes a token adds, from a request that continued a cache
-    (one that starts empty also allocates fixed state, e.g. recurrent
-    layers') over at least 256 tokens."""
+def _measure_slope(gb: int, n_tokens: int) -> None:
+    """The cache bytes a token adds (_grown_bytes), from a request that
+    continued a cache (one that starts empty also allocates fixed state,
+    e.g. recurrent layers') over at least 256 tokens."""
     m = _STATE["mem"]
-    if m.get("cb0", 0) > 0 and n_tokens >= 256 and cb > m["cb0"]:
-        m["slope"] = max(m["slope"] or 0, (cb - m["cb0"]) / n_tokens)
+    if m.get("gb0", 0) > 0 and n_tokens >= 256 and gb > m["gb0"]:
+        m["slope"] = max(m["slope"] or 0, (gb - m["gb0"]) / n_tokens)
 
 
 def _govern_done(cache, n_tokens: int) -> None:
@@ -358,7 +380,7 @@ def _govern_done(cache, n_tokens: int) -> None:
     m = _STATE["mem"]
     if not _CFG["memory_bytes"]:
         return
-    _measure_slope(_cache_bytes(cache), n_tokens)
+    _measure_slope(_grown_bytes(cache), n_tokens)
     _govern_mark(cache)
     m["F"] = max(m["F"] or 0, m["peak_rest"])
 
