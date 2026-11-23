@@ -120,11 +120,11 @@ Its chat template takes `reasoning_effort` instead of `enable_thinking`: `--chat
 
 | Context | Prefill (new tokens) | Decode | Writing a function from the prompt out again | Next turn's first token | Peak memory |
 |---|---|---|---|---|---|
-| 4k | 163 tok/s | 18 tok/s | 24 tok/s | 0.5 s | 17.7 GiB |
-| 16k | 188 tok/s | 17 tok/s | 19 tok/s | 0.7 s | 18.9 GiB |
-| 32k | 161 tok/s | 14 tok/s | 31 tok/s | 0.9 s | 20.2 GiB |
-| 64k | 119 tok/s | 11 tok/s | 21 tok/s | 1.2 s | 21.8 GiB |
-| 128k | 80 tok/s | 7 tok/s | 10 tok/s | 2.7 s | 23.7 GiB |
+| 4k | 162 tok/s | 19 tok/s | 25 tok/s | 0.8 s | 17.6 GiB |
+| 16k | 192 tok/s | 17 tok/s | 22 tok/s | 0.7 s | 18.1 GiB |
+| 32k | 172 tok/s | 15 tok/s | 33 tok/s | 0.8 s | 19.1 GiB |
+| 64k | 136 tok/s | 11 tok/s | 22 tok/s | 1.2 s | 19.8 GiB |
+| 128k | 94 tok/s | 8 tok/s | 11 tok/s | 2.6 s | 22.2 GiB |
 
 Decode is a reply that repeats nothing from the prompt; one that quotes it gets lookup drafts. The next turn restores the conversation from the SSD prompt cache, which holds 15 GB at 128k tokens.
 
