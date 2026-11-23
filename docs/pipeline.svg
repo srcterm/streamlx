@@ -1,6 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="960" height="516" viewBox="0 0 960 516" role="img" aria-labelledby="t d"><title id="t">How streamlx serves a request</title><desc id="d">A request from a coding agent goes to streamlx serve, which prefills the prompt expert by expert and decodes pipelined with the checkpoint's draft head. Each decoder layer is the stock model code except its routed experts, which run from expert pools in RAM; a miss is read from the stock checkpoint on the SSD straight into its slot. The KV cache is restored from and stored to a prompt cache on the SSD.</desc><style>svg{--bg:#f6f8fa;--edge:#d1d9e0;--mem:#ffffff;--ssd:#eef1f4;--box:#ffffff;--line:#afb8c1;--ink:#1f2328;--muted:#59636e;--acc:#0969da;--soft:#ddf4ff}@media (prefers-color-scheme:dark){svg{--bg:#151b23;--edge:#3d444d;--mem:#0d1117;--ssd:#1b2129;--box:#0d1117;--line:#4a525c;--ink:#f0f6fc;--muted:#9198a1;--acc:#4493f8;--soft:#102a52}}
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="516" viewBox="0 0 960 516" role="img" aria-labelledby="t d"><title id="t">How streamlx serves a request</title><desc id="d">A request from a coding agent goes to streamlx serve, which prefills the prompt expert by expert and decodes pipelined with the checkpoint's draft head. Each decoder layer is the stock model code except its routed experts, which run from expert pools in RAM; a miss is read from the stock checkpoint on the SSD straight into its slot. The KV cache is restored from and stored to a prompt cache on the SSD.</desc><style>svg{--edge:#d1d9e0;--mem:#ffffff;--ssd:#eef1f4;--box:#ffffff;--line:#afb8c1;--ink:#1f2328;--muted:#59636e;--acc:#0969da;--soft:#ddf4ff}@media (prefers-color-scheme:dark){svg{--edge:#3d444d;--mem:#0d1117;--ssd:#1b2129;--box:#0d1117;--line:#4a525c;--ink:#f0f6fc;--muted:#9198a1;--acc:#4493f8;--soft:#102a52}}
 svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetica,Arial,sans-serif}
-.card{fill:var(--bg);stroke:var(--edge)}
 .mem{fill:var(--mem);stroke:var(--edge)}
 .ssd{fill:var(--ssd);stroke:var(--edge)}
 .box{fill:var(--box);stroke:var(--line)}
@@ -23,7 +22,6 @@ svg{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helvetic
 .ahf{fill:var(--muted)}
 .ahx{fill:var(--acc)}
 </style><defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 Z" class="ahf"/></marker><marker id="ahx" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,1 L9,5 L0,9 Z" class="ahx"/></marker></defs>
-<rect x="0.5" y="0.5" width="959" height="515" rx="12" class="card"/>
 <rect x="12" y="136" width="936" height="232" rx="10" class="mem"/>
 <rect x="12" y="380" width="936" height="124" rx="10" class="ssd"/>
 <text x="28" y="162" class="lab">RAM</text>

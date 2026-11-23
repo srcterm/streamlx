@@ -98,6 +98,7 @@ class RequestEnd(unittest.TestCase):
                         stream=self.stream))]
                     self.assertEqual(out, seq[:n])
                     self.assertGreater(dec.draft_ok, 0)
+                    self.assertEqual(dec.cache, [])  # (the decoder lives on)
                     self.assertEqual(cache[0].offset, want[0].offset)
                     self.assertEqual(ad.offset(cache), len(PROMPT) + n)
                     a = ref(mx.array([[nxt]]), cache=want)
@@ -126,6 +127,7 @@ class RequestEnd(unittest.TestCase):
                 for _ in range(n):
                     next(gen)
                 gen.close()
+                self.assertEqual(dec.cache, [])
                 self.assertEqual(cache[1][0].offset, 3 + n)
                 self.assertEqual(ad.offset(cache), 3 + n)
 
@@ -205,6 +207,40 @@ class PoolsGrowBack(unittest.TestCase):
             # room for every expert again, still less than _GROW more
             serve._fit_pools(1.05 * every, "decoding")
             self.assertTrue(all_held(pools))
+
+
+class CacheGrowth(unittest.TestCase):
+    """--memory-gib's bytes a token: what a request adds to the cache, the
+    attention rows; not the rows a prompt chunk leaves in a window for its
+    own attention, which go at the next token (Inkling 2's windows are
+    restored from the SSD holding only their window: counted, a 4,000-token
+    chunk looked like 196 KB a token where the cache grew by 33)."""
+
+    def test_windows_do_not_grow(self):
+        from unittest import mock
+
+        from mlx_lm.models.cache import ArraysCache, CacheList
+
+        def rows(n):
+            return mx.zeros((1, 2, n, 16))
+
+        cache = [CacheList(RotatingKVCache(max_size=8), ArraysCache(1)),
+                 CacheList(KVCache(), ArraysCache(1))]
+        for c in cache:
+            c[0].update_and_fetch(rows(8), rows(8))
+            c[1][0] = mx.zeros((1, 3, 16))
+        state = {"mem": {"slope": None}}
+        kv0 = cache[1][0].nbytes
+        with mock.patch.object(serve, "_STATE", state):
+            state["mem"]["gb0"] = serve._grown_bytes(cache)
+            for c in cache:                   # a prompt chunk of 300 tokens
+                c[0].update_and_fetch(rows(300), rows(300))
+            self.assertGreater(cache[0][0].keys.shape[2], 8)
+            serve._measure_slope(serve._grown_bytes(cache), 300)
+        # the attention rows' buffer, which grows 256 rows at a time
+        self.assertEqual(state["mem"]["slope"],
+                         (cache[1][0].nbytes - kv0) / 300)
+        self.assertLess(state["mem"]["slope"], 1.5 * 2 * rows(1).nbytes)
 
 
 class TokenLogprob(unittest.TestCase):

@@ -1,6 +1,7 @@
 """The SSD prompt cache restores a history only for the weights that
 computed it, and a damaged or deleted segment costs one prefill: never a
 request, and never a second prefill of the same prompt."""
+import importlib.util
 import os
 import shutil
 import struct
@@ -130,6 +131,99 @@ class DamagedSegment(_Case):
                 pc.insert_cache(ck.dir, req + [NEXT], cache)
                 pc.flush()
                 self.assertEqual(self.restored(pc, ck, ck.ref, req), len(req))
+
+
+class Layouts(_Case):
+    """What a segment holds, and that it restores bit for bit: a window
+    (RotatingKVCache) only the rows a next token can reach, a CacheList's
+    members each their own way (Inkling 2: the attention rows the segment
+    added or a window, beside a convolution state stored whole). Restored at
+    the last of a prefill's segment ends, the caches give the logits of the
+    ones never stored, for a chunk and then token by token."""
+    CHUNK = 5
+
+    def check(self, model_dir, model, make, vocab):
+        tokens = [t % vocab for t in toy.prompt(40)]
+        more = [t % vocab for t in toy.prompt(8, seed=1)]
+        pc = _server(self.root)
+        got, _ = pc.fetch_nearest_cache(model_dir, tokens)
+        self.assertIsNone(got)
+        cache = make()
+        for n in range(self.CHUNK, len(tokens) + 1, self.CHUNK):
+            mx.eval(model(mx.array([tokens[n - self.CHUNK:n]]), cache=cache))
+            pc.save_progress(n, cache)    # a segment a prefill chunk
+        pc.flush()
+        for seg in pc._segs.values():
+            header, meta = pc._header(seg.path)
+            n = seg.end - seg.start
+            self.check_rows(header, meta["layers"], "", n)
+            # no segment holds rows of the tokens before it past a window
+            self.assertLessEqual(max(h["shape"][-2] for h in header.values()
+                                     if len(h.get("shape", ())) == 4),
+                                 max(n, self.window))
+        # what follows a restore: a chunk, or (a template that adds nothing
+        # after the history) a token
+        for steps in ([more[:5]] + [[t] for t in more[5:]],
+                      [[t] for t in more[:3]] + [more[3:]]):
+            pc = _server(self.root)       # a restarted server
+            cache, rest = pc.fetch_nearest_cache(model_dir, tokens + more)
+            self.assertEqual((pc.last[0], rest), (len(tokens), more))
+            # its attention rows in buffers with a live one's room
+            for c in cache:
+                for kv in getattr(c, "caches", (c,)):
+                    if type(kv).__name__ == "KVCache":
+                        self.assertEqual(kv.offset, len(tokens))
+                        self.assertEqual(kv.keys.shape[2] % kv.step, 0)
+            ref = make()                  # the caches never stored
+            for n in range(self.CHUNK, len(tokens) + 1, self.CHUNK):
+                model(mx.array([tokens[n - self.CHUNK:n]]), cache=ref)
+            for step in steps:
+                a = model(mx.array([step]), cache=cache)
+                b = model(mx.array([step]), cache=ref)
+                self.assertTrue(bool(mx.array_equal(a, b)), (steps, step))
+
+    def check_rows(self, header, specs, prefix, n):
+        """Rows along the sequence of each stored array: a segment's own
+        rows for a cache that grows along it, at most the window for a
+        rotating one."""
+        for i, spec in enumerate(specs):
+            at = f"{prefix}{i}."
+            if "members" in spec:
+                self.check_rows(header, spec["members"], at, n)
+                continue
+            rows = [h["shape"][-2] for k, h in header.items()
+                    if k.startswith(at) and len(h["shape"]) == 4]
+            if spec["sliced"]:
+                self.assertEqual(set(rows), {n}, at)
+            elif spec["cls"].endswith("RotatingKVCache"):
+                self.assertTrue(rows, at)
+                self.assertLessEqual(max(rows), self.window, at)
+
+    def test_windows(self):
+        from mlx_lm.models.cache import RotatingKVCache
+
+        ck = toy.Checkpoint()
+        self.addCleanup(ck.close)
+        # (the chunks are 5 tokens; `keep` rows stay at the window's start)
+        for w, keep in ((4, 0), (8, 0), (32, 0), (8, 2)):
+            with self.subTest(window=w, keep=keep):
+                self.root = tempfile.mkdtemp(dir=self.root)
+                self.window = w
+                self.check(ck.dir, ck.ref,
+                           lambda: [RotatingKVCache(max_size=w, keep=keep)
+                                    for _ in ck.ref.layers], toy.VOCAB)
+
+    @unittest.skipUnless(importlib.util.find_spec("mlx_lm.models.inkling2")
+                         and mx.default_device() == mx.gpu,
+                         "needs an mlx-lm with the inkling2 model, on the GPU")
+    def test_cache_lists(self):
+        import toy_inkling2 as ink
+
+        ck = ink.Checkpoint()
+        self.addCleanup(ck.close)
+        m = ck.stock()
+        self.window = ink.TEXT["sliding_window_size"]
+        self.check(ck.dir, m, m.make_cache, ink.VOCAB)
 
 
 if __name__ == "__main__":

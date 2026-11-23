@@ -83,9 +83,13 @@ the text.
 Drafts by copy (pipeline.Lookup) need no head: where the reply repeats text
 of the conversation (a file written out again, a quoted passage, a loop) for
 eight tokens, what followed there is drafted, 16 tokens a forward for a model
-in memory, as many streams as a head's drafts for a streamed one. Every
-model gets them, one with no draft head too; --draft-head none, or
-STREAMLX_LOOKUP=0 in the environment, turns them off.
+whose experts are all in memory and for Inkling 2 Mini, as many streams as
+--draft-k for a streamed one (eight at most on Inkling 2). A model with no
+draft head, or one whose head did not load, gets them too; one whose layers
+no adapter splits (Qwen3.5/3.6's hybrid stack, HunYuan) only while its
+experts are all in memory, and one whose experts streamlx does not stream
+decodes as mlx-lm's. --draft-head none, or STREAMLX_LOOKUP=0 (or off) in the
+environment, turns them off.
 """
 
 from __future__ import annotations
@@ -122,7 +126,7 @@ from streamlx.integrate import (
     prefill_chunks,
     resize_pools,
 )
-from streamlx.kvcache import PagedPromptCache, stored_bytes
+from streamlx.kvcache import PagedPromptCache, settled_bytes, stored_bytes
 from streamlx.pipeline_adapters import greedy
 
 _CFG = {"budget_bytes": None, "trust": False, "tokenizer_config": {},
@@ -194,6 +198,19 @@ def _cache_bytes(cache) -> int:
         return 0
 
 
+def _grown_bytes(cache) -> int:
+    """_cache_bytes with each layer as it stands after its next token
+    (settled_bytes): a window (a rotating cache) after a prompt chunk also
+    holds the chunk, for the chunk's own attention, until then. What a
+    request adds to this is what the conversation grows by (a window
+    restored from the SSD holds only its window, so the chunk's rows are
+    not growth)."""
+    try:
+        return sum(settled_bytes(c) for c in cache or ())
+    except Exception:  # noqa: BLE001 — a cache type without nbytes
+        return 0
+
+
 def _fit_pools(target: float, why: str) -> None:
     """Resize every expert pool (trunk and draft head) to `target` bytes in
     all, at most --budget-gib: down by _HYST or more, up by _GROW or more
@@ -240,7 +257,7 @@ def _govern_request(kwargs: dict) -> None:
                  - pool_bytes(_STATE["pools"] or {}))
     # decoding's share; on the first request what is resident now plus 2 GiB
     m["rest"] = m["F"] if m["F"] is not None else m["base"] + 2 * 2**30
-    m["cb0"], m["peak_rest"] = cb, 0
+    m["gb0"], m["peak_rest"] = _grown_bytes(cache), 0
     m["to_come"] = max(0, kwargs.get("max_tokens", 256))
     _STATE["plan"] = sizes = _plan(kwargs)
     chunk = sizes[0] if sizes else 0
@@ -324,7 +341,7 @@ def _govern_chunk(cache, done: int, n: int, later: list[int], left: int,
     if not lim:
         return later
     cb = _cache_bytes(cache)
-    _measure_slope(cb, done)
+    _measure_slope(_grown_bytes(cache), done)
     if n >= PREFILL_MIN:
         held = (mx.get_peak_memory() - cb
                 - pool_bytes(_STATE["pools"] or {})
@@ -343,13 +360,13 @@ def _govern_chunk(cache, done: int, n: int, later: list[int], left: int,
     return later
 
 
-def _measure_slope(cb: int, n_tokens: int) -> None:
-    """The cache bytes a token adds, from a request that continued a cache
-    (one that starts empty also allocates fixed state, e.g. recurrent
-    layers') over at least 256 tokens."""
+def _measure_slope(gb: int, n_tokens: int) -> None:
+    """The cache bytes a token adds (_grown_bytes), from a request that
+    continued a cache (one that starts empty also allocates fixed state,
+    e.g. recurrent layers') over at least 256 tokens."""
     m = _STATE["mem"]
-    if m.get("cb0", 0) > 0 and n_tokens >= 256 and cb > m["cb0"]:
-        m["slope"] = max(m["slope"] or 0, (cb - m["cb0"]) / n_tokens)
+    if m.get("gb0", 0) > 0 and n_tokens >= 256 and gb > m["gb0"]:
+        m["slope"] = max(m["slope"] or 0, (gb - m["gb0"]) / n_tokens)
 
 
 def _govern_done(cache, n_tokens: int) -> None:
@@ -358,7 +375,7 @@ def _govern_done(cache, n_tokens: int) -> None:
     m = _STATE["mem"]
     if not _CFG["memory_bytes"]:
         return
-    _measure_slope(_cache_bytes(cache), n_tokens)
+    _measure_slope(_grown_bytes(cache), n_tokens)
     _govern_mark(cache)
     m["F"] = max(m["F"] or 0, m["peak_rest"])
 
@@ -553,6 +570,10 @@ def _pipelined(dec, kwargs: dict):
             if ad.offset(dec.cache) < start + n:
                 ad.plain(token, dec.cache)
                 mx.eval([c.state for c in cache])
+            # the decoder outlives the request: its cache must not, or the
+            # next request's restore and prefill run beside it, and the
+            # memory governor counts it in theirs
+            dec.cache = []
 
         try:
             for token in itertools.chain((first,), later):
@@ -682,7 +703,7 @@ class StreamingModelProvider(srv.ModelProvider):
                 if _CFG["draft_head"] != "auto":   # one that was asked for
                     raise
                 print(f"[streamlx] the checkpoint's draft head did not load "
-                      f"({type(e).__name__}: {e}): plain decoding",
+                      f"({type(e).__name__}: {e}): decoding without it",
                       file=sys.stderr)
         ad = None
         if drafter is not None:
@@ -690,7 +711,7 @@ class StreamingModelProvider(srv.ModelProvider):
             print(f"[streamlx] draft head in {time.time()-t0:.1f}s, up to "
                   f"{k} tokens " + ("a forward" if getattr(ad, "batched", 0)
                                     else "in flight"), file=sys.stderr)
-        elif _CFG["draft_head"] == "auto" and not head:
+        elif _CFG["draft_head"] == "auto":    # none, or one that did not load
             ad = headless_adapter(model, pools)    # drafts by copy alone
         if ad is not None:
             from streamlx.pipeline import PipelinedDecoder

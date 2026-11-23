@@ -213,6 +213,9 @@ class Inkling2Adapter(StandardMoEAdapter):
     snapshot holds the arrays under handles of its own.
     """
     verify = None       # steps run as streams
+    # finish() keeps the fourth states of this many positions a layer, for
+    # restore_cache: a step of more streams could not roll back to its first
+    max_streams = 8
 
     def __init__(self, model, drafter=None):
         try:    # mlx-lm's layout from 11-19 (#2082): the model is a package
@@ -337,7 +340,7 @@ class Inkling2Adapter(StandardMoEAdapter):
         st.conv.advance(x.shape[1])
         late = self._late.setdefault(l, {})
         late[pos.offset] = state
-        late.pop(pos.offset - 8, None)
+        late.pop(pos.offset - self.max_streams, None)
         h = (st.h + y.astype(mx.float32)).astype(st.dtype)
         pos.blocks = st.blocks
         if l == len(self.layers) - 1:
