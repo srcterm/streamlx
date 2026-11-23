@@ -198,6 +198,7 @@ class OneForward(unittest.TestCase):
         ad = adapter_for(m, None)
         dec = PipelinedDecoder(ad, pools, [], k_max=1)
         self.assertFalse(dec.one_forward)
+        self.assertEqual(dec.k_copy, 4)       # no head: four streams a copy
 
 
 class _Clock:
@@ -263,7 +264,7 @@ class DecodeLoop(unittest.TestCase):
         mx.eval(logits, rows)
         dec = PipelinedDecoder(ad, pools, ad.views(cache), k_max=3,
                                adaptive=False, plain_fn=ad.plain,
-                               self_gate=True)
+                               self_gate=True, lookup=0)   # the head's drafts
         dec.gate_probe, dec.gate_min, dec.gate_hold = 8, 4, 16
         ran, charged = [], {"step": [], "plain": [], "undrafted": []}
 
@@ -388,7 +389,7 @@ class RunAhead(unittest.TestCase):
         out = []
         head = _CountingHead(self.seq, _Clock(), lambda: len(out))
         dec, cache, row = self._decoder(head, k_max=3, adaptive=False,
-                                        self_gate=True)
+                                        self_gate=True, lookup=0)
         dec.gate_probe, dec.gate_min, dec.gate_hold = 8, 4, 16
         out.append(self.seq[0])
         got = dec.generate(self.seq[0], row, len(PROMPT), N,
@@ -398,6 +399,132 @@ class RunAhead(unittest.TestCase):
         self.assertEqual(head.fed, 0)        # nothing fed per token
         self.assertGreater(head.drafts[0], 8)    # the gated-off run's pairs
         self.assertGreater(dec.draft_ok, 0)
+
+
+class _MuteHead(_Head):
+    """A head with nothing to propose: every draft is a copy."""
+
+    def draft(self, pairs, depth):
+        self.pos += len(pairs)
+        self.calls += 1
+        return [], []
+
+
+class CopiedDrafts(unittest.TestCase):
+    """Drafts by copy (pipeline.Lookup): where the last three tokens occurred
+    before, what followed them is the draft, once it has predicted a few
+    tokens. With the continuation in the conversation already, streamed
+    decoding takes it in steps of k_copy and gives plain decoding's tokens;
+    where the copy is wrong the drafts are rolled back; and a copy is
+    drafted from whatever the gate's arm, outside its accounts."""
+
+    def test_lookup(self):
+        lk = pipeline.Lookup(3)
+        lk.reset(range(1, 10))                    # 1 .. 9
+        for t in (50, 2, 3, 4):
+            lk.push(t)
+        self.assertEqual((lk.run, lk.propose(2)), (0, [5, 6]))    # found
+        lk.push(5)
+        self.assertEqual((lk.run, lk.propose(4)), (1, [6, 7, 8, 9]))
+        self.assertEqual(lk.propose(8), [6, 7, 8, 9, 50, 2, 3, 4])
+        lk.push(6)
+        lk.push(99)                               # the copy ends
+        self.assertEqual((lk.run, lk.propose(4)), (0, []))
+        for t in (3, 4, 5, 6):                    # the latest place wins
+            lk.push(t)
+        self.assertEqual(lk.propose(2), [99, 3])
+        lk.reset(())
+        for t in (1, 2, 3, 1, 2, 3, 1, 2):        # the reply repeats itself
+            lk.push(t)
+        self.assertEqual((lk.run, lk.propose(6)), (2, [3, 1, 2]))
+
+    def _decode(self, context, head=_MuteHead, plain=False, held=False, **kw):
+        ck = toy.Checkpoint()
+        self.addCleanup(ck.close)
+        seq, _ = toy.greedy(ck.ref, PROMPT, N)
+        m, pools = _held(ck) if held else ck.streaming(8)
+        head = head and head(seq, _Clock())
+        ad = adapter_for(m, head)
+        cache = make_prompt_cache(m)
+        logits, rows = ad.forward_taps(mx.array([PROMPT]), cache)
+        mx.eval(logits)
+        kw.setdefault("k_max", 4 if head else 1)
+        dec = PipelinedDecoder(ad, pools, ad.views(cache), adaptive=False,
+                               plain_fn=ad.plain if plain else None, **kw)
+        row = None if rows is None else rows[:, -1:]
+        return ck, seq, pools, head, dec, row, context(seq)
+
+    def test_a_copy_is_plain_decoding(self):
+        # with a head that proposes nothing, as streams and (every expert
+        # in memory) in one forward a step
+        for head, held in ((_MuteHead, False), (_MuteHead, True)):
+            ck, seq, pools, head, dec, row, ctx = self._decode(
+                lambda seq: PROMPT + seq, head, plain=head is None,
+                held=held, k_copy=4)
+            self.assertEqual(dec.one_forward, held)
+            out = dec.generate(seq[0], row, len(PROMPT), N, context=ctx)
+            self.assertEqual(out, seq[:N])
+            self.assertEqual(toy.wrong_slots(ck.ref, pools), [])
+            lk = dec.lookup
+            # (a copy is drafted from once it has predicted eight tokens;
+            # the toy repeats itself: where three tokens occurred twice the
+            # later place is followed, and may go on otherwise)
+            self.assertGreater(lk.kept, N // 3)
+            self.assertLess(lk.proposed - lk.kept, N // 6)
+            self.assertGreater(dec.accepted_hist.get(4, 0), N // 8)
+
+    def test_wrong_copies_are_rolled_back(self):
+        rng = np.random.default_rng(0)
+
+        def spoiled(seq):
+            return PROMPT + [(_other(rng, t, toy.VOCAB) if i % 13 == 12 else t)
+                             for i, t in enumerate(seq)]
+
+        ck, seq, pools, head, dec, row, ctx = self._decode(
+            spoiled, self_gate=False, lookup=2)
+        with mock.patch.object(pipeline, "_LK_MIN", 4):
+            out = dec.generate(seq[0], row, len(PROMPT), N, context=ctx)
+        self.assertEqual(out, seq[:N])
+        self.assertEqual(toy.wrong_slots(ck.ref, pools), [])
+        self.assertGreater(dec.lookup.proposed, dec.lookup.kept)
+        self.assertGreater(dec.lookup.kept, 0)
+        # the tokens of a copy reach the head with its next draft
+        self.assertGreaterEqual(head.pos, N - 13)
+
+    def test_width_follows_acceptance(self):
+        ck, seq, pools, head, dec, row, ctx = self._decode(
+            lambda seq: PROMPT + seq, k_copy=16)
+        dec.adaptive = True
+        dec.lookup.reset(ctx)
+        for t in seq[:3]:
+            dec.lookup.push(t)
+        # as many drafts as are each more likely kept than not, and no
+        # more than the copy has predicted tokens
+        for run, rate, drafts in ((16, None, 13), (16, 1.0, 15), (16, 0.9, 6),
+                                  (16, 0.5, 1), (16, 0.0, 1), (8, 1.0, 8)):
+            dec.lookup.run, dec._calib[10] = run, rate
+            self.assertEqual(len(dec._copied()[0]), drafts)
+
+    def test_outside_the_gate(self):
+        ck, seq, pools, head, dec, row, ctx = self._decode(
+            lambda seq: PROMPT + seq, plain=True, self_gate=True)
+        dec._g_begin("off", hold=10**6)           # drafting held off
+        charged = []
+        account = dec._gate_account
+        dec._gate_account = lambda dt, n: (charged.append(n), account(dt, n))
+        out = dec.generate(seq[0], row, len(PROMPT), N, context=ctx)
+        self.assertEqual(out, seq[:N])
+        self.assertGreater(dec.lookup.kept, N // 3)
+        self.assertFalse(dec.drafting)            # the gate's arm stands,
+        self.assertEqual(set(charged), {1})       # charged its plain steps
+        self.assertEqual(len(charged), dec.plain_steps)
+        # without the copy every step is plain
+        ck, seq, pools, head, dec, row, _ = self._decode(
+            lambda seq: PROMPT, plain=True, self_gate=True, lookup=0)
+        dec._g_begin("off", hold=10**6)
+        out = dec.generate(seq[0], row, len(PROMPT), N, context=PROMPT)
+        self.assertEqual(out, seq[:N])
+        self.assertEqual(dec.plain_steps, N - 1)
 
 
 @unittest.skipUnless(importlib.util.find_spec("mlx_lm.models.inkling2")

@@ -190,7 +190,8 @@ def main() -> int:
                                    plain_fn=ad.plain)
             emit(first)
             out = dec.generate(first, hidden[:, -1:], len(ids),
-                               args.max_tokens, on_token=emit, stop=eos)
+                               args.max_tokens, on_token=emit, stop=eos,
+                               context=ids)
         else:
             def queue(t):
                 """The forward of `t` (an id, or the step before's argmax
@@ -227,8 +228,11 @@ def main() -> int:
           f"streamed {reader.bytes_read/1e9:.1f} GB from SSD ---")
     if dec is not None:
         gate = dec.stats()["gate"]
+        lk = dec.lookup
+        by_copy = (f" ({lk.kept}/{lk.proposed} by copy)"
+                   if lk is not None and lk.proposed else "")
         print(f"--- pipeline: {dec.draft_ok}/{dec.draft_tried} drafts "
-              f"accepted, tokens per step "
+              f"accepted{by_copy}, tokens per step "
               f"{dict(sorted(dec.accepted_hist.items()))}, "
               f"{dec.plain_steps} plain steps, gate "
               f"{gate['decisions'] or gate['arm']} ---")

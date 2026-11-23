@@ -79,6 +79,12 @@ Requests that sample, process logits or ask for logprobs decode plainly. On a
 prompt-cache hit the head's context starts at the tokens this request
 prefills: drafts are verified, so that can only cost acceptance, not change
 the text.
+
+Drafts by copy (pipeline.Lookup): where the reply repeats text of the
+conversation (a file written out again, a quoted passage, a loop) for eight
+tokens, what followed there is drafted, 16 tokens a forward for a model in
+memory, as many streams as a head's drafts for a streamed one.
+STREAMLX_LOOKUP=0 in the environment turns them off.
 """
 
 from __future__ import annotations
@@ -527,8 +533,15 @@ def _pipelined(dec, kwargs: dict):
                 finish_reason=finish_reason)
 
         start = ad.offset(dec.cache)
+        # drafts by copy read the whole conversation: the request's tokens
+        # as the prompt cache saw them (this prompt is what it did not hold)
+        paged = _STATE.get("paged")
+        whole = paged.request_tokens() if paged is not None else None
+        if not whole or whole[-len(prompt):] != list(prompt):
+            whole = prompt
         later = dec.decode(first, rows[:, -1:], start,
-                           max_tokens if max_tokens > 0 else 2**62, stop=eos)
+                           max_tokens if max_tokens > 0 else 2**62, stop=eos,
+                           context=whole)
 
         def end():
             # Stock's cache ends after the last token: the next turn restores
@@ -606,8 +619,11 @@ def _instrumented(fn):
                             f"from SSD, {paged.nbytes / 1e9:.1f} GB stored")
                 if dec is not None:
                     msg += (f" | drafts {dec.draft_ok - drafted[0]}/"
-                            f"{dec.draft_tried - drafted[1]}, gate "
-                            f"{'on' if dec.drafting else 'off'}")
+                            f"{dec.draft_tried - drafted[1]}")
+                    if dec.lookup is not None and dec.lookup.proposed:
+                        msg += (f" ({dec.lookup.kept}/{dec.lookup.proposed} "
+                                "by copy)")
+                    msg += f", gate {'on' if dec.drafting else 'off'}"
                 peak = max(_STATE["mem"].get("peak_all", 0),
                            mx.get_peak_memory())
                 msg += f" | peak {peak / 2**30:.1f} GiB"

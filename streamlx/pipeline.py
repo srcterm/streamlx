@@ -22,6 +22,9 @@ builds the next graph. Because the streams still touch each layer's cache
 in sequence order, the computation IS the sequential decode; the only new
 machinery is undoing the cache writes of drafts that turn out wrong.
 
+Drafts need no head where the reply repeats the conversation: the tokens
+that followed there before are the drafts (Lookup), checked like any other.
+
 The model-specific pieces are a host ADAPTER (the same pattern as
 load_streaming_model's `loader=`): how to embed a token, split a layer,
 finish it, get logits, and draft. Everything here is model-agnostic:
@@ -65,6 +68,8 @@ restore_cache), as deepseek_v41 and inkling2 do.
 """
 from __future__ import annotations
 
+import math
+import os
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
@@ -79,6 +84,67 @@ from .pool import KEEPALIVE, all_held, keepalive_wait
 # pairs wait for the head's next draft instead of a feed per token; past this
 # many they are fed (one wait for the step in flight) to bound what is held.
 _PAIRS_HELD = 256
+
+# Drafts by copy (Lookup): how many tokens must repeat to find one; 0: none
+# (STREAMLX_LOOKUP=0: the head's drafts only).
+LOOKUP = int(os.environ.get("STREAMLX_LOOKUP", "3"))
+# A copy is drafted from once it has predicted this many committed tokens in
+# a row. Ordinary text repeats phrases of the prompt and of itself and then
+# goes on otherwise: drafted from at once, three in four such copies were
+# wrong after a token or two and cost 3 to 5% (the Mini, F172); a real copy
+# holds.
+_LK_MIN = 8
+# A copied draft's "confidence" is not a probability but its own calibration
+# bucket beside the head's ten, from this acceptance rate until measured.
+_LK_CONF, _LK_PRIOR = 2.0, 0.95
+
+
+class Lookup:
+    """Drafts by copy. Where the last `n` tokens occurred before, in the
+    prompt or in the reply so far, a model rewriting a file, quoting or
+    repeating itself goes on as it did there: the tokens that followed are
+    the draft, free to make and as long as the step can take. They come
+    before the head's drafts, for any model with a decoder.
+
+    `ptr` is where the text being copied continues (an index into `seq`),
+    `run` how many committed tokens in a row it predicted."""
+
+    def __init__(self, n: int = 3):
+        self.n = max(1, n)
+        self.reset(())
+
+    def reset(self, context) -> None:
+        """A new sequence: the prompt's tokens (all of them, cached or not)."""
+        n = self.n
+        self.seq = [int(t) for t in context]
+        # the n tokens before a position -> that position, the latest one
+        self.at = {tuple(self.seq[p - n:p]): p
+                   for p in range(n, len(self.seq))}
+        self.ptr = None
+        self.run = 0
+        self.proposed = self.kept = 0
+
+    def push(self, tok: int) -> None:
+        """A committed token."""
+        seq, n = self.seq, self.n
+        p = len(seq)
+        nxt = None
+        if self.ptr is not None and self.ptr < p and seq[self.ptr] == tok:
+            self.run += 1
+            nxt = self.ptr + 1
+        else:
+            self.run = 0
+        if p >= n:
+            self.at[tuple(seq[p - n:p])] = p
+        seq.append(tok)
+        if nxt is None or nxt >= len(seq):
+            nxt = self.at.get(tuple(seq[-n:])) if len(seq) >= n else None
+        self.ptr = nxt
+
+    def propose(self, depth: int) -> list[int]:
+        """Up to `depth` tokens the copy goes on with."""
+        return [] if self.ptr is None else self.seq[self.ptr:self.ptr + depth]
+
 
 # -- generic cache snapshot ---------------------------------------------------
 
@@ -181,8 +247,16 @@ class _Read:
 
 class PipelinedDecoder:
     def __init__(self, adapter, pools: dict, cache: list, k_max: int = 3,
-                 adaptive: bool = True, plain_fn=None, self_gate: bool = True):
+                 adaptive: bool = True, plain_fn=None, self_gate: bool = True,
+                 lookup: int | None = None, k_copy: int | None = None):
         self.ad = adapter
+        # Drafts by copy (Lookup): the match length that starts one, default
+        # LOOKUP, 0 for none. A copy that has held is drafted from whatever
+        # the head has and whatever the gate's arm: its steps are neither
+        # arm's rate, so they are not charged to the gate.
+        n = LOOKUP if lookup is None else lookup
+        self.lookup = Lookup(n) if n > 0 else None
+        self._k_copy = k_copy         # None: by the kind of step (_mode)
         self.pools = pools
         self.cache = cache
         # plain_fn(tok, cache) -> (logits [1,1,V], hidden): the host's own
@@ -236,7 +310,7 @@ class PipelinedDecoder:
         self.reader = next(iter(pools.values())).reader
         self.k_max = max(1, k_max)
         self._mode()
-        self.ex = ThreadPoolExecutor(max_workers=self.k_max,
+        self.ex = ThreadPoolExecutor(max_workers=max(self.k_max, self.k_copy),
                                      thread_name_prefix="streamlx-pipe-io")
         self.n_layers = len(adapter.layers)
         # stats
@@ -255,8 +329,9 @@ class PipelinedDecoder:
         # adaptive=False runs every draft the head gives (tests).
         self.adaptive = adaptive
         self._t_step: dict[int, float] = {}       # K -> EMA seconds per step
-        self._calib = [None] * 10                 # conf bucket -> EMA accept
-        self._calib_n = [0] * 10
+        # conf bucket -> EMA accept: the head's ten, then copied drafts'
+        self._calib = [None] * 11
+        self._calib_n = [0] * 11
         self._ema = 0.15
         # The time model excludes each sequence's first two steps (the
         # post-prefill step is cold: pool churn, graph warmup) and explores:
@@ -450,10 +525,18 @@ class PipelinedDecoder:
         products, attention), so logits differ in their last bits, as in
         stock's own chunked prefill, and where plain's best two tokens are
         about tied the text can take the other (the Mini: after some tens
-        of tokens on a long prompt; identical on short ones)."""
+        of tokens on a long prompt; identical on short ones).
+
+        And the tokens of a step of copied drafts. Streams: the head's
+        width (each stream in flight holds experts of its own), 4 with no
+        head. One forward: 16, its rows share every weight but their
+        experts (the Mini's own head at 8 a step lost 7 to 16% on ordinary
+        text against 4, a held copy at 16 gained a third: F172)."""
         ad = self.ad
         self.one_forward = getattr(ad, "verify", None) is not None and (
             getattr(ad, "batched", False) or all_held(self.pools))
+        self.k_copy = self._k_copy or (
+            16 if self.one_forward else self.k_max if self.k_max > 1 else 4)
 
     def step(self, toks: list[int], offset: int):
         """Returns (outputs, hiddens, snaps): outputs[i] = argmax after
@@ -651,21 +734,24 @@ class PipelinedDecoder:
 
     # -- the decode loop -----------------------------------------------------
     def generate(self, first_tok: int, first_hidden, offset: int,
-                 n_tokens: int, on_token=None, stop=()) -> list[int]:
+                 n_tokens: int, on_token=None, stop=(),
+                 context=None) -> list[int]:
         """Greedy pipelined decode. `first_tok` is the committed token whose
         forward has not run yet; `first_hidden` the hidden that produced
         it (the drafter's first pending pair). Returns the generated ids
         starting with first_tok, exactly like a plain greedy loop, ending
-        early after the first committed id in `stop`."""
+        early after the first committed id in `stop`. `context`: the
+        prompt's tokens, which drafts by copy read (Lookup)."""
         out = [first_tok]
-        for tok in self.decode(first_tok, first_hidden, offset, n_tokens, stop):
+        for tok in self.decode(first_tok, first_hidden, offset, n_tokens, stop,
+                               context):
             out.append(tok)
             if on_token is not None:
                 on_token(tok)
         return out
 
     def decode(self, first_tok: int, first_hidden, offset: int, n_tokens: int,
-               stop=()):
+               stop=(), context=None):
         """generate() one token at a time: yields the ids after first_tok. A
         server stops reading wherever a request ends, so however this ends,
         closed early included, the cache ends just after the last id out when
@@ -673,6 +759,10 @@ class PipelinedDecoder:
         else just before it."""
         self._warm = self._warm_gate = 0           # a sequence's cold steps
         self._mode()
+        lk = self.lookup
+        if lk is not None:
+            lk.reset(context if context is not None else ())
+            lk.push(first_tok)
         if first_tok in stop:
             return
         n = 1
@@ -695,9 +785,12 @@ class PipelinedDecoder:
         while n < n_tokens:
             drafts, conf = [], []
             queued = pend is not None
+            copy = not queued and self._copy_ready()
+            if copy:                    # (the head gets its tokens later)
+                drafts, conf = self._copied()
             if depth <= 0:
                 pairs = []                          # no head to keep exact
-            elif queued or (ahead and self._plain_next(depth)):
+            elif copy or queued or (ahead and self._plain_next(depth)):
                 if len(pairs) >= _PAIRS_HELD:
                     self._feed(pairs)
                     pairs = []
@@ -709,8 +802,10 @@ class PipelinedDecoder:
                     t0 = time.perf_counter()
                     tok, h = pend if queued else self._plain_queue(cur)
                     self._built = 0.0
+                    # (not on a copy one token from being drafted from)
                     pend = (self._plain_queue(tok) if self._plain_next(depth)
-                            and n + 1 < n_tokens else None)
+                            and n + 1 < n_tokens
+                            and not self._copy_ready(1) else None)
                     nxt = int(tok.item())
                     # The gate is charged what the step costs without running
                     # ahead (plus the next one's build, hidden here): with
@@ -725,6 +820,8 @@ class PipelinedDecoder:
                     nxt, _lg, h = self.plain_step(cur)
                 self.steps += 1
                 pairs.append((h, nxt))
+                if lk is not None:
+                    lk.push(nxt)
                 n += 1
                 yield nxt
                 if nxt in stop:
@@ -745,10 +842,21 @@ class PipelinedDecoder:
             self.draft_tried += K - 1
             self.draft_ok += a - 1
             self.accepted_hist[a] = self.accepted_hist.get(a, 0) + 1
+            if lk is not None:
+                if copy:
+                    lk.proposed += K - 1
+                    lk.kept += a - 1
+                for i in range(a):
+                    lk.push(outs[i])
             tr = time.perf_counter()
             self.rollback(snaps, a)
-            # the step's cost up to where the next one can begin
-            self._gate_account(dt + time.perf_counter() - tr, a)
+            if copy:
+                # neither arm's rate; nor is the next step's, whose draft
+                # or feed takes the copy's tokens to the head
+                self._g_draft, self._g_settle = 0.0, True
+            else:
+                # the step's cost up to where the next one can begin
+                self._gate_account(dt + time.perf_counter() - tr, a)
             for i in range(a):
                 pairs.append((hiddens[i], outs[i]))
                 n += 1
@@ -779,11 +887,16 @@ class PipelinedDecoder:
     # -- adaptive K -----------------------------------------------------------
     @staticmethod
     def _bucket(c: float) -> int:
+        if c >= _LK_CONF:                 # a copied draft
+            return 10
         return min(9, max(0, int(c * 10)))
 
     def _cal(self, c: float) -> float:
-        v = self._calib[self._bucket(c)]
-        return c if v is None else v
+        b = self._bucket(c)
+        v = self._calib[b]
+        if v is None:
+            return _LK_PRIOR if b == 10 else c
+        return v
 
     def _learn_accept(self, confs, a: int) -> None:
         """Draft j (0-based) was accepted iff j < a - 1; draft j+1 was only
@@ -878,6 +991,25 @@ class PipelinedDecoder:
             K = self._choose_k(conf)
             return drafts[:K - 1], conf[:K - 1]
         return drafts, conf
+
+    def _copy_ready(self, soon: int = 0) -> bool:
+        """A copy has predicted _LK_MIN committed tokens (`soon`: will have
+        once it predicts that many more) and has tokens to go on with."""
+        lk = self.lookup
+        return (lk is not None and self.k_copy > 1 and lk.ptr is not None
+                and lk.run + soon >= _LK_MIN)
+
+    def _copied(self):
+        """(drafts, confs) of a step by copy: as many drafts as the copy
+        has predicted tokens so far (one that ends as it starts then costs
+        half a full step: a served reply lost 15 drafts to one), and as are
+        each more likely kept than not at the copies' measured acceptance,
+        at least one (which keeps measuring it)."""
+        n, p = min(self.k_copy - 1, self.lookup.run), self._cal(_LK_CONF)
+        if self.adaptive and p < 1.0:
+            n = max(1, min(n, int(math.log(0.5) / math.log(max(p, 0.01)))))
+        drafts = self.lookup.propose(n)
+        return drafts, [_LK_CONF] * len(drafts)
 
     def _feed(self, pairs) -> None:
         """Gated OFF: no head call, no stage bytes, but the head's own cache
