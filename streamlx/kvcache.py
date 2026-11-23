@@ -11,11 +11,14 @@ anything stored, from any earlier turn or conversation, and RAM holds only
 the active request's cache.
 
 Layers whose cache grows along the sequence (KVCache, QSAKVCache,
-QuantizedKVCache, ConcatenateKVCache and CacheLists of them) store each
-segment's slice: a prefix restores from the chain of segments before it,
-cut at any token when every layer is such a cache. Other layers (recurrent
-ArraysCache, rotating windows) store their whole state at the segment's end,
-so models with them restore at segment ends only.
+QuantizedKVCache, ConcatenateKVCache) store each segment's slice: a prefix
+restores from the chain of segments before it, cut at any token when every
+layer is such a cache. Other layers (recurrent ArraysCache, rotating
+windows) store their state at the segment's end, a window only the rows a
+next token can reach, so models with them restore at segment ends only. A
+CacheList (Inkling 2's layers: attention rows beside a convolution state)
+stores each member its own way: stored whole, each segment would write all
+the rows before it again (a 128k-token conversation, ~100 GB).
 
 Each model's segments sit in a directory of its own under the root, named
 for its path, config and weight files (weights replaced under the same path
@@ -33,6 +36,7 @@ save_progress(n, cache) when the active request's prefill reaches token n.
 from __future__ import annotations
 
 import bisect
+import copy
 import hashlib
 import heapq
 import importlib
@@ -53,7 +57,7 @@ import mlx.core as mx
 import numpy as np
 from mlx.utils import tree_flatten, tree_unflatten
 
-FORMAT = 1
+FORMAT = 2      # 2: a CacheList's members each their own way, windows cut
 _STEP = 256      # tokens per hash step
 _SLICED = ("KVCache", "QSAKVCache", "QuantizedKVCache", "ConcatenateKVCache")
 # state leaves of a sliced cache not along axis -2: their axis, or None for what
@@ -122,11 +126,39 @@ def stored_bytes(root) -> int:
 
 
 def _sliced(c) -> bool:
-    """Whether a layer cache grows along the sequence (axis -2) and nothing
-    else, so any token range of it can be cut out and concatenated back."""
-    if type(c).__name__ == "CacheList":
-        return all(_sliced(x) for x in c.caches)
+    """Whether a cache grows along the sequence (axis -2) and nothing else,
+    so any token range of it can be cut out and concatenated back."""
     return type(c).__name__ in _SLICED
+
+
+def _window(c):
+    """A rotating window (mlx-lm's RotatingKVCache) after a forward of
+    several tokens holds them and the max_size - 1 rows before them, in
+    order; the next forward reaches back max_size - 1 rows, a token
+    max_size (`keep` rows and the last max_size - keep, then it rotates).
+    A copy of c with only those rows (the same next state: the same rows,
+    the same write index), else c."""
+    if (type(c).__name__ != "RotatingKVCache"
+            or getattr(c, "keys", None) is None):
+        return c
+    n, size, keep = c.keys.shape[2], c.max_size, c.keep
+    if n <= size or c._idx != n:    # (in order: the last update appended)
+        return c
+
+    def cut(v):
+        tail = v[..., n - (size - keep):, :]
+        return (mx.concatenate([v[..., :keep, :], tail], axis=2) if keep
+                else tail)
+
+    w = copy.copy(c)
+    w.keys, w.values, w._idx = cut(c.keys), cut(c.values), size
+    return w
+
+
+def _layout(specs) -> list:
+    """The cache classes of a segment's layers, a CacheList's members too."""
+    return [[s["cls"], _layout(s["members"]) if "members" in s else None]
+            for s in specs]
 
 
 def _offset(c) -> int | None:
@@ -159,6 +191,36 @@ def _host(a: mx.array) -> tuple[str, np.ndarray]:
     if a.dtype == mx.bfloat16:
         a = a.view(mx.uint16)
     return tag, np.array(a)
+
+
+def _store(c, prefix: str, start: int, end: int, host: dict) -> dict:
+    """A cache's part of the segment tokens[start:end]: its arrays into
+    `host` under `prefix`, and its spec. A CacheList's members are stored
+    each their own way, under prefix + their index."""
+    cls = f"{type(c).__module__}.{type(c).__qualname__}"
+    if type(c).__name__ == "CacheList":
+        members = [_store(m, f"{prefix}{j}.", start, end, host)
+                   for j, m in enumerate(c.caches)]
+        return {"cls": cls, "sliced": all(m["sliced"] for m in members),
+                "members": members}
+    sl = _sliced(c)
+    if not sl:
+        c = _window(c)
+    axes = _LEAF_AXIS.get(type(c).__name__, {}) if sl else {}
+    scalars = {}
+    for path, v in tree_flatten(c.state):
+        axis = axes.get(path, -2)
+        if axis is None:
+            continue
+        if isinstance(v, mx.array):
+            host[f"{prefix}{path}"] = _host(
+                v if not sl else v[..., start:end, :] if axis == -2
+                else v[..., start:end])
+        else:
+            scalars[path] = v
+    meta = getattr(c, "meta_state", "")
+    return {"cls": cls, "sliced": sl, "scalars": scalars,
+            "meta": list(meta) if isinstance(meta, tuple) else meta}
 
 
 @dataclass
@@ -396,27 +458,8 @@ class PagedPromptCache:
         mx.eval([v for c in cache for _, v in tree_flatten(c.state)
                  if isinstance(v, mx.array)])
         host = {"tokens": ("I32", a[start:end].copy())}
-        layers = []
-        for i, c in enumerate(cache):
-            sl = _sliced(c)
-            axes = _LEAF_AXIS.get(type(c).__name__, {}) if sl else {}
-            scalars = {}
-            for path, v in tree_flatten(c.state):
-                axis = axes.get(path, -2)
-                if axis is None:
-                    continue
-                if isinstance(v, mx.array):
-                    host[f"{i}.{path}"] = _host(
-                        v if not sl else v[..., start:end, :] if axis == -2
-                        else v[..., start:end])
-                else:
-                    scalars[path] = v
-            meta = getattr(c, "meta_state", "")
-            layers.append({"cls": f"{type(c).__module__}."
-                                  f"{type(c).__qualname__}",
-                           "sliced": sl, "scalars": scalars,
-                           "meta": list(meta) if isinstance(meta, tuple)
-                           else meta})
+        layers = [_store(c, f"{i}.", start, end, host)
+                  for i, c in enumerate(cache)]
         if self._sliced_only is None:
             self._sliced_only = all(x["sliced"] for x in layers)
         meta = {"format": FORMAT, "key": key, "prev": prev, "start": start,
@@ -439,49 +482,74 @@ class PagedPromptCache:
         if partial is not None:
             loaded.append(mx.load(str(partial[0].path), return_metadata=True))
         metas = [json.loads(m["streamlx"]) for _, m in loaded]
-        kinds = {tuple(x["cls"] for x in m["layers"]) for m in metas}
+        kinds = {json.dumps(_layout(m["layers"])) for m in metas}
         if len(kinds) != 1:   # e.g. KV quantized from some point on
             raise ValueError("segments of different cache layouts")
         n = chain[-1].end if chain else 0
         if partial is not None:
             n = partial[0].start + partial[1]
         whole = len(chain)
-        out = []
-        for i, spec in enumerate(metas[-1]["layers"]):
-            prefix = f"{i}."
+
+        def spec_in(meta, at):
+            spec = meta["layers"][at[0]]
+            for j in at[1:]:
+                spec = spec["members"][j]
+            return spec
+
+        def rebuild(at, spec):
+            prefix = "".join(f"{k}." for k in at)
+            cls = _cls(spec["cls"])
+            if "members" in spec:     # a CacheList: its members, rebuilt
+                return cls(*(rebuild(at + (j,), m)
+                             for j, m in enumerate(spec["members"])))
             names = [k[len(prefix):] for k in loaded[-1][0]
                      if k.startswith(prefix)]
             axes = _LEAF_AXIS.get(spec["cls"].rpartition(".")[2], {})
+            # a KVCache's rows go in a buffer with the room its updates
+            # allocate (`step` rows at a time), as a live one has: else the
+            # next token would copy every row into a new buffer
+            step = getattr(cls, "step", 0) if cls.__name__ == "KVCache" else 0
             leaves = []
             for name in names:
                 if spec["sliced"]:
                     axis = axes.get(name, -2)
-                    parts = [arrs[prefix + name] for arrs, _ in
+                    parts = [arrs.pop(prefix + name) for arrs, _ in
                              loaded[:whole]]
                     if partial is not None:
-                        v = loaded[-1][0][prefix + name]
+                        v = loaded[-1][0].pop(prefix + name)
                         parts.append(v[..., :partial[1], :] if axis == -2
                                      else v[..., :partial[1]])
+                    pad = -n % step if step and axis == -2 else 0
+                    if pad:
+                        v = parts[-1]
+                        parts.append(mx.zeros((*v.shape[:-2], pad,
+                                               v.shape[-1]), v.dtype))
                     v = (parts[0] if len(parts) == 1
                          else mx.concatenate(parts, axis=axis))
+                    # one array at a time: its parts go once it is copied,
+                    # so a restore holds the cache once, not twice
+                    mx.eval(v)
+                    del parts
                 else:
                     v = loaded[whole - 1][0][prefix + name]
                 leaves.append((name, v))
-            src = metas[-1] if spec["sliced"] else metas[whole - 1]
-            leaves += list(src["layers"][i]["scalars"].items())
+            src = spec_in(metas[-1] if spec["sliced"] else metas[whole - 1],
+                          at)
+            leaves += list(src["scalars"].items())
             state = tree_unflatten(leaves)
-            cls = _cls(spec["cls"])
             # mlx-vlm's caches (and mlx-lm's older ones) rebuild from both
             if len(inspect.signature(cls.from_state).parameters) > 1:
-                meta = src["layers"][i].get("meta", "")
+                meta = src.get("meta", "")
                 c = cls.from_state(state, tuple(meta) if isinstance(meta, list)
                                    else meta)
             else:
                 c = cls.from_state(state)
             if spec["sliced"]:
                 _set_offset(c, n)
-            out.append(c)
-        return out, n
+            return c
+
+        return [rebuild((i,), spec)
+                for i, spec in enumerate(metas[-1]["layers"])], n
 
     # -- the server's interface ----------------------------------------------
 
