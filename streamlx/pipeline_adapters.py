@@ -98,8 +98,6 @@ class StandardMoEAdapter:
         # concatenated in its order; other drafters read the last layer's
         self.tap_layers = tuple(getattr(drafter, "tap_layers", None) or ())
         self.taps = frozenset(self.tap_layers)
-        if drafter is not None and not self.taps:
-            self.verify = None    # (forward_taps has no rows for such a head)
 
     def views(self, cache):
         """The core's per-layer cache list for the model's prompt cache."""
@@ -184,25 +182,20 @@ class StandardMoEAdapter:
         """The model's own one-token forward: the pipeline's plain_fn (tok an
         id or a queued step's argmax, token_ids). Returns (logits, the hidden
         draft_hidden gives; None without a head)."""
-        if self.drafter is None:
-            return self.model(token_ids(tok), cache=cache), None
-        want = self.tap_layers or (len(self.layers) - 1,)
-        with capture_layer_outputs(self.model, want) as got:
-            logits = self.model(token_ids(tok), cache=cache)
-        if not self.taps:
-            return logits, got[want[0]][-1]
-        return logits, mx.concatenate([got[i][-1] for i in self.tap_layers],
-                                      axis=-1)
+        return self.forward_taps(token_ids(tok), cache)
 
     def forward_taps(self, ids, cache):
         """The model's forward plus the draft head's context for every
-        position: the tap layers' outputs, concatenated (a prefill's)."""
-        with capture_layer_outputs(self.model, self.tap_layers) as got:
+        position (a prefill's): the tap layers' outputs, concatenated, else
+        a head's last layer's; None without a head."""
+        want = self.tap_layers or (
+            (len(self.layers) - 1,) if self.drafter is not None else ())
+        if not want:
+            return self.model(ids, cache=cache), None
+        with capture_layer_outputs(self.model, want) as got:
             logits = self.model(ids, cache=cache)
-        if not self.taps:
-            return logits, None
         return logits, mx.concatenate(
-            [mx.concatenate(got[i], axis=1) for i in self.tap_layers], axis=-1)
+            [mx.concatenate(got[i], axis=1) for i in want], axis=-1)
 
     # -- a step's tokens in one forward (PipelinedDecoder._mode) ------------
     def verify(self, toks, cache):
@@ -319,7 +312,9 @@ class WholeModelAdapter(StandardMoEAdapter):
 
 
 def adapter_for(model, drafter=None):
-    """The pipeline adapter for `model`'s decoder shape."""
+    """The pipeline adapter for `model`'s decoder shape (with no draft head,
+    WholeModelAdapter where the standard adapter does not split the
+    layers)."""
     mt = getattr(getattr(model, "args", None), "model_type", None)
     lm = getattr(getattr(model, "model", None), "language_model", None)
     visits = getattr(lm, "layer_visits", None)
@@ -348,7 +343,12 @@ def adapter_for(model, drafter=None):
         from .inkling2 import Inkling2Adapter
 
         return Inkling2Adapter(model, drafter)
-    return StandardMoEAdapter(model, drafter)
+    try:
+        return StandardMoEAdapter(model, drafter)
+    except (AttributeError, StopIteration):
+        if drafter is not None:
+            raise
+        return WholeModelAdapter(model)
 
 
 def headless_adapter(model):
@@ -363,8 +363,6 @@ def headless_adapter(model):
         return adapter_for(model)
     except NotImplementedError:      # a looped stack that is not Inkling 2's
         return None
-    except (AttributeError, StopIteration):
-        return WholeModelAdapter(model)
 
 
 @contextmanager

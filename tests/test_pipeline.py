@@ -13,24 +13,30 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 
 import toy
 from streamlx import pipeline
-from streamlx.integrate import prefill_cache, resize_pools
+from streamlx.integrate import prefill_cache
 from streamlx.pipeline import PipelinedDecoder
 from streamlx.pipeline_adapters import adapter_for
 
 N, PROMPT = 48, toy.prompt()
 
 
-def _held(ck):
-    """(model, pools) of the toy with every expert in memory."""
-    m, pools = ck.streaming(8)
-    resize_pools(pools, sum(p.n_experts * p.expert_bytes
-                            for p in pools.values()))
-    return m, pools
-
-
 def _other(rng, t: int, vocab: int) -> int:
     """A token that is not t: a wrong draft."""
     return (t + 1 + int(rng.integers(0, vocab - 1))) % vocab
+
+
+def _drafts(rng, seq, i: int, n: int, most: int, wrong: float,
+            vocab: int = toy.VOCAB):
+    """A step's tokens from seq[i], up to `most` and none past seq[n - 1],
+    each draft wrong with probability `wrong`; and how many are kept."""
+    toks, a = [seq[i]], None
+    for j in range(1, min(int(rng.integers(1, most + 1)), n - i)):
+        t = seq[i + j]
+        if rng.random() < wrong:
+            t = _other(rng, t, vocab)
+            a = j if a is None else a
+        toks.append(t)
+    return toks, len(toks) if a is None else a
 
 
 class Scheduler(unittest.TestCase):
@@ -129,14 +135,7 @@ class Rollback(unittest.TestCase):
                                            adaptive=False, self_gate=False)
                     i = same = rolled = 0
                     while i < n:
-                        toks, a = [seq[i]], None
-                        for j in range(1, min(int(rng.integers(1, 5)), n - i)):
-                            t = seq[i + j]
-                            if rng.random() < wrong:
-                                t = _other(rng, t, toy.VOCAB)
-                                a = j if a is None else a
-                            toks.append(t)
-                        a = len(toks) if a is None else a
+                        toks, a = _drafts(rng, seq, i, n, 4, wrong)
                         outs, hid, snaps = dec.step(toks, len(PROMPT) + i)
                         for j in range(a):
                             same += (bool(mx.array_equal(
@@ -156,16 +155,22 @@ class OneForward(unittest.TestCase):
     have: trimmed (KVCache, a window not yet full) or put back and run again
     (a window that has wrapped)."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.ck = toy.Checkpoint()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ck.close()
+
     def test_rejected_drafts(self):
-        ck = toy.Checkpoint()
-        self.addCleanup(ck.close)
-        n = 64
+        ck, n = self.ck, 64
         for window in (None, 4, 32):          # the prompt is 12 tokens
             seq, _ = toy.greedy(ck.ref, PROMPT, n,
                                 Rollback.caches(ck.ref, window))
             with self.subTest(window=window):
                 rng = np.random.default_rng(1)
-                m, pools = _held(ck)
+                m, pools = ck.held()
                 ad = adapter_for(m, None)
                 cache = Rollback.caches(m, window)
                 mx.eval(m(mx.array([PROMPT]), cache=cache))
@@ -174,14 +179,7 @@ class OneForward(unittest.TestCase):
                 self.assertTrue(dec.one_forward)
                 i = same = rolled = 0
                 while i < n:
-                    toks, a = [seq[i]], None
-                    for j in range(1, min(int(rng.integers(1, 7)), n - i)):
-                        t = seq[i + j]
-                        if rng.random() < 0.3:
-                            t = _other(rng, t, toy.VOCAB)
-                            a = j if a is None else a
-                        toks.append(t)
-                    a = len(toks) if a is None else a
+                    toks, a = _drafts(rng, seq, i, n, 6, 0.3)
                     outs, _hid, rec = dec.step(toks, len(PROMPT) + i)
                     same += sum(outs[j] == seq[i + j + 1] for j in range(a))
                     dec.rollback(rec, a)
@@ -192,9 +190,7 @@ class OneForward(unittest.TestCase):
                 self.assertGreater(rolled, 0)
 
     def test_streams_where_experts_are_read(self):
-        ck = toy.Checkpoint()
-        self.addCleanup(ck.close)
-        m, pools = ck.streaming(8)
+        m, pools = self.ck.streaming(8)
         ad = adapter_for(m, None)
         dec = PipelinedDecoder(ad, pools, [], k_max=1)
         self.assertFalse(dec.one_forward)
@@ -207,12 +203,11 @@ class OneForward(unittest.TestCase):
         # a draft head is refused)
         from streamlx import pipeline_adapters
 
-        ck = toy.Checkpoint()
-        self.addCleanup(ck.close)
+        ck = self.ck
         seq, _ = toy.greedy(ck.ref, PROMPT, N)
         with mock.patch.object(pipeline_adapters, "_ATTN", ("no_such",)):
             for held in (False, True):
-                m, pools = _held(ck) if held else ck.streaming(8)
+                m, pools = ck.held() if held else ck.streaming(8)
                 ad = pipeline_adapters.headless_adapter(m)
                 self.assertIsNone(ad.begin)
                 cache = make_prompt_cache(m)
@@ -364,7 +359,7 @@ class RunAhead(unittest.TestCase):
         self.ck = toy.Checkpoint()
         self.addCleanup(self.ck.close)
         self.seq, _ = toy.greedy(self.ck.ref, PROMPT, N)
-        self.m, self.pools = _held(self.ck)
+        self.m, self.pools = self.ck.held()
 
     def _decoder(self, head, **kw):
         ad = adapter_for(self.m, head)
@@ -446,6 +441,15 @@ class CopiedDrafts(unittest.TestCase):
     drafted from with no head at all and whatever the gate's arm, outside
     its accounts."""
 
+    @classmethod
+    def setUpClass(cls):
+        cls.ck = toy.Checkpoint()
+        cls.seq, _ = toy.greedy(cls.ck.ref, PROMPT, N)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ck.close()
+
     def test_lookup(self):
         lk = pipeline.Lookup(3)
         lk.reset(range(1, 10))                    # 1 .. 9
@@ -467,11 +471,10 @@ class CopiedDrafts(unittest.TestCase):
         self.assertEqual((lk.run, lk.propose(6)), (2, [3, 1, 2]))
 
     def _decode(self, context, head=_MuteHead, plain=False, held=False, **kw):
-        ck = toy.Checkpoint()
-        self.addCleanup(ck.close)
-        seq, _ = toy.greedy(ck.ref, PROMPT, N)
-        m, pools = _held(ck) if held else ck.streaming(8)
-        head = head and head(seq, _Clock())
+        """(decoder, the head's first row, context(seq)) on the toy streamed,
+        or with every expert held."""
+        m, pools = self.ck.held() if held else self.ck.streaming(8)
+        head = head and head(self.seq, _Clock())
         ad = adapter_for(m, head)
         cache = make_prompt_cache(m)
         logits, rows = ad.forward_taps(mx.array([PROMPT]), cache)
@@ -480,20 +483,21 @@ class CopiedDrafts(unittest.TestCase):
         dec = PipelinedDecoder(ad, pools, ad.views(cache), adaptive=False,
                                plain_fn=ad.plain if plain else None, **kw)
         row = None if rows is None else rows[:, -1:]
-        return ck, seq, pools, head, dec, row, context(seq)
+        return dec, row, context(self.seq)
 
     def test_a_copy_is_plain_decoding(self):
         # with a head that proposes nothing and with no head, as streams and
         # (every expert in memory) in one forward a step
+        seq = self.seq
         for head, held in ((_MuteHead, False), (_MuteHead, True),
                            (None, False), (None, True)):
-            ck, seq, pools, head, dec, row, ctx = self._decode(
-                lambda seq: PROMPT + seq, head, plain=head is None,
-                held=held, k_copy=4)
+            dec, row, ctx = self._decode(lambda seq: PROMPT + seq, head,
+                                         plain=head is None, held=held,
+                                         k_copy=4)
             self.assertEqual(dec.one_forward, held)
             out = dec.generate(seq[0], row, len(PROMPT), N, context=ctx)
             self.assertEqual(out, seq[:N])
-            self.assertEqual(toy.wrong_slots(ck.ref, pools), [])
+            self.assertEqual(toy.wrong_slots(self.ck.ref, dec.pools), [])
             lk = dec.lookup
             # (a copy is drafted from once it has predicted eight tokens;
             # the toy repeats itself: where three tokens occurred twice the
@@ -509,34 +513,35 @@ class CopiedDrafts(unittest.TestCase):
             return PROMPT + [(_other(rng, t, toy.VOCAB) if i % 13 == 12 else t)
                              for i, t in enumerate(seq)]
 
-        ck, seq, pools, head, dec, row, ctx = self._decode(
-            spoiled, self_gate=False, lookup=2)
+        dec, row, ctx = self._decode(spoiled, self_gate=False, lookup=2)
+        seq = self.seq
         with mock.patch.object(pipeline, "_LK_MIN", 4):
             out = dec.generate(seq[0], row, len(PROMPT), N, context=ctx)
         self.assertEqual(out, seq[:N])
-        self.assertEqual(toy.wrong_slots(ck.ref, pools), [])
+        self.assertEqual(toy.wrong_slots(self.ck.ref, dec.pools), [])
         self.assertGreater(dec.lookup.proposed, dec.lookup.kept)
         self.assertGreater(dec.lookup.kept, 0)
         # the tokens of a copy reach the head with its next draft
-        self.assertGreaterEqual(head.pos, N - 13)
+        self.assertGreaterEqual(dec.ad.drafter.pos, N - 13)
 
     def test_width_follows_acceptance(self):
-        ck, seq, pools, head, dec, row, ctx = self._decode(
-            lambda seq: PROMPT + seq, k_copy=16)
+        dec, row, ctx = self._decode(lambda seq: PROMPT + seq, k_copy=16)
         dec.adaptive = True
         dec.lookup.reset(ctx)
-        for t in seq[:3]:
+        for t in self.seq[:3]:
             dec.lookup.push(t)
         # as many drafts as are each more likely kept than not, and no
         # more than the copy has predicted tokens
-        for run, rate, drafts in ((16, None, 13), (16, 1.0, 15), (16, 0.9, 6),
-                                  (16, 0.5, 1), (16, 0.0, 1), (8, 1.0, 8)):
+        for run, rate, drafts in ((16, pipeline._LK_PRIOR, 13), (16, 1.0, 15),
+                                  (16, 0.9, 6), (16, 0.5, 1), (16, 0.0, 1),
+                                  (8, 1.0, 8)):
             dec.lookup.run, dec._calib[10] = run, rate
             self.assertEqual(len(dec._copied()[0]), drafts)
 
     def test_outside_the_gate(self):
-        ck, seq, pools, head, dec, row, ctx = self._decode(
-            lambda seq: PROMPT + seq, plain=True, self_gate=True)
+        seq = self.seq
+        dec, row, ctx = self._decode(lambda seq: PROMPT + seq, plain=True,
+                                     self_gate=True)
         dec._g_begin("off", hold=10**6)           # drafting held off
         charged = []
         account = dec._gate_account
@@ -548,8 +553,8 @@ class CopiedDrafts(unittest.TestCase):
         self.assertEqual(set(charged), {1})       # charged its plain steps
         self.assertEqual(len(charged), dec.plain_steps)
         # without the copy every step is plain
-        ck, seq, pools, head, dec, row, _ = self._decode(
-            lambda seq: PROMPT, plain=True, self_gate=True, lookup=0)
+        dec, row, _ = self._decode(lambda seq: PROMPT, plain=True,
+                                   self_gate=True, lookup=0)
         dec._g_begin("off", hold=10**6)
         out = dec.generate(seq[0], row, len(PROMPT), N, context=PROMPT)
         self.assertEqual(out, seq[:N])
@@ -609,14 +614,7 @@ class Inkling2(unittest.TestCase):
                             rows_same += bool(mx.array_equal(row, taps[i]))
                             i, steps = i + 1, steps + 1
                             continue
-                        toks, a = [seq[i]], None
-                        for j in range(1, min(int(rng.integers(1, 5)), n - i)):
-                            t = seq[i + j]
-                            if rng.random() < wrong:
-                                t = _other(rng, t, ink.VOCAB)
-                                a = j if a is None else a
-                            toks.append(t)
-                        a = len(toks) if a is None else a
+                        toks, a = _drafts(rng, seq, i, n, 4, wrong, ink.VOCAB)
                         outs, hid, snaps = dec.step(toks, len(prompt) + i)
                         for j in range(a):
                             lg = ad.logits(hid[j][..., -hidden:])[0, -1]

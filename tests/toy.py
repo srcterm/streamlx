@@ -21,7 +21,7 @@ from mlx_lm.models.cache import make_prompt_cache
 if os.environ.get("STREAMLX_TEST_DEVICE") == "cpu":
     mx.set_default_device(mx.cpu)
 
-from streamlx.integrate import install_streaming  # noqa: E402
+from streamlx.integrate import install_streaming, resize_pools  # noqa: E402
 
 ARGS = dict(model_type="qwen3_moe", hidden_size=64, num_hidden_layers=4,
             intermediate_size=128, num_attention_heads=4,
@@ -73,6 +73,13 @@ class Checkpoint:
         in memory."""
         m = build(self.file)
         pools, _ = install_streaming(m, self.dir, slots)
+        return m, pools
+
+    def held(self):
+        """(model, pools): the checkpoint streamed with every expert held."""
+        m, pools = self.streaming(8)
+        resize_pools(pools, sum(p.n_experts * p.expert_bytes
+                                for p in pools.values()))
         return m, pools
 
     def close(self) -> None:

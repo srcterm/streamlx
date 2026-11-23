@@ -161,7 +161,7 @@ def main() -> int:
                     logits = model(chunk, cache=cache)
                 else:
                     logits, h = ad.forward_taps(chunk, cache)
-                    context.append([] if h is None else h)
+                    context.append(h)
             mx.eval(logits, context)
         if pre < budget:
             resize_pools(pools, budget)
@@ -194,7 +194,7 @@ def main() -> int:
             del context
             # plain_fn arms the self-gate: drafting only while it is faster
             dec = PipelinedDecoder(ad, pools, ad.views(cache),
-                                   k_max=draft_k or 1, plain_fn=ad.plain)
+                                   k_max=draft_k, plain_fn=ad.plain)
             emit(first)
             out = dec.generate(first, hidden, len(ids), args.max_tokens,
                                on_token=emit, stop=eos, context=ids)

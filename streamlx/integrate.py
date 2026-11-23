@@ -183,7 +183,9 @@ class StreamingSwitchGLU(nn.Module):
 
         y = switch_forward(x.reshape(b * t, -1)[order // k][None],
                            picks(flat), self.pool.pool, self.pool.qparams,
-                           self.pool.act, escales=self._esc(picks(indices)),
+                           self.pool.act,
+                           escales=(None if self.pool.escales is None
+                                    else self._esc(picks(indices))),
                            weights=None if w is None else picks(w))
         return y.reshape(b * t * k, -1)[inv].reshape(b, t, k, -1)
 

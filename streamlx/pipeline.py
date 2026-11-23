@@ -126,20 +126,13 @@ class Lookup:
 
     def push(self, tok: int) -> None:
         """A committed token."""
-        seq, n = self.seq, self.n
-        p = len(seq)
-        nxt = None
-        if self.ptr is not None and self.ptr < p and seq[self.ptr] == tok:
-            self.run += 1
-            nxt = self.ptr + 1
-        else:
-            self.run = 0
+        seq, n, p = self.seq, self.n, len(self.seq)
+        hit = self.ptr is not None and seq[self.ptr] == tok
+        self.run = self.run + 1 if hit else 0
         if p >= n:
             self.at[tuple(seq[p - n:p])] = p
         seq.append(tok)
-        if nxt is None or nxt >= len(seq):
-            nxt = self.at.get(tuple(seq[-n:])) if len(seq) >= n else None
-        self.ptr = nxt
+        self.ptr = self.ptr + 1 if hit else self.at.get(tuple(seq[-n:]))
 
     def propose(self, depth: int) -> list[int]:
         """Up to `depth` tokens the copy goes on with."""
@@ -332,7 +325,8 @@ class PipelinedDecoder:
         self.adaptive = adaptive
         self._t_step: dict[int, float] = {}       # K -> EMA seconds per step
         # conf bucket -> EMA accept: the head's ten, then copied drafts'
-        self._calib = [None] * 11
+        # (their prior until measured)
+        self._calib = [None] * 10 + [_LK_PRIOR]
         self._calib_n = [0] * 11
         self._ema = 0.15
         # The time model excludes each sequence's first two steps (the
@@ -553,7 +547,7 @@ class PipelinedDecoder:
         if self.one_forward:
             logits, rows, rec = self.ad.verify(toks, self.cache)
             outs = mx.argmax(logits[0], axis=-1)
-            mx.eval(outs, [] if rows is None else rows)
+            mx.eval(outs, rows)
             return (outs.tolist(),
                     [None if rows is None else rows[:, i:i + 1]
                      for i in range(len(toks))], rec)
@@ -630,16 +624,12 @@ class PipelinedDecoder:
 
     def rollback(self, snaps, a: int) -> None:
         """Undo the cache writes of streams >= a (keep streams 0..a-1)."""
-        if self.one_forward:
-            t0 = time.perf_counter()
-            self.ad.rollback(self.cache, snaps, a)
-            self.t_rollback += time.perf_counter() - t0
-            return
-        if not snaps or a >= len(snaps[0]):
-            return
         t0 = time.perf_counter()
-        for l in range(self.n_layers):
-            self._restore(self.cache[l], snaps[l][a])
+        if self.one_forward:
+            self.ad.rollback(self.cache, snaps, a)
+        elif snaps and a < len(snaps[0]):
+            for l in range(self.n_layers):
+                self._restore(self.cache[l], snaps[l][a])
         self.t_rollback += time.perf_counter() - t0
 
     # -- the plain fallback and the self-gate --------------------------------
@@ -875,6 +865,7 @@ class PipelinedDecoder:
                         self.rollback(snaps, min(i + 2, a))
                 if ending:
                     return
+            snaps = hiddens = None       # (not held into the steps after)
             offset += a
             cur = outs[a - 1]
             if pairs and depth == 0:
@@ -897,11 +888,8 @@ class PipelinedDecoder:
         return min(9, max(0, int(c * 10)))
 
     def _cal(self, c: float) -> float:
-        b = self._bucket(c)
-        v = self._calib[b]
-        if v is None:
-            return _LK_PRIOR if b == 10 else c
-        return v
+        v = self._calib[self._bucket(c)]
+        return c if v is None else v
 
     def _learn_accept(self, confs, a: int) -> None:
         """Draft j (0-based) was accepted iff j < a - 1; draft j+1 was only

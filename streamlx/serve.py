@@ -507,18 +507,16 @@ def _pipelined(dec, kwargs: dict):
             with prefill_cache(cache):
                 _, rows = ad.forward_taps(
                     mx.array([prompt[done:done + k]]), cache)
-            mx.eval([c.state for c in cache], [] if rows is None else rows)
-            if rows is not None:
-                ad.prime_pairs(rows, mx.array(
-                    [prompt[done + 1:done + k + 1]], dtype=mx.int32))
+            mx.eval(rows, [c.state for c in cache])
+            ad.prime_pairs(rows, mx.array(
+                [prompt[done + 1:done + k + 1]], dtype=mx.int32))
             done += k
             cb(done, len(prompt))
             mx.clear_cache()
         with prefill_cache(cache):
             logits, rows = ad.forward_taps(mx.array([prompt[done:]]),
                                            cache)
-        mx.eval(logits, [c.state for c in cache],
-                [] if rows is None else rows)
+        mx.eval(logits, rows, [c.state for c in cache])
         cb(len(prompt), len(prompt))
         token = first = int(mx.argmax(logits[0, -1]).item())
         dec.cache = ad.views(cache)
@@ -696,7 +694,7 @@ class StreamingModelProvider(srv.ModelProvider):
         if ad is not None:
             from streamlx.pipeline import PipelinedDecoder
 
-            _STATE["decoder"] = PipelinedDecoder(ad, pools, [], k_max=k or 1,
+            _STATE["decoder"] = PipelinedDecoder(ad, pools, [], k_max=k,
                                                  plain_fn=ad.plain)
         if auto:
             # what the memory limit leaves beside the trunk and the head is
