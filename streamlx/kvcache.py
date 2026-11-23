@@ -558,6 +558,11 @@ class PagedPromptCache:
                      best[-1].key if best else "")
         return cache, tokens[n:]
 
+    def request_tokens(self):
+        """The active request's whole prompt (what was restored from here
+        included), None before a request."""
+        return None if self._cur is None else self._cur[0]
+
     def save_progress(self, n: int, cache) -> None:
         """Prefill reached tokens[:n] of the active request: store it."""
         if self._cur is None or self._dir is None:

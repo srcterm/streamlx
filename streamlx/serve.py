@@ -71,15 +71,21 @@ flight, so each token's expert reads overlap the others' compute, with plain
 decoding's output. A checkpoint that carries one (Qwen3.8, DeepSeek-V4.1,
 Inkling 2) uses it by default; --draft-head takes an mlx-vlm drafter
 directory for other models, or none for plain decoding. Inkling 2 Mini (a
-looped stack) checks each step's drafts in one forward instead
-(pipeline.BatchedDecoder), which pays when its experts are in memory; its
-text can then leave plain decoding's where two tokens are about tied
-(--draft-head none keeps plain's). The self-gate's verdict carries across
-requests.
+looped stack) and any model whose experts are all in memory check each
+step's drafts in one forward instead (PipelinedDecoder._mode); the text can
+then leave plain decoding's where two tokens are about tied (--draft-head
+none keeps plain's). The self-gate's verdict carries across requests.
 Requests that sample, process logits or ask for logprobs decode plainly. On a
 prompt-cache hit the head's context starts at the tokens this request
 prefills: drafts are verified, so that can only cost acceptance, not change
 the text.
+
+Drafts by copy (pipeline.Lookup) need no head: where the reply repeats text
+of the conversation (a file written out again, a quoted passage, a loop) for
+eight tokens, what followed there is drafted, 16 tokens a forward for a model
+in memory, as many streams as a head's drafts for a streamed one. Every
+model gets them, one with no draft head too; --draft-head none, or
+STREAMLX_LOOKUP=0 in the environment, turns them off.
 """
 
 from __future__ import annotations
@@ -117,6 +123,7 @@ from streamlx.integrate import (
     resize_pools,
 )
 from streamlx.kvcache import PagedPromptCache, stored_bytes
+from streamlx.pipeline_adapters import greedy
 
 _CFG = {"budget_bytes": None, "trust": False, "tokenizer_config": {},
         "draft_head": "auto", "draft_k": None, "memory_bytes": 0,
@@ -512,7 +519,7 @@ def _pipelined(dec, kwargs: dict):
                                            cache)
         mx.eval(logits, rows, [c.state for c in cache])
         cb(len(prompt), len(prompt))
-        token = first = int(mx.argmax(logits[0, -1]).item())
+        token = first = int(greedy(logits[0, -1]).item())
         dec.cache = ad.views(cache)
         prompt_tps = len(prompt) / (time.perf_counter() - tic)
         tic = time.perf_counter()
@@ -528,8 +535,15 @@ def _pipelined(dec, kwargs: dict):
                 finish_reason=finish_reason)
 
         start = ad.offset(dec.cache)
-        later = dec.decode(first, rows[:, -1:], start,
-                           max_tokens if max_tokens > 0 else 2**62, stop=eos)
+        # drafts by copy read the whole conversation: the request's tokens
+        # as the prompt cache saw them (this prompt is what it did not hold)
+        paged = _STATE.get("paged")
+        whole = paged.request_tokens() if paged is not None else None
+        if not whole or whole[-len(prompt):] != list(prompt):
+            whole = prompt
+        later = dec.decode(first, None if rows is None else rows[:, -1:],
+                           start, max_tokens if max_tokens > 0 else 2**62,
+                           stop=eos, context=whole)
 
         def end():
             # Stock's cache ends after the last token: the next turn restores
@@ -605,10 +619,15 @@ def _instrumented(fn):
                 if paged is not None:
                     msg += (f" | kv: {paged.last[0]} of {paged.last[1]} tok "
                             f"from SSD, {paged.nbytes / 1e9:.1f} GB stored")
-                if dec is not None:
+                if dec is not None and (dec.ad.drafter is not None
+                                        or dec.draft_tried > drafted[1]):
                     msg += (f" | drafts {dec.draft_ok - drafted[0]}/"
-                            f"{dec.draft_tried - drafted[1]}, gate "
-                            f"{'on' if dec.drafting else 'off'}")
+                            f"{dec.draft_tried - drafted[1]}")
+                    if dec.lookup is not None and dec.lookup.proposed:
+                        msg += (f" ({dec.lookup.kept}/{dec.lookup.proposed} "
+                                "by copy)")
+                    if dec.self_gate:
+                        msg += f", gate {'on' if dec.drafting else 'off'}"
                 peak = max(_STATE["mem"].get("peak_all", 0),
                            mx.get_peak_memory())
                 msg += f" | peak {peak / 2**30:.1f} GiB"
@@ -636,7 +655,7 @@ class StreamingModelProvider(srv.ModelProvider):
         if adapter_path is not None or draft_model_path is not None:
             raise ValueError("adapters/draft models not supported with "
                              "expert streaming")
-        from streamlx.pipeline_adapters import default_draft
+        from streamlx.pipeline_adapters import default_draft, headless_adapter
 
         t0 = time.time()
         auto = _CFG["budget_bytes"] is None
@@ -654,7 +673,6 @@ class StreamingModelProvider(srv.ModelProvider):
                                 _CFG["draft_k"])
         drafter = None
         if head:
-            from streamlx.pipeline import BatchedDecoder, PipelinedDecoder
             from streamlx.pipeline_adapters import adapter_for, load_drafter
 
             t0 = time.time()
@@ -666,15 +684,19 @@ class StreamingModelProvider(srv.ModelProvider):
                 print(f"[streamlx] the checkpoint's draft head did not load "
                       f"({type(e).__name__}: {e}): plain decoding",
                       file=sys.stderr)
+        ad = None
         if drafter is not None:
             ad = adapter_for(model, drafter)
-            batched = getattr(ad, "batched", False)
-            _STATE["decoder"] = (BatchedDecoder if batched
-                                 else PipelinedDecoder)(
-                ad, pools, [], k_max=k, plain_fn=ad.plain)
             print(f"[streamlx] draft head in {time.time()-t0:.1f}s, up to "
-                  f"{k} tokens " + ("a forward" if batched else "in flight"),
-                  file=sys.stderr)
+                  f"{k} tokens " + ("a forward" if getattr(ad, "batched", 0)
+                                    else "in flight"), file=sys.stderr)
+        elif _CFG["draft_head"] == "auto" and not head:
+            ad = headless_adapter(model, pools)    # drafts by copy alone
+        if ad is not None:
+            from streamlx.pipeline import PipelinedDecoder
+
+            _STATE["decoder"] = PipelinedDecoder(ad, pools, [], k_max=k,
+                                                 plain_fn=ad.plain)
         if auto:
             # what the memory limit leaves beside the trunk and the head is
             # the most the pools may take; they start at what the first

@@ -13,7 +13,7 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 
 import toy
 from streamlx import pipeline
-from streamlx.integrate import prefill_cache, resize_pools
+from streamlx.integrate import prefill_cache
 from streamlx.pipeline import PipelinedDecoder
 from streamlx.pipeline_adapters import adapter_for
 
@@ -23,6 +23,20 @@ N, PROMPT = 48, toy.prompt()
 def _other(rng, t: int, vocab: int) -> int:
     """A token that is not t: a wrong draft."""
     return (t + 1 + int(rng.integers(0, vocab - 1))) % vocab
+
+
+def _drafts(rng, seq, i: int, n: int, most: int, wrong: float,
+            vocab: int = toy.VOCAB):
+    """A step's tokens from seq[i], up to `most` and none past seq[n - 1],
+    each draft wrong with probability `wrong`; and how many are kept."""
+    toks, a = [seq[i]], None
+    for j in range(1, min(int(rng.integers(1, most + 1)), n - i)):
+        t = seq[i + j]
+        if rng.random() < wrong:
+            t = _other(rng, t, vocab)
+            a = j if a is None else a
+        toks.append(t)
+    return toks, len(toks) if a is None else a
 
 
 class Scheduler(unittest.TestCase):
@@ -121,14 +135,7 @@ class Rollback(unittest.TestCase):
                                            adaptive=False, self_gate=False)
                     i = same = rolled = 0
                     while i < n:
-                        toks, a = [seq[i]], None
-                        for j in range(1, min(int(rng.integers(1, 5)), n - i)):
-                            t = seq[i + j]
-                            if rng.random() < wrong:
-                                t = _other(rng, t, toy.VOCAB)
-                                a = j if a is None else a
-                            toks.append(t)
-                        a = len(toks) if a is None else a
+                        toks, a = _drafts(rng, seq, i, n, 4, wrong)
                         outs, hid, snaps = dec.step(toks, len(PROMPT) + i)
                         for j in range(a):
                             same += (bool(mx.array_equal(
@@ -139,6 +146,151 @@ class Rollback(unittest.TestCase):
                         i += a
                     self.assertEqual(same, n)
                     self.assertEqual(rolled > 0, wrong > 0)
+
+
+class OneForward(unittest.TestCase):
+    """A model whose experts are all in memory checks a step's drafts in one
+    forward of its tokens (the adapter's verify): the tokens are the stock
+    model's, and rejected drafts leave the caches as the tokens kept would
+    have: trimmed (KVCache, a window not yet full) or put back and run again
+    (a window that has wrapped)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ck = toy.Checkpoint()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ck.close()
+
+    def test_rejected_drafts(self):
+        ck, n = self.ck, 64
+        for window in (None, 4, 32):          # the prompt is 12 tokens
+            seq, _ = toy.greedy(ck.ref, PROMPT, n,
+                                Rollback.caches(ck.ref, window))
+            with self.subTest(window=window):
+                rng = np.random.default_rng(1)
+                m, pools = ck.held()
+                ad = adapter_for(m, None)
+                cache = Rollback.caches(m, window)
+                mx.eval(m(mx.array([PROMPT]), cache=cache))
+                dec = PipelinedDecoder(ad, pools, ad.views(cache),
+                                       adaptive=False, self_gate=False)
+                self.assertTrue(dec.one_forward)
+                i = same = rolled = 0
+                while i < n:
+                    toks, a = _drafts(rng, seq, i, n, 6, 0.3)
+                    outs, _hid, rec = dec.step(toks, len(PROMPT) + i)
+                    same += sum(outs[j] == seq[i + j + 1] for j in range(a))
+                    dec.rollback(rec, a)
+                    self.assertEqual(ad.offset(cache), len(PROMPT) + i + a)
+                    rolled += len(toks) - a
+                    i += a
+                self.assertEqual(same, n)
+                self.assertGreater(rolled, 0)
+
+    def test_streams_where_experts_are_read(self):
+        m, pools = self.ck.streaming(8)
+        ad = adapter_for(m, None)
+        dec = PipelinedDecoder(ad, pools, [], k_max=1)
+        self.assertFalse(dec.one_forward)
+        self.assertEqual(dec.k_copy, 4)       # no head: four streams a copy
+        # and no head: a plain step is the model's forward, nothing recorded
+        self.assertIsNone(ad.plain(PROMPT[0], make_prompt_cache(m))[1])
+
+    def test_layers_the_adapter_does_not_split(self):
+        # (a hybrid stack: no streams, so copies only in one forward, and
+        # a draft head is refused)
+        from streamlx import pipeline_adapters
+
+        ck = self.ck
+        seq, _ = toy.greedy(ck.ref, PROMPT, N)
+        with mock.patch.object(pipeline_adapters, "_ATTN", ("no_such",)):
+            for held in (False, True):
+                m, pools = ck.held() if held else ck.streaming(8)
+                ad = pipeline_adapters.headless_adapter(m, pools)
+                self.assertIsNone(ad.begin)
+                cache = make_prompt_cache(m)
+                mx.eval(m(mx.array([PROMPT]), cache=cache))
+                dec = PipelinedDecoder(ad, pools, cache, k_max=1,
+                                       plain_fn=ad.plain)
+                out = dec.generate(seq[0], None, len(PROMPT), N,
+                                   context=PROMPT + seq)
+                self.assertEqual(out, seq[:N])
+                self.assertEqual((dec.one_forward, dec.lookup.kept > N // 3),
+                                 (held, held))
+            with self.assertRaises(AttributeError):
+                adapter_for(m, SimpleNamespace(tap_layers=(3,)))
+
+
+class LayerShapes(unittest.TestCase):
+    """With no draft head, copies stream through the standard adapter's
+    split only where it computes what the model's own forward does
+    (pipeline_adapters._SPLIT): checked on a tiny random model of each such
+    mlx-lm type. Any other gets WholeModelAdapter, the model's own forward:
+    copies in one forward while every expert is held, plain steps while they
+    stream (HunYuan's attention also returns its keys and values, for the
+    next layer). A model the loader holds whole gets no decoder."""
+
+    def test_split_is_the_forward(self):
+        from streamlx.pipeline_adapters import (_SPLIT, StandardMoEAdapter,
+                                                WholeModelAdapter)
+
+        self.assertLessEqual(_SPLIT, set(toy.SHAPES))    # each checked here
+        for mt, args in sorted(toy.SHAPES.items()):
+            with self.subTest(model_type=mt):
+                if importlib.util.find_spec(f"mlx_lm.models.{mt}") is None:
+                    self.skipTest(f"no {mt} in this mlx-lm")
+                mx.random.seed(0)
+                m = toy.build(args=args, quantize=False)
+                ad = adapter_for(m)
+                if mt not in _SPLIT:
+                    self.assertIsInstance(ad, WholeModelAdapter)
+                    continue
+                self.assertIs(type(ad), StandardMoEAdapter)
+                own, split = make_prompt_cache(m), make_prompt_cache(m)
+                mx.eval(m(mx.array([PROMPT]), cache=split))
+                tok = toy.pick(m(mx.array([PROMPT]), cache=own)[0, -1])
+                for i in range(8):
+                    want = m(mx.array([[tok]]), cache=own)[0, -1]
+                    ids, h, pos = ad.prep(tok, len(PROMPT) + i)
+                    ctx = ad.masks(h, split)
+                    for l in range(len(ad.layers)):
+                        h = ad.finish(l, ad.begin(l, h, ids, ctx, split, pos))
+                    self.assertTrue(bool(mx.array_equal(ad.logits(h)[0, -1],
+                                                        want)))
+                    tok = toy.pick(want)
+
+    def test_hunyuan(self):
+        from streamlx.pipeline_adapters import (WholeModelAdapter,
+                                                headless_adapter)
+
+        if importlib.util.find_spec("mlx_lm.models.hunyuan") is None:
+            self.skipTest("no hunyuan in this mlx-lm")
+        ck = toy.Checkpoint(args=toy.SHAPES["hunyuan"])
+        self.addCleanup(ck.close)
+        seq, _ = toy.greedy(ck.ref, PROMPT, N)
+        for held in (False, True):          # 8 of its 16 experts, then all
+            with self.subTest(held=held):
+                m, pools = ck.held() if held else ck.streaming(8)
+                ad = headless_adapter(m, pools)
+                self.assertIsInstance(ad, WholeModelAdapter)
+                cache = make_prompt_cache(m)
+                mx.eval(m(mx.array([PROMPT]), cache=cache))
+                dec = PipelinedDecoder(ad, pools, cache, k_max=1,
+                                       plain_fn=ad.plain)
+                out = dec.generate(seq[0], None, len(PROMPT), N,
+                                   context=PROMPT + seq)
+                self.assertEqual(out, seq[:N])
+                self.assertEqual((dec.one_forward, dec.lookup.kept > 0),
+                                 (held, held))
+
+    def test_a_model_held_whole(self):
+        # (the loader streams no expert of it: mlx-lm's Mixtral keeps them in
+        # block_sparse_moe) it decodes as mlx-lm's
+        from streamlx.pipeline_adapters import headless_adapter
+
+        self.assertIsNone(headless_adapter(toy.build(), {}))
 
 
 class _Clock:
@@ -204,7 +356,7 @@ class DecodeLoop(unittest.TestCase):
         mx.eval(logits, rows)
         dec = PipelinedDecoder(ad, pools, ad.views(cache), k_max=3,
                                adaptive=False, plain_fn=ad.plain,
-                               self_gate=True)
+                               self_gate=True, lookup=0)   # the head's drafts
         dec.gate_probe, dec.gate_min, dec.gate_hold = 8, 4, 16
         ran, charged = [], {"step": [], "plain": [], "undrafted": []}
 
@@ -277,10 +429,7 @@ class RunAhead(unittest.TestCase):
         self.ck = toy.Checkpoint()
         self.addCleanup(self.ck.close)
         self.seq, _ = toy.greedy(self.ck.ref, PROMPT, N)
-        m, self.pools = self.ck.streaming(8)
-        resize_pools(self.pools, sum(p.n_experts * p.expert_bytes
-                                     for p in self.pools.values()))
-        self.m = m
+        self.m, self.pools = self.ck.held()
 
     def _decoder(self, head, **kw):
         ad = adapter_for(self.m, head)
@@ -332,7 +481,7 @@ class RunAhead(unittest.TestCase):
         out = []
         head = _CountingHead(self.seq, _Clock(), lambda: len(out))
         dec, cache, row = self._decoder(head, k_max=3, adaptive=False,
-                                        self_gate=True)
+                                        self_gate=True, lookup=0)
         dec.gate_probe, dec.gate_min, dec.gate_hold = 8, 4, 16
         out.append(self.seq[0])
         got = dec.generate(self.seq[0], row, len(PROMPT), N,
@@ -342,6 +491,155 @@ class RunAhead(unittest.TestCase):
         self.assertEqual(head.fed, 0)        # nothing fed per token
         self.assertGreater(head.drafts[0], 8)    # the gated-off run's pairs
         self.assertGreater(dec.draft_ok, 0)
+
+
+class _MuteHead(_Head):
+    """A head with nothing to propose: every draft is a copy."""
+
+    def draft(self, pairs, depth):
+        self.pos += len(pairs)
+        self.calls += 1
+        return [], []
+
+
+class CopiedDrafts(unittest.TestCase):
+    """Drafts by copy (pipeline.Lookup): where the last three tokens occurred
+    before, what followed them is the draft, once it has predicted a few
+    tokens. With the continuation in the conversation already, streamed
+    decoding takes it in steps of k_copy and gives plain decoding's tokens;
+    where the copy is wrong the drafts are rolled back; and a copy is
+    drafted from with no head at all and whatever the gate's arm, outside
+    its accounts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ck = toy.Checkpoint()
+        cls.seq, _ = toy.greedy(cls.ck.ref, PROMPT, N)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.ck.close()
+
+    def test_lookup(self):
+        lk = pipeline.Lookup(3)
+        lk.reset(range(1, 10))                    # 1 .. 9
+        for t in (50, 2, 3, 4):
+            lk.push(t)
+        self.assertEqual((lk.run, lk.propose(2)), (0, [5, 6]))    # found
+        lk.push(5)
+        self.assertEqual((lk.run, lk.propose(4)), (1, [6, 7, 8, 9]))
+        self.assertEqual(lk.propose(8), [6, 7, 8, 9, 50, 2, 3, 4])
+        lk.push(6)
+        lk.push(99)                               # the copy ends
+        self.assertEqual((lk.run, lk.propose(4)), (0, []))
+        for t in (3, 4, 5, 6):                    # the latest place wins
+            lk.push(t)
+        self.assertEqual(lk.propose(2), [99, 3])
+        lk.reset(())
+        for t in (1, 2, 3, 1, 2, 3, 1, 2):        # the reply repeats itself
+            lk.push(t)
+        self.assertEqual((lk.run, lk.propose(6)), (2, [3, 1, 2]))
+
+    def _decode(self, context, head=_MuteHead, plain=False, held=False, **kw):
+        """(decoder, the head's first row, context(seq)) on the toy streamed,
+        or with every expert held."""
+        m, pools = self.ck.held() if held else self.ck.streaming(8)
+        head = head and head(self.seq, _Clock())
+        ad = adapter_for(m, head)
+        cache = make_prompt_cache(m)
+        logits, rows = ad.forward_taps(mx.array([PROMPT]), cache)
+        mx.eval(logits)
+        kw.setdefault("k_max", 4 if head else 1)
+        dec = PipelinedDecoder(ad, pools, ad.views(cache), adaptive=False,
+                               plain_fn=ad.plain if plain else None, **kw)
+        row = None if rows is None else rows[:, -1:]
+        return dec, row, context(self.seq)
+
+    def test_a_copy_is_plain_decoding(self):
+        # with a head that proposes nothing and with no head, as streams and
+        # (every expert in memory) in one forward a step
+        seq = self.seq
+        for head, held in ((_MuteHead, False), (_MuteHead, True),
+                           (None, False), (None, True)):
+            dec, row, ctx = self._decode(lambda seq: PROMPT + seq, head,
+                                         plain=head is None, held=held,
+                                         k_copy=4)
+            self.assertEqual(dec.one_forward, held)
+            out = dec.generate(seq[0], row, len(PROMPT), N, context=ctx)
+            self.assertEqual(out, seq[:N])
+            self.assertEqual(toy.wrong_slots(self.ck.ref, dec.pools), [])
+            lk = dec.lookup
+            # (a copy is drafted from once it has predicted eight tokens;
+            # the toy repeats itself: where three tokens occurred twice the
+            # later place is followed, and may go on otherwise)
+            self.assertGreater(lk.kept, N // 3)
+            self.assertLess(lk.proposed - lk.kept, N // 6)
+            self.assertGreater(dec.accepted_hist.get(4, 0), N // 8)
+
+    def test_wrong_copies_are_rolled_back(self):
+        rng = np.random.default_rng(0)
+
+        def spoiled(seq):
+            return PROMPT + [(_other(rng, t, toy.VOCAB) if i % 13 == 12 else t)
+                             for i, t in enumerate(seq)]
+
+        dec, row, ctx = self._decode(spoiled, self_gate=False, lookup=2)
+        seq = self.seq
+        with mock.patch.object(pipeline, "_LK_MIN", 4):
+            out = dec.generate(seq[0], row, len(PROMPT), N, context=ctx)
+        self.assertEqual(out, seq[:N])
+        self.assertEqual(toy.wrong_slots(self.ck.ref, dec.pools), [])
+        self.assertGreater(dec.lookup.proposed, dec.lookup.kept)
+        self.assertGreater(dec.lookup.kept, 0)
+        # the tokens of a copy reach the head with its next draft
+        self.assertGreaterEqual(dec.ad.drafter.pos, N - 13)
+
+    def test_counts_are_the_decode_s(self):
+        # a decode's setup runs when it is called: one that ends before its
+        # first id is read (a request for one token) leaves no copy counts
+        # of the decode before
+        dec, row, ctx = self._decode(lambda seq: PROMPT + seq, head=None,
+                                     plain=True)
+        dec.generate(self.seq[0], row, len(PROMPT), N, context=ctx)
+        self.assertGreater(dec.lookup.kept, 0)
+        dec.decode(self.seq[0], row, len(PROMPT), 1, context=ctx).close()
+        self.assertEqual((dec.lookup.proposed, dec.lookup.kept), (0, 0))
+
+    def test_width_follows_acceptance(self):
+        dec, row, ctx = self._decode(lambda seq: PROMPT + seq, k_copy=16)
+        dec.adaptive = True
+        dec.lookup.reset(ctx)
+        for t in self.seq[:3]:
+            dec.lookup.push(t)
+        # as many drafts as are each more likely kept than not, and no
+        # more than the copy has predicted tokens
+        for run, rate, drafts in ((16, pipeline._LK_PRIOR, 13), (16, 1.0, 15),
+                                  (16, 0.9, 6), (16, 0.5, 1), (16, 0.0, 1),
+                                  (8, 1.0, 8)):
+            dec.lookup.run, dec._calib[10] = run, rate
+            self.assertEqual(len(dec._copied()[0]), drafts)
+
+    def test_outside_the_gate(self):
+        seq = self.seq
+        dec, row, ctx = self._decode(lambda seq: PROMPT + seq, plain=True,
+                                     self_gate=True)
+        dec._g_begin("off", hold=10**6)           # drafting held off
+        charged = []
+        account = dec._gate_account
+        dec._gate_account = lambda dt, n: (charged.append(n), account(dt, n))
+        out = dec.generate(seq[0], row, len(PROMPT), N, context=ctx)
+        self.assertEqual(out, seq[:N])
+        self.assertGreater(dec.lookup.kept, N // 3)
+        self.assertFalse(dec.drafting)            # the gate's arm stands,
+        self.assertEqual(set(charged), {1})       # charged its plain steps
+        self.assertEqual(len(charged), dec.plain_steps)
+        # without the copy every step is plain
+        dec, row, _ = self._decode(lambda seq: PROMPT, plain=True,
+                                   self_gate=True, lookup=0)
+        dec._g_begin("off", hold=10**6)
+        out = dec.generate(seq[0], row, len(PROMPT), N, context=PROMPT)
+        self.assertEqual(out, seq[:N])
+        self.assertEqual(dec.plain_steps, N - 1)
 
 
 @unittest.skipUnless(importlib.util.find_spec("mlx_lm.models.inkling2")
@@ -397,14 +695,7 @@ class Inkling2(unittest.TestCase):
                             rows_same += bool(mx.array_equal(row, taps[i]))
                             i, steps = i + 1, steps + 1
                             continue
-                        toks, a = [seq[i]], None
-                        for j in range(1, min(int(rng.integers(1, 5)), n - i)):
-                            t = seq[i + j]
-                            if rng.random() < wrong:
-                                t = _other(rng, t, ink.VOCAB)
-                                a = j if a is None else a
-                            toks.append(t)
-                        a = len(toks) if a is None else a
+                        toks, a = _drafts(rng, seq, i, n, 4, wrong, ink.VOCAB)
                         outs, hid, snaps = dec.step(toks, len(prompt) + i)
                         for j in range(a):
                             lg = ad.logits(hid[j][..., -hidden:])[0, -1]
@@ -432,7 +723,7 @@ def _has_loop() -> bool:
 @unittest.skipUnless(_has_loop(), "needs an mlx-lm with the looped inkling2 "
                      "(inkling2_loop), on the GPU")
 class InklingLoop(unittest.TestCase):
-    """Inkling 2 Mini's looped stack through BatchedDecoder, each step's
+    """Inkling 2 Mini's looped stack through the decoder, each step's
     drafts checked in one forward: what a step's rejected drafts were leaves
     no trace in the caches (what follows is bit for bit the same), with the
     sliding windows filling and full, after one rollback or two; and a
@@ -501,7 +792,6 @@ class InklingLoop(unittest.TestCase):
 
     def test_decode_with_the_head(self):
         from streamlx.inkling2 import Inkling2LoopAdapter
-        from streamlx.pipeline import BatchedDecoder
         from streamlx.pipeline_adapters import load_drafter
 
         ink = self.ink
@@ -517,8 +807,10 @@ class InklingLoop(unittest.TestCase):
                 logits, rows = ad.forward_taps(mx.array([prompt]), cache)
             mx.eval(logits, rows)
             ad.prime_pairs(rows[:, :-1], None)
-            dec = BatchedDecoder(ad, pools, views, k_max=4, plain_fn=ad.plain,
-                                 adaptive=False, self_gate=False)
+            dec = PipelinedDecoder(ad, pools, views, k_max=4,
+                                   plain_fn=ad.plain, adaptive=False,
+                                   self_gate=False)
+            self.assertTrue(dec.one_forward)
             first = int(mx.argmax(logits[0, -1]).item())
             if early:                         # a server's request that ends
                 out, gen = [first], dec.decode(first, rows[:, -1:],

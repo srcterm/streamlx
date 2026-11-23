@@ -44,6 +44,35 @@ def token_ids(tok) -> mx.array:
     return mx.array([[tok]])
 
 
+def greedy(logits: mx.array) -> mx.array:
+    """The ids mlx-lm's greedy sampler takes from `logits` (a token a row, on
+    the last axis): the argmax of the log-probabilities generate_step
+    computes, in the logits' dtype, not of the logits. Two bf16 logits a
+    step apart can normalize to the same value, and then the first id wins."""
+    return mx.argmax(logits - mx.logsumexp(logits, axis=-1, keepdims=True),
+                     axis=-1)
+
+
+def _taken(c):
+    """The tokens one layer's cache has taken in; None where it does not
+    count them (a recurrent state). A CacheList counts by its members
+    (DeepSeek-V3.2's attention and indexer). A batch cache counts them in
+    _idx (its offset is the rows' padding); a rotating window's _idx is
+    where it writes next, which wraps, and its count is its offset."""
+    if type(c).__name__ == "CacheList":
+        return next((n for n in map(_taken, c.caches) if n is not None), None)
+    for obj in (c, getattr(c, "kv_cache", None)):
+        if obj is None or not hasattr(obj, "_idx"):
+            continue
+        if not hasattr(obj, "max_size"):
+            return int(obj._idx)
+        return int(getattr(obj, "_offset", obj.offset))
+    off = getattr(c, "offset", None)
+    if off is None:
+        return None
+    return int(off.reshape(-1)[0].item()) if isinstance(off, mx.array) else int(off)
+
+
 def _pick(obj, names, what):
     for n in names:
         if getattr(obj, n, None) is not None:
@@ -110,20 +139,9 @@ class StandardMoEAdapter:
         return ids, self.embed_tokens(ids), pos
 
     def offset(self, cache) -> int:
-        """Tokens the cache has taken in. A batch cache counts them in _idx
-        (its offset is the rows' padding); a rotating window's _idx is where
-        it writes next, which wraps, and its count is its offset."""
-        for c in cache:
-            for obj in (c, getattr(c, "kv_cache", None)):
-                if obj is None or not hasattr(obj, "_idx"):
-                    continue
-                if not hasattr(obj, "max_size"):
-                    return int(obj._idx)
-                return int(getattr(obj, "_offset", obj.offset))
-            off = getattr(c, "offset", None)
-            if off is not None:
-                return int(off.reshape(-1)[0].item()) if isinstance(off, mx.array) else int(off)
-        return 0
+        """Tokens the cache has taken in: the first layer's that counts them
+        (_taken)."""
+        return next((n for n in map(_taken, cache) if n is not None), 0)
 
     def masks(self, h, cache):
         try:
@@ -181,24 +199,53 @@ class StandardMoEAdapter:
     def plain(self, tok, cache):
         """The model's own one-token forward: the pipeline's plain_fn (tok an
         id or a queued step's argmax, token_ids). Returns (logits, the hidden
-        draft_hidden gives)."""
-        want = self.tap_layers or (len(self.layers) - 1,)
-        with capture_layer_outputs(self.model, want) as got:
-            logits = self.model(token_ids(tok), cache=cache)
-        if not self.taps:
-            return logits, got[want[0]][-1]
-        return logits, mx.concatenate([got[i][-1] for i in self.tap_layers],
-                                      axis=-1)
+        draft_hidden gives; None without a head)."""
+        return self.forward_taps(token_ids(tok), cache)
 
     def forward_taps(self, ids, cache):
         """The model's forward plus the draft head's context for every
-        position: the tap layers' outputs, concatenated (a prefill's)."""
-        with capture_layer_outputs(self.model, self.tap_layers) as got:
+        position (a prefill's): the tap layers' outputs, concatenated, else
+        a head's last layer's; None without a head."""
+        want = self.tap_layers or (
+            (len(self.layers) - 1,) if self.drafter is not None else ())
+        if not want:
+            return self.model(ids, cache=cache), None
+        with capture_layer_outputs(self.model, want) as got:
             logits = self.model(ids, cache=cache)
-        if not self.taps:
-            return logits, None
         return logits, mx.concatenate(
-            [mx.concatenate(got[i], axis=1) for i in self.tap_layers], axis=-1)
+            [mx.concatenate(got[i], axis=1) for i in want], axis=-1)
+
+    # -- a step's tokens in one forward (PipelinedDecoder._mode) ------------
+    def verify(self, toks, cache):
+        """The step's tokens through the model in one forward: (logits
+        [1, K, V], the head's rows, what rollback() needs)."""
+        from .pipeline import snapshot_cache
+
+        snap = [snapshot_cache(c) for c in cache]
+        logits, rows = self.forward_taps(mx.array([toks]), cache)
+        return logits, rows, SimpleNamespace(snap=snap, toks=toks)
+
+    def rollback(self, cache, rec, keep: int) -> None:
+        """Keep only the step's first `keep` tokens in the caches: trimmed
+        where every cache can be, else the caches as they were before the
+        step and those tokens once more (a recurrent state, a window that
+        has wrapped)."""
+        from mlx_lm.models.cache import (can_trim_prompt_cache,
+                                         trim_prompt_cache)
+
+        from .pipeline import restore_cache
+
+        r = len(rec.toks) - keep
+        if r <= 0:
+            return
+        if can_trim_prompt_cache(cache):
+            trim_prompt_cache(cache, r)
+        else:
+            for c, s in zip(cache, rec.snap):
+                restore_cache(c, s)
+            self.model(mx.array([rec.toks[:keep]]), cache=cache)
+            mx.eval([c.state for c in cache])
+        rec.toks = rec.toks[:keep]
 
     # -- drafting ----------------------------------------------------------------
     def reset_drafter(self) -> None:
@@ -270,15 +317,39 @@ class MistralLarge4Adapter(StandardMoEAdapter):
                                blk=layer.mlp, pos=pos)
 
 
+class WholeModelAdapter(StandardMoEAdapter):
+    """A model whose layers no adapter here splits (Qwen3.5's hybrid stack),
+    with no draft head: no step runs as streams, but there is the model's
+    own forward, for plain steps and for copied drafts checked in one
+    forward (verify) while every expert is in memory."""
+    begin = None
+
+    def __init__(self, model):
+        self.model, self.layers = model, list(model.layers)
+        self.drafter, self.tap_layers, self.taps = None, (), frozenset()
+
+
+# The mlx-lm types whose layers StandardMoEAdapter's split computes as their
+# own forward does (tests: LayerShapes, a tiny random model of each). With no
+# draft head another type gets WholeModelAdapter: HunYuan's attention, say,
+# also returns its keys and values for the next layer, which the split
+# cannot take.
+_SPLIT = frozenset({"qwen3_moe", "qwen2_moe", "olmoe", "glm4_moe",
+                    "glm4_moe_lite", "deepseek_v2", "deepseek_v3",
+                    "deepseek_v32", "laguna", "ernie4_5_moe"})
+
+
 def adapter_for(model, drafter=None):
-    """The pipeline adapter for `model`'s decoder shape."""
+    """The pipeline adapter for `model`'s decoder shape (with no draft head,
+    WholeModelAdapter where the standard adapter's split is not known to
+    compute the layers as they are: _SPLIT)."""
     mt = getattr(getattr(model, "args", None), "model_type", None)
     lm = getattr(getattr(model, "model", None), "language_model", None)
     visits = getattr(lm, "layer_visits", None)
     if visits is not None and len(visits) != len(model.layers):
         # a looped stack (Inkling 2 Mini) runs some layers more than once a
         # token, with caches and inputs of each pass: its drafts are checked
-        # in one forward of the model's own (pipeline.BatchedDecoder)
+        # in one forward of the model's own (PipelinedDecoder._mode)
         if mt != "inkling2_loop":
             raise NotImplementedError(
                 f"draft heads do not support looped models ({mt}): "
@@ -300,7 +371,29 @@ def adapter_for(model, drafter=None):
         from .inkling2 import Inkling2Adapter
 
         return Inkling2Adapter(model, drafter)
-    return StandardMoEAdapter(model, drafter)
+    if drafter is None and mt not in _SPLIT:
+        return WholeModelAdapter(model)
+    try:
+        return StandardMoEAdapter(model, drafter)
+    except (AttributeError, StopIteration):
+        if drafter is not None:
+            raise
+        return WholeModelAdapter(model)
+
+
+def headless_adapter(model, pools):
+    """The adapter of a model with no draft head, for a decoder whose drafts
+    are copies alone (pipeline.Lookup); None where they are off, or where
+    the loader streams none of its experts (`pools` empty: mlx-lm's Mixtral
+    keeps them in block_sparse_moe): the model then decodes as mlx-lm's."""
+    from .pipeline import LOOKUP
+
+    if LOOKUP <= 0 or not pools:
+        return None
+    try:
+        return adapter_for(model)
+    except NotImplementedError:      # a looped stack that is not Inkling 2's
+        return None
 
 
 @contextmanager

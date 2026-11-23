@@ -153,6 +153,21 @@ class WholeModel(unittest.TestCase):
         self.assertEqual(reader.bytes_read - b0, every)
         self.assertTrue(all_held(pools))
 
+    def test_rows_by_expert(self):
+        """A several-row call over held pools runs its picks in slot order
+        (the same kernel, fewer cold reads): stock's logits bit for bit."""
+        m, _ = self.ck.held()
+        rows = mx.array([PROMPT[:5]])                 # 5 rows a call
+        want = self.ck.ref(rows, cache=make_prompt_cache(self.ck.ref))
+        with mock.patch.object(StreamingSwitchGLU, "_by_expert", autospec=True,
+                               side_effect=StreamingSwitchGLU._by_expert) as spy, \
+                mock.patch.object(StreamingSwitchGLU, "_remap",
+                                  side_effect=AssertionError("host")):
+            got = m(rows, cache=make_prompt_cache(m))
+            mx.eval(got)
+        self.assertTrue(spy.called)
+        self.assertTrue(mx.array_equal(got, want))
+
     def test_short(self):
         _, pools = self.ck.streaming(8)
         reader = next(iter(pools.values())).reader

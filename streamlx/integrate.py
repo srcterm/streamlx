@@ -164,6 +164,31 @@ class StreamingSwitchGLU(nn.Module):
             self._slots_mx, self._slots_key = mx.array(p.slot_table), key
         return self._slots_mx
 
+    def _by_expert(self, x: mx.array, slots: mx.array, indices: mx.array,
+                   w=None) -> mx.array:
+        """A several-row call on the per-row kernel, its picks in slot order.
+        The rows of a pass share experts (four drafted tokens' 32 picks use
+        about 19), and the kernel reads a pick's weights faster when the pick
+        before it read the same ones: 10 to 18% of the expert time at 4 to
+        16 rows. A pick's output is its own matrix-vector product, so the
+        order changes no value (mlx-lm itself sorts from 64 picks on). All
+        on the GPU: the forward still never waits on the host."""
+        b, t, k = slots.shape
+        flat = slots.reshape(-1)
+        order = mx.argsort(flat)
+        inv = mx.argsort(order)
+
+        def picks(a):                  # [1, P, 1] in slot order
+            return a.reshape(-1)[order][None, :, None]
+
+        y = switch_forward(x.reshape(b * t, -1)[order // k][None],
+                           picks(flat), self.pool.pool, self.pool.qparams,
+                           self.pool.act,
+                           escales=(None if self.pool.escales is None
+                                    else self._esc(picks(indices))),
+                           weights=None if w is None else picks(w))
+        return y.reshape(b * t * k, -1)[inv].reshape(b, t, k, -1)
+
     def _remap(self, idx: np.ndarray) -> np.ndarray:
         slots = self.pool.slot_table[idx]
         if (slots == self.pool.SENTINEL).any():
@@ -573,6 +598,8 @@ class StreamingSwitchGLU(nn.Module):
                 if not decode and _PREFILL["cache"] is not None:
                     self._own_cache_states()
                 self.pool.hits += indices.size
+                if not decode:
+                    return self._by_expert(x, slots[indices], indices, w)
                 return switch_forward(x, slots[indices], self.pool.pool,
                                       self.pool.qparams, self.pool.act,
                                       escales=self._esc(indices), weights=w)
