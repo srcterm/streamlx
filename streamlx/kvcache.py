@@ -136,23 +136,26 @@ def _window(c):
     several tokens holds them and the max_size - 1 rows before them, in
     order; the next forward reaches back max_size - 1 rows, a token
     max_size (`keep` rows and the last max_size - keep, then it rotates).
-    A copy of c with only those rows (the same next state: the same rows,
-    the same write index), else c."""
+    A copy of c with only those rows, cut as its next update cuts them (the
+    same next state: the same rows, the same write index), else c."""
     if (type(c).__name__ != "RotatingKVCache"
             or getattr(c, "keys", None) is None):
         return c
-    n, size, keep = c.keys.shape[2], c.max_size, c.keep
+    n, size = c.keys.shape[2], c.max_size
     if n <= size or c._idx != n:    # (in order: the last update appended)
         return c
-
-    def cut(v):
-        tail = v[..., n - (size - keep):, :]
-        return (mx.concatenate([v[..., :keep, :], tail], axis=2) if keep
-                else tail)
-
     w = copy.copy(c)
-    w.keys, w.values, w._idx = cut(c.keys), cut(c.values), size
+    w.keys, w.values = c._trim(n - size, c.keys), c._trim(n - size, c.values)
+    w._idx = size
     return w
+
+
+def settled_bytes(c) -> int:
+    """The bytes a layer cache holds once its next token has run (a window
+    after a prompt chunk holds the chunk too until then: _window)."""
+    if type(c).__name__ == "CacheList":
+        return sum(settled_bytes(m) for m in c.caches)
+    return _window(c).nbytes
 
 
 def _layout(specs) -> list:
@@ -166,14 +169,6 @@ def _offset(c) -> int | None:
     if type(c).__name__ == "CacheList":
         return max((_offset(x) or 0 for x in c.caches), default=None)
     return getattr(c, "offset", None)
-
-
-def _set_offset(c, n: int) -> None:
-    if type(c).__name__ == "CacheList":
-        for x in c.caches:
-            _set_offset(x, n)
-    elif hasattr(c, "offset"):
-        c.offset = n
 
 
 def _cls(name: str):
@@ -490,18 +485,14 @@ class PagedPromptCache:
             n = partial[0].start + partial[1]
         whole = len(chain)
 
-        def spec_in(meta, at):
-            spec = meta["layers"][at[0]]
-            for j in at[1:]:
-                spec = spec["members"][j]
-            return spec
-
-        def rebuild(at, spec):
-            prefix = "".join(f"{k}." for k in at)
+        def rebuild(prefix, spec, old):
+            """The cache stored under `prefix`: `spec` its spec in the newest
+            segment, `old` in the last whole one (the same layout)."""
             cls = _cls(spec["cls"])
             if "members" in spec:     # a CacheList: its members, rebuilt
-                return cls(*(rebuild(at + (j,), m)
-                             for j, m in enumerate(spec["members"])))
+                return cls(*(rebuild(f"{prefix}{j}.", m, o) for j, (m, o)
+                             in enumerate(zip(spec["members"],
+                                              old["members"]))))
             names = [k[len(prefix):] for k in loaded[-1][0]
                      if k.startswith(prefix)]
             axes = _LEAF_AXIS.get(spec["cls"].rpartition(".")[2], {})
@@ -533,8 +524,7 @@ class PagedPromptCache:
                 else:
                     v = loaded[whole - 1][0][prefix + name]
                 leaves.append((name, v))
-            src = spec_in(metas[-1] if spec["sliced"] else metas[whole - 1],
-                          at)
+            src = spec if spec["sliced"] else old
             leaves += list(src["scalars"].items())
             state = tree_unflatten(leaves)
             # mlx-vlm's caches (and mlx-lm's older ones) rebuild from both
@@ -545,11 +535,12 @@ class PagedPromptCache:
             else:
                 c = cls.from_state(state)
             if spec["sliced"]:
-                _set_offset(c, n)
+                c.offset = n
             return c
 
-        return [rebuild((i,), spec)
-                for i, spec in enumerate(metas[-1]["layers"])], n
+        return [rebuild(f"{i}.", s, o) for i, (s, o) in
+                enumerate(zip(metas[-1]["layers"],
+                              metas[whole - 1]["layers"]))], n
 
     # -- the server's interface ----------------------------------------------
 

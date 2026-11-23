@@ -122,7 +122,7 @@ from streamlx.integrate import (
     prefill_chunks,
     resize_pools,
 )
-from streamlx.kvcache import PagedPromptCache, stored_bytes
+from streamlx.kvcache import PagedPromptCache, settled_bytes, stored_bytes
 from streamlx.pipeline_adapters import greedy
 
 _CFG = {"budget_bytes": None, "trust": False, "tokenizer_config": {},
@@ -195,23 +195,14 @@ def _cache_bytes(cache) -> int:
 
 
 def _grown_bytes(cache) -> int:
-    """_cache_bytes with each window (a rotating cache) at most its window:
-    after a prompt chunk it also holds the chunk, for the chunk's own
-    attention, until the next token. What a request adds to this is what
-    the conversation grows by (a window restored from the SSD holds only
-    its window, so the chunk's rows are not growth)."""
-    def one(c):
-        if type(c).__name__ == "CacheList":
-            return sum(one(m) for m in c.caches)
-        n, keys = c.nbytes, getattr(c, "keys", None)
-        size = getattr(c, "max_size", None)
-        if (type(c).__name__ == "RotatingKVCache" and keys is not None
-                and keys.shape[2] > size):
-            n = n * size // keys.shape[2]
-        return n
-
+    """_cache_bytes with each layer as it stands after its next token
+    (settled_bytes): a window (a rotating cache) after a prompt chunk also
+    holds the chunk, for the chunk's own attention, until then. What a
+    request adds to this is what the conversation grows by (a window
+    restored from the SSD holds only its window, so the chunk's rows are
+    not growth)."""
     try:
-        return sum(one(c) for c in cache or ())
+        return sum(settled_bytes(c) for c in cache or ())
     except Exception:  # noqa: BLE001 — a cache type without nbytes
         return 0
 

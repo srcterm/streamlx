@@ -227,7 +227,7 @@ class CacheGrowth(unittest.TestCase):
         for c in cache:
             c[0].update_and_fetch(rows(8), rows(8))
             c[1][0] = mx.zeros((1, 3, 16))
-        state = {"mem": {"slope": None}, "pools": {}}
+        state = {"mem": {"slope": None}}
         kv0 = cache[1][0].nbytes
         with mock.patch.object(serve, "_STATE", state):
             state["mem"]["gb0"] = serve._grown_bytes(cache)
