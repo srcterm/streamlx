@@ -45,6 +45,10 @@ Adapter protocol (duck-typed):
     draft_hidden(h, pos)        optional: what a pair carries for a stream
                                 (default its final hidden; a DSpark head
                                 wants several layers' outputs)
+    verify(toks, cache) -> (logits [1, K, V], rows [1, K, ...], record)
+    rollback(cache, record, keep)    optional: a step's tokens in one
+                                forward of the model's, and its caches cut
+                                back to the tokens kept (see _mode)
 
 Rollback: a shallow snapshot of every layer cache is taken right before
 each stream's begin() at that layer; rejecting streams >= a restores the
@@ -231,6 +235,7 @@ class PipelinedDecoder:
         self._restore = getattr(adapter, "restore_cache", None) or restore_cache
         self.reader = next(iter(pools.values())).reader
         self.k_max = max(1, k_max)
+        self._mode()
         self.ex = ThreadPoolExecutor(max_workers=self.k_max,
                                      thread_name_prefix="streamlx-pipe-io")
         self.n_layers = len(adapter.layers)
@@ -431,12 +436,39 @@ class PipelinedDecoder:
         return best, late
 
     # -- one step: K tokens in flight ----------------------------------------
+    def _mode(self) -> None:
+        """How steps run, set where a decode begins (the pools may have been
+        resized since the last). As streams, K tokens in flight, each
+        token's forward the model's own for one token: plain decoding bit
+        for bit, and it pays where there are expert reads to hide. Or the
+        step's tokens in ONE forward of the model's (the adapter's verify()
+        and rollback()), where an adapter checks drafts that way (`batched`:
+        Inkling 2 Mini's looped stack) or every expert is held: each weight
+        is then read once for all the tokens, well under K forwards of one.
+        That is not plain decoding bit for bit: a forward of K tokens
+        computes each through other kernels than a forward of one (matrix
+        products, attention), so logits differ in their last bits, as in
+        stock's own chunked prefill, and where plain's best two tokens are
+        about tied the text can take the other (the Mini: after some tens
+        of tokens on a long prompt; identical on short ones)."""
+        ad = self.ad
+        self.one_forward = getattr(ad, "verify", None) is not None and (
+            getattr(ad, "batched", False) or all_held(self.pools))
+
     def step(self, toks: list[int], offset: int):
         """Returns (outputs, hiddens, snaps): outputs[i] = argmax after
         stream i, hiddens[i] = its final (pre-head) hidden, snaps[l][i] =
-        layer-l cache snapshot taken before stream i wrote it. A step that
-        raises (a read failed) leaves the pools usable: see _abandon. The
-        cache then holds part of the step and is the caller's to drop."""
+        layer-l cache snapshot taken before stream i wrote it (one forward:
+        the adapter's record for its rollback). A step that raises (a read
+        failed) leaves the pools usable: see _abandon. The cache then holds
+        part of the step and is the caller's to drop."""
+        if self.one_forward:
+            logits, rows, rec = self.ad.verify(toks, self.cache)
+            outs = mx.argmax(logits[0], axis=-1)
+            mx.eval(outs, [] if rows is None else rows)
+            return (outs.tolist(),
+                    [None if rows is None else rows[:, i:i + 1]
+                     for i in range(len(toks))], rec)
         try:
             return self._step(toks, offset)
         except BaseException:
@@ -510,6 +542,11 @@ class PipelinedDecoder:
 
     def rollback(self, snaps, a: int) -> None:
         """Undo the cache writes of streams >= a (keep streams 0..a-1)."""
+        if self.one_forward:
+            t0 = time.perf_counter()
+            self.ad.rollback(self.cache, snaps, a)
+            self.t_rollback += time.perf_counter() - t0
+            return
         if not snaps or a >= len(snaps[0]):
             return
         t0 = time.perf_counter()
@@ -635,6 +672,7 @@ class PipelinedDecoder:
         a later stream of its step, or a plain step queued after it, ran it,
         else just before it."""
         self._warm = self._warm_gate = 0           # a sequence's cold steps
+        self._mode()
         if first_tok in stop:
             return
         n = 1
@@ -881,38 +919,3 @@ class PipelinedDecoder:
                 "decisions": list(self._g_decisions[-6:]),
             },
         }
-
-
-
-class BatchedDecoder(PipelinedDecoder):
-    """Speculative decoding with each step's drafts checked in ONE forward of
-    all its tokens, the model's own code over K positions: for a model held
-    in memory that costs well under K forwards of a token (each weight is
-    read once for all of them), where the pipelined streams above only pay
-    when there are expert reads to hide. The adapter runs the forward and
-    rolls the caches back to the tokens accepted:
-        verify(toks, cache) -> (logits [1, K, V], draft rows [1, K, ...],
-                                record)
-        rollback(cache, record, keep)
-    Drafting, the adaptive K, the self-gate against plain decoding and the
-    decode loop are the pipelined decoder's. Unlike the streams above, this
-    is not plain decoding bit for bit: a forward of K tokens computes each
-    one through other kernels than a forward of one (matrix products,
-    attention), so logits differ in their last bits, as in stock's own
-    chunked prefill, and where plain's best two tokens are about tied the
-    text can take the other (Inkling 2 Mini: after some tens of tokens on a
-    long prompt; identical on short ones)."""
-
-    def step(self, toks: list[int], offset: int):
-        logits, rows, rec = self.ad.verify(toks, self.cache)
-        outs = mx.argmax(logits[0], axis=-1)
-        mx.eval(outs, [] if rows is None else rows)
-        return (outs.tolist(), [None if rows is None else rows[:, i:i + 1]
-                                for i in range(len(toks))], rec)
-
-    def rollback(self, rec, a: int) -> None:
-        if rec is None:
-            return
-        t0 = time.perf_counter()
-        self.ad.rollback(self.cache, rec, a)
-        self.t_rollback += time.perf_counter() - t0

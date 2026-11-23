@@ -178,7 +178,7 @@ def main() -> int:
         t0 = time.time()
         dec = None
         if drafter is not None:
-            from streamlx.pipeline import BatchedDecoder, PipelinedDecoder
+            from streamlx.pipeline import PipelinedDecoder
 
             hidden = mx.concatenate(context, axis=1)
             del context
@@ -186,10 +186,8 @@ def main() -> int:
             drafter.prime_pairs(hidden[:, :-1],
                                 mx.array([ids[1:]], dtype=mx.int32))
             # plain_fn arms the self-gate: drafting only while it is faster
-            cls = (BatchedDecoder if getattr(ad, "batched", False)
-                   else PipelinedDecoder)
-            dec = cls(ad, pools, ad.views(cache), k_max=draft_k,
-                      plain_fn=ad.plain)
+            dec = PipelinedDecoder(ad, pools, ad.views(cache), k_max=draft_k,
+                                   plain_fn=ad.plain)
             emit(first)
             out = dec.generate(first, hidden[:, -1:], len(ids),
                                args.max_tokens, on_token=emit, stop=eos)

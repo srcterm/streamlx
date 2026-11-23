@@ -98,6 +98,8 @@ class StandardMoEAdapter:
         # concatenated in its order; other drafters read the last layer's
         self.tap_layers = tuple(getattr(drafter, "tap_layers", None) or ())
         self.taps = frozenset(self.tap_layers)
+        if drafter is not None and not self.taps:
+            self.verify = None    # (forward_taps has no rows for such a head)
 
     def views(self, cache):
         """The core's per-layer cache list for the model's prompt cache."""
@@ -200,6 +202,38 @@ class StandardMoEAdapter:
         return logits, mx.concatenate(
             [mx.concatenate(got[i], axis=1) for i in self.tap_layers], axis=-1)
 
+    # -- a step's tokens in one forward (PipelinedDecoder._mode) ------------
+    def verify(self, toks, cache):
+        """The step's tokens through the model in one forward: (logits
+        [1, K, V], the head's rows, what rollback() needs)."""
+        from .pipeline import snapshot_cache
+
+        snap = [snapshot_cache(c) for c in cache]
+        logits, rows = self.forward_taps(mx.array([toks]), cache)
+        return logits, rows, SimpleNamespace(snap=snap, toks=toks)
+
+    def rollback(self, cache, rec, keep: int) -> None:
+        """Keep only the step's first `keep` tokens in the caches: trimmed
+        where every cache can be, else the caches as they were before the
+        step and those tokens once more (a recurrent state, a window that
+        has wrapped)."""
+        from mlx_lm.models.cache import (can_trim_prompt_cache,
+                                         trim_prompt_cache)
+
+        from .pipeline import restore_cache
+
+        r = len(rec.toks) - keep
+        if r <= 0:
+            return
+        if can_trim_prompt_cache(cache):
+            trim_prompt_cache(cache, r)
+        else:
+            for c, s in zip(cache, rec.snap):
+                restore_cache(c, s)
+            self.model(mx.array([rec.toks[:keep]]), cache=cache)
+            mx.eval([c.state for c in cache])
+        rec.toks = rec.toks[:keep]
+
     # -- drafting ----------------------------------------------------------------
     def reset_drafter(self) -> None:
         if self.drafter is not None:
@@ -278,7 +312,7 @@ def adapter_for(model, drafter=None):
     if visits is not None and len(visits) != len(model.layers):
         # a looped stack (Inkling 2 Mini) runs some layers more than once a
         # token, with caches and inputs of each pass: its drafts are checked
-        # in one forward of the model's own (pipeline.BatchedDecoder)
+        # in one forward of the model's own (PipelinedDecoder._mode)
         if mt != "inkling2_loop":
             raise NotImplementedError(
                 f"draft heads do not support looped models ({mt}): "

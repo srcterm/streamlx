@@ -20,6 +20,14 @@ from streamlx.pipeline_adapters import adapter_for
 N, PROMPT = 48, toy.prompt()
 
 
+def _held(ck):
+    """(model, pools) of the toy with every expert in memory."""
+    m, pools = ck.streaming(8)
+    resize_pools(pools, sum(p.n_experts * p.expert_bytes
+                            for p in pools.values()))
+    return m, pools
+
+
 def _other(rng, t: int, vocab: int) -> int:
     """A token that is not t: a wrong draft."""
     return (t + 1 + int(rng.integers(0, vocab - 1))) % vocab
@@ -139,6 +147,57 @@ class Rollback(unittest.TestCase):
                         i += a
                     self.assertEqual(same, n)
                     self.assertEqual(rolled > 0, wrong > 0)
+
+
+class OneForward(unittest.TestCase):
+    """A model whose experts are all in memory checks a step's drafts in one
+    forward of its tokens (the adapter's verify): the tokens are the stock
+    model's, and rejected drafts leave the caches as the tokens kept would
+    have: trimmed (KVCache, a window not yet full) or put back and run again
+    (a window that has wrapped)."""
+
+    def test_rejected_drafts(self):
+        ck = toy.Checkpoint()
+        self.addCleanup(ck.close)
+        n = 64
+        for window in (None, 4, 32):          # the prompt is 12 tokens
+            seq, _ = toy.greedy(ck.ref, PROMPT, n,
+                                Rollback.caches(ck.ref, window))
+            with self.subTest(window=window):
+                rng = np.random.default_rng(1)
+                m, pools = _held(ck)
+                ad = adapter_for(m, None)
+                cache = Rollback.caches(m, window)
+                mx.eval(m(mx.array([PROMPT]), cache=cache))
+                dec = PipelinedDecoder(ad, pools, ad.views(cache),
+                                       adaptive=False, self_gate=False)
+                self.assertTrue(dec.one_forward)
+                i = same = rolled = 0
+                while i < n:
+                    toks, a = [seq[i]], None
+                    for j in range(1, min(int(rng.integers(1, 7)), n - i)):
+                        t = seq[i + j]
+                        if rng.random() < 0.3:
+                            t = _other(rng, t, toy.VOCAB)
+                            a = j if a is None else a
+                        toks.append(t)
+                    a = len(toks) if a is None else a
+                    outs, _hid, rec = dec.step(toks, len(PROMPT) + i)
+                    same += sum(outs[j] == seq[i + j + 1] for j in range(a))
+                    dec.rollback(rec, a)
+                    self.assertEqual(ad.offset(cache), len(PROMPT) + i + a)
+                    rolled += len(toks) - a
+                    i += a
+                self.assertEqual(same, n)
+                self.assertGreater(rolled, 0)
+
+    def test_streams_where_experts_are_read(self):
+        ck = toy.Checkpoint()
+        self.addCleanup(ck.close)
+        m, pools = ck.streaming(8)
+        ad = adapter_for(m, None)
+        dec = PipelinedDecoder(ad, pools, [], k_max=1)
+        self.assertFalse(dec.one_forward)
 
 
 class _Clock:
@@ -277,10 +336,7 @@ class RunAhead(unittest.TestCase):
         self.ck = toy.Checkpoint()
         self.addCleanup(self.ck.close)
         self.seq, _ = toy.greedy(self.ck.ref, PROMPT, N)
-        m, self.pools = self.ck.streaming(8)
-        resize_pools(self.pools, sum(p.n_experts * p.expert_bytes
-                                     for p in self.pools.values()))
-        self.m = m
+        self.m, self.pools = _held(self.ck)
 
     def _decoder(self, head, **kw):
         ad = adapter_for(self.m, head)
@@ -432,7 +488,7 @@ def _has_loop() -> bool:
 @unittest.skipUnless(_has_loop(), "needs an mlx-lm with the looped inkling2 "
                      "(inkling2_loop), on the GPU")
 class InklingLoop(unittest.TestCase):
-    """Inkling 2 Mini's looped stack through BatchedDecoder, each step's
+    """Inkling 2 Mini's looped stack through the decoder, each step's
     drafts checked in one forward: what a step's rejected drafts were leaves
     no trace in the caches (what follows is bit for bit the same), with the
     sliding windows filling and full, after one rollback or two; and a
@@ -501,7 +557,6 @@ class InklingLoop(unittest.TestCase):
 
     def test_decode_with_the_head(self):
         from streamlx.inkling2 import Inkling2LoopAdapter
-        from streamlx.pipeline import BatchedDecoder
         from streamlx.pipeline_adapters import load_drafter
 
         ink = self.ink
@@ -517,8 +572,10 @@ class InklingLoop(unittest.TestCase):
                 logits, rows = ad.forward_taps(mx.array([prompt]), cache)
             mx.eval(logits, rows)
             ad.prime_pairs(rows[:, :-1], None)
-            dec = BatchedDecoder(ad, pools, views, k_max=4, plain_fn=ad.plain,
-                                 adaptive=False, self_gate=False)
+            dec = PipelinedDecoder(ad, pools, views, k_max=4,
+                                   plain_fn=ad.plain, adaptive=False,
+                                   self_gate=False)
+            self.assertTrue(dec.one_forward)
             first = int(mx.argmax(logits[0, -1]).item())
             if early:                         # a server's request that ends
                 out, gen = [first], dec.decode(first, rows[:, -1:],

@@ -212,6 +212,7 @@ class Inkling2Adapter(StandardMoEAdapter):
     rejected one stored. A sliding layer's window is written in place, so its
     snapshot holds the arrays under handles of its own.
     """
+    verify = None       # steps run as streams
 
     def __init__(self, model, drafter=None):
         try:    # mlx-lm's layout from 11-19 (#2082): the model is a package
@@ -376,7 +377,7 @@ class Inkling2Adapter(StandardMoEAdapter):
 class Inkling2LoopAdapter(Inkling2Adapter):
     """The adapter for mlx-lm's looped Inkling 2 (Mini: layers 6 to 17 run
     three times a token, each pass with caches of its own). Its drafts are
-    checked in one forward of the step's tokens (pipeline.BatchedDecoder),
+    checked in one forward of the step's tokens (PipelinedDecoder._mode),
     mlx-lm's own loop: verify() runs it and records every convolution window
     the layers build, rollback() takes a rejected draft's rows off the KV
     caches and each convolution state from its window, at the last token
