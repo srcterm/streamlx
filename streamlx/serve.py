@@ -123,6 +123,7 @@ from streamlx.integrate import (
     resize_pools,
 )
 from streamlx.kvcache import PagedPromptCache, stored_bytes
+from streamlx.pipeline_adapters import greedy
 
 _CFG = {"budget_bytes": None, "trust": False, "tokenizer_config": {},
         "draft_head": "auto", "draft_k": None, "memory_bytes": 0,
@@ -518,7 +519,7 @@ def _pipelined(dec, kwargs: dict):
                                            cache)
         mx.eval(logits, rows, [c.state for c in cache])
         cb(len(prompt), len(prompt))
-        token = first = int(mx.argmax(logits[0, -1]).item())
+        token = first = int(greedy(logits[0, -1]).item())
         dec.cache = ad.views(cache)
         prompt_tps = len(prompt) / (time.perf_counter() - tic)
         tic = time.perf_counter()
@@ -690,7 +691,7 @@ class StreamingModelProvider(srv.ModelProvider):
                   f"{k} tokens " + ("a forward" if getattr(ad, "batched", 0)
                                     else "in flight"), file=sys.stderr)
         elif _CFG["draft_head"] == "auto" and not head:
-            ad = headless_adapter(model)    # drafts by copy alone
+            ad = headless_adapter(model, pools)    # drafts by copy alone
         if ad is not None:
             from streamlx.pipeline import PipelinedDecoder
 

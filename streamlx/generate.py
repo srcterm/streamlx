@@ -50,7 +50,7 @@ from streamlx.integrate import (
     prefill_plan,
     resize_pools,
 )
-from streamlx.pipeline_adapters import token_ids
+from streamlx.pipeline_adapters import greedy, token_ids
 from streamlx.pool import all_held
 
 PREFILL_STEP = 4096
@@ -119,7 +119,7 @@ def main() -> int:
         ad = adapter_for(model, drafter)
         print(f"[load] draft head in {time.time()-t0:.1f}s", file=sys.stderr)
     elif args.draft_head == "auto" and not head:
-        ad = headless_adapter(model)    # drafts by copy alone
+        ad = headless_adapter(model, pools)    # drafts by copy alone
     # the memory limit, less what is resident, MLX's buffer cache and 2 GiB;
     # the pools take it, or every expert when that is less
     room = (budget_within(memory_limit(), pools, reserve=4 * 2**30)
@@ -165,7 +165,7 @@ def main() -> int:
             mx.eval(logits, context)
         if pre < budget:
             resize_pools(pools, budget)
-        first = int(mx.argmax(logits[0, -1]).item())
+        first = int(greedy(logits[0, -1]).item())
 
         eos = set(tokenizer.eos_token_ids or ())
         detok = tokenizer.detokenizer
@@ -200,9 +200,9 @@ def main() -> int:
                                on_token=emit, stop=eos, context=ids)
         else:
             def queue(t):
-                """The forward of `t` (an id, or the step before's argmax
-                still being computed), queued: its argmax."""
-                y = mx.argmax(model(token_ids(t), cache=cache)[0, -1])
+                """The forward of `t` (an id, or the step before's token
+                still being computed), queued: its greedy token."""
+                y = greedy(model(token_ids(t), cache=cache)[0, -1])
                 mx.async_eval(y)
                 return y
 

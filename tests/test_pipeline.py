@@ -208,7 +208,7 @@ class OneForward(unittest.TestCase):
         with mock.patch.object(pipeline_adapters, "_ATTN", ("no_such",)):
             for held in (False, True):
                 m, pools = ck.held() if held else ck.streaming(8)
-                ad = pipeline_adapters.headless_adapter(m)
+                ad = pipeline_adapters.headless_adapter(m, pools)
                 self.assertIsNone(ad.begin)
                 cache = make_prompt_cache(m)
                 mx.eval(m(mx.array([PROMPT]), cache=cache))
@@ -221,6 +221,76 @@ class OneForward(unittest.TestCase):
                                  (held, held))
             with self.assertRaises(AttributeError):
                 adapter_for(m, SimpleNamespace(tap_layers=(3,)))
+
+
+class LayerShapes(unittest.TestCase):
+    """With no draft head, copies stream through the standard adapter's
+    split only where it computes what the model's own forward does
+    (pipeline_adapters._SPLIT): checked on a tiny random model of each such
+    mlx-lm type. Any other gets WholeModelAdapter, the model's own forward:
+    copies in one forward while every expert is held, plain steps while they
+    stream (HunYuan's attention also returns its keys and values, for the
+    next layer). A model the loader holds whole gets no decoder."""
+
+    def test_split_is_the_forward(self):
+        from streamlx.pipeline_adapters import (_SPLIT, StandardMoEAdapter,
+                                                WholeModelAdapter)
+
+        self.assertLessEqual(_SPLIT, set(toy.SHAPES))    # each checked here
+        for mt, args in sorted(toy.SHAPES.items()):
+            with self.subTest(model_type=mt):
+                if importlib.util.find_spec(f"mlx_lm.models.{mt}") is None:
+                    self.skipTest(f"no {mt} in this mlx-lm")
+                mx.random.seed(0)
+                m = toy.build(args=args, quantize=False)
+                ad = adapter_for(m)
+                if mt not in _SPLIT:
+                    self.assertIsInstance(ad, WholeModelAdapter)
+                    continue
+                self.assertIs(type(ad), StandardMoEAdapter)
+                own, split = make_prompt_cache(m), make_prompt_cache(m)
+                mx.eval(m(mx.array([PROMPT]), cache=split))
+                tok = toy.pick(m(mx.array([PROMPT]), cache=own)[0, -1])
+                for i in range(8):
+                    want = m(mx.array([[tok]]), cache=own)[0, -1]
+                    ids, h, pos = ad.prep(tok, len(PROMPT) + i)
+                    ctx = ad.masks(h, split)
+                    for l in range(len(ad.layers)):
+                        h = ad.finish(l, ad.begin(l, h, ids, ctx, split, pos))
+                    self.assertTrue(bool(mx.array_equal(ad.logits(h)[0, -1],
+                                                        want)))
+                    tok = toy.pick(want)
+
+    def test_hunyuan(self):
+        from streamlx.pipeline_adapters import (WholeModelAdapter,
+                                                headless_adapter)
+
+        if importlib.util.find_spec("mlx_lm.models.hunyuan") is None:
+            self.skipTest("no hunyuan in this mlx-lm")
+        ck = toy.Checkpoint(args=toy.SHAPES["hunyuan"])
+        self.addCleanup(ck.close)
+        seq, _ = toy.greedy(ck.ref, PROMPT, N)
+        for held in (False, True):          # 8 of its 16 experts, then all
+            with self.subTest(held=held):
+                m, pools = ck.held() if held else ck.streaming(8)
+                ad = headless_adapter(m, pools)
+                self.assertIsInstance(ad, WholeModelAdapter)
+                cache = make_prompt_cache(m)
+                mx.eval(m(mx.array([PROMPT]), cache=cache))
+                dec = PipelinedDecoder(ad, pools, cache, k_max=1,
+                                       plain_fn=ad.plain)
+                out = dec.generate(seq[0], None, len(PROMPT), N,
+                                   context=PROMPT + seq)
+                self.assertEqual(out, seq[:N])
+                self.assertEqual((dec.one_forward, dec.lookup.kept > 0),
+                                 (held, held))
+
+    def test_a_model_held_whole(self):
+        # (the loader streams no expert of it: mlx-lm's Mixtral keeps them in
+        # block_sparse_moe) it decodes as mlx-lm's
+        from streamlx.pipeline_adapters import headless_adapter
+
+        self.assertIsNone(headless_adapter(toy.build(), {}))
 
 
 class _Clock:
@@ -523,6 +593,17 @@ class CopiedDrafts(unittest.TestCase):
         self.assertGreater(dec.lookup.kept, 0)
         # the tokens of a copy reach the head with its next draft
         self.assertGreaterEqual(dec.ad.drafter.pos, N - 13)
+
+    def test_counts_are_the_decode_s(self):
+        # a decode's setup runs when it is called: one that ends before its
+        # first id is read (a request for one token) leaves no copy counts
+        # of the decode before
+        dec, row, ctx = self._decode(lambda seq: PROMPT + seq, head=None,
+                                     plain=True)
+        dec.generate(self.seq[0], row, len(PROMPT), N, context=ctx)
+        self.assertGreater(dec.lookup.kept, 0)
+        dec.decode(self.seq[0], row, len(PROMPT), 1, context=ctx).close()
+        self.assertEqual((dec.lookup.proposed, dec.lookup.kept), (0, 0))
 
     def test_width_follows_acceptance(self):
         dec, row, ctx = self._decode(lambda seq: PROMPT + seq, k_copy=16)

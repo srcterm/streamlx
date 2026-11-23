@@ -1,16 +1,18 @@
-"""A served request's end: the prompt cache must end where the stock loop
-leaves it (after the last token out, run once), because the next turn
-continues from it. A pipelined step can have run that token already."""
+"""A served request: its tokens are the stock loop's greedy ones, and its
+prompt cache must end where the stock loop leaves it (after the last token
+out, run once), because the next turn continues from it. A pipelined step
+can have run that token already."""
+import importlib.util
 import types
 import unittest
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 
 import toy
 from streamlx import serve
 from streamlx.pipeline import PipelinedDecoder
-from streamlx.pipeline_adapters import adapter_for
+from streamlx.pipeline_adapters import adapter_for, headless_adapter
 
 PROMPT = toy.prompt(8)
 
@@ -101,6 +103,72 @@ class RequestEnd(unittest.TestCase):
                     a = ref(mx.array([[nxt]]), cache=want)
                     b = m(mx.array([[nxt]]), cache=cache)
                     self.assertTrue(bool(mx.array_equal(a, b)))
+
+    def test_nested_caches(self):
+        # DeepSeek-V3.2's layers each hold a CacheList (its attention's and
+        # its indexer's): the tokens taken in are its members' count, so a
+        # request closed after n tokens does not run the last one again where
+        # a plain step queued ahead (every expert held) already did
+        if importlib.util.find_spec("mlx_lm.models.deepseek_v32") is None:
+            self.skipTest("no deepseek_v32 in this mlx-lm")
+        ck = toy.Checkpoint(args=toy.SHAPES["deepseek_v32"])
+        self.addCleanup(ck.close)
+        m, pools = ck.held()
+        ad = headless_adapter(m, pools)
+        for n in (2, 3, 5):
+            with self.subTest(tokens=n):
+                cache = make_prompt_cache(m)
+                dec = PipelinedDecoder(ad, pools, [], k_max=1,
+                                       plain_fn=ad.plain)
+                gen = serve._pipelined(dec, dict(
+                    model=m, tokenizer=_Tokenizer(), prompt_cache=cache,
+                    prompt=PROMPT[:3], max_tokens=64, stream=self.stream))
+                for _ in range(n):
+                    next(gen)
+                gen.close()
+                self.assertEqual(cache[1][0].offset, 3 + n)
+                self.assertEqual(ad.offset(cache), 3 + n)
+
+
+class GreedyAsStock(unittest.TestCase):
+    """The decoder takes mlx-lm's greedy token: the argmax of the
+    log-probabilities, not of the logits. Two bf16 logits a step apart can
+    normalize to one value, and then the first id wins (the bf16 toy's
+    prompt [29] on the GPU: 71 by stock, the logits' argmax 159)."""
+
+    def test_rule(self):
+        from mlx_lm.sample_utils import make_sampler
+
+        from streamlx.pipeline_adapters import greedy
+
+        sampler, apart = make_sampler(0.0), 0
+        for s in range(200):
+            x = (mx.random.normal((4, 256), key=mx.random.key(s)) * 0.5
+                 ).astype(mx.bfloat16)
+            want = [sampler(r - mx.logsumexp(r, keepdims=True)).item()
+                    for r in (x[i:i + 1] for i in range(4))]
+            self.assertEqual(greedy(x).tolist(), want)     # each row alone
+            self.assertEqual([greedy(x[i]).item() for i in range(4)], want)
+            apart += sum(a != b for a, b in
+                         zip(want, mx.argmax(x, axis=-1).tolist()))
+        self.assertGreater(apart, 0)          # (rows where the two differ)
+
+    def test_served(self):
+        ck = toy.Checkpoint(dtype=mx.bfloat16)
+        self.addCleanup(ck.close)
+        m, pools = ck.held()
+        ad = headless_adapter(m, pools)
+        stream = mx.new_stream(mx.default_device())
+        for prompt in ([29], PROMPT):
+            with self.subTest(prompt=prompt):
+                want, _ = toy.greedy(ck.ref, prompt, 7)
+                dec = PipelinedDecoder(ad, pools, [], k_max=1,
+                                       plain_fn=ad.plain)
+                out = [r.token for r in serve._pipelined(dec, dict(
+                    model=m, tokenizer=_Tokenizer(),
+                    prompt_cache=make_prompt_cache(m), prompt=prompt,
+                    max_tokens=8, stream=stream))]
+                self.assertEqual(out, want)
 
 
 class PoolsGrowBack(unittest.TestCase):

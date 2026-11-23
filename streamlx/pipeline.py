@@ -78,6 +78,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import numpy as np
 
+from .pipeline_adapters import greedy
 from .pool import KEEPALIVE, all_held, keepalive_wait
 
 # While drafting is off and plain steps run ahead (decode), the committed
@@ -538,15 +539,15 @@ class PipelinedDecoder:
             self.k_copy = 1         # layers the adapter does not split
 
     def step(self, toks: list[int], offset: int):
-        """Returns (outputs, hiddens, snaps): outputs[i] = argmax after
-        stream i, hiddens[i] = its final (pre-head) hidden, snaps[l][i] =
+        """Returns (outputs, hiddens, snaps): outputs[i] = the greedy token
+        after stream i, hiddens[i] = its final (pre-head) hidden, snaps[l][i] =
         layer-l cache snapshot taken before stream i wrote it (one forward:
         the adapter's record for its rollback). A step that raises (a read
         failed) leaves the pools usable: see _abandon. The cache then holds
         part of the step and is the caller's to drop."""
         if self.one_forward:
             logits, rows, rec = self.ad.verify(toks, self.cache)
-            outs = mx.argmax(logits[0], axis=-1)
+            outs = greedy(logits[0])
             mx.eval(outs, rows)
             return (outs.tolist(),
                     [None if rows is None else rows[:, i:i + 1]
@@ -618,7 +619,7 @@ class PipelinedDecoder:
         mx.eval(*(s.out for s in streams))
         for s in streams:                    # the layers the logits ran last
             self._settle(s)
-        outs = [int(mx.argmax(s.out[0, -1]).item()) for s in streams]
+        outs = [int(greedy(s.out[0, -1]).item()) for s in streams]
         dh = getattr(self.ad, "draft_hidden", None)
         return outs, [dh(s.h, s.pos) if dh else s.h for s in streams], snaps
 
@@ -634,21 +635,21 @@ class PipelinedDecoder:
 
     # -- the plain fallback and the self-gate --------------------------------
     def plain_step(self, tok: int):
-        """One token through the host's own forward. Returns (argmax,
-        logits, hidden)."""
+        """One token through the host's own forward. Returns (the greedy
+        token, logits, hidden)."""
         t0 = time.perf_counter()
         logits, hidden = self.plain_fn(tok, self.cache)
         mx.eval(logits)
         self._plain_done(time.perf_counter() - t0)
-        return int(mx.argmax(logits[0, -1]).item()), logits, hidden
+        return int(greedy(logits[0, -1]).item()), logits, hidden
 
     def _plain_queue(self, tok):
-        """A plain step on `tok` (an id, or the step before's argmax still
-        being computed), queued on the GPU and not waited on: (argmax,
-        hidden)."""
+        """A plain step on `tok` (an id, or the step before's token still
+        being computed), queued on the GPU and not waited on: (its greedy
+        token, hidden)."""
         t0 = time.perf_counter()
         logits, hidden = self.plain_fn(tok, self.cache)
-        nxt = mx.argmax(logits[0, -1])
+        nxt = greedy(logits[0, -1])
         self._built = time.perf_counter() - t0      # the host's build
         mx.async_eval(nxt, *([] if hidden is None else [hidden]))
         return nxt, hidden
@@ -751,13 +752,19 @@ class PipelinedDecoder:
         server stops reading wherever a request ends, so however this ends,
         closed early included, the cache ends just after the last id out when
         a later stream of its step, or a plain step queued after it, ran it,
-        else just before it."""
+        else just before it. The sequence's state is set at the call, not at
+        the first id read: a request that ends on its first token keeps no
+        counts of the one before."""
         self._warm = self._warm_gate = 0           # a sequence's cold steps
         self._mode()
+        if self.lookup is not None:
+            self.lookup.reset(context if context is not None else ())
+            self.lookup.push(first_tok)
+        return self._decode(first_tok, first_hidden, offset, n_tokens, stop)
+
+    def _decode(self, first_tok: int, first_hidden, offset: int,
+                n_tokens: int, stop):
         lk = self.lookup
-        if lk is not None:
-            lk.reset(context if context is not None else ())
-            lk.push(first_tok)
         if first_tok in stop:
             return
         n = 1
