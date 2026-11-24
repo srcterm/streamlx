@@ -31,9 +31,10 @@ less than 1 GiB free.
 A segment's arrays are stored compressed, losslessly: in blocks, each one's
 bytes split into planes, the most significant first (the high byte of a
 bf16 value, its sign and exponent, repeats far more than the low one), then
-compressed with Apple's libcompression, a system library. A restore reads
-every segment's part of an array straight into the array's final buffer,
-decoding on a pool of threads, so a row is copied once on its way in.
+compressed with Apple's libcompression; Accelerate's vImage splits and joins
+the planes (both are system libraries). A restore reads every segment's
+part of an array straight into the array's final buffer, decoding on a pool
+of threads, so a row is copied once on its way in.
 
 Drop-in for mlx_lm's LRUPromptCache in the sequential server (one request at
 a time): the same fetch_nearest_cache / insert_cache interface, plus
@@ -45,6 +46,7 @@ from __future__ import annotations
 import bisect
 import copy
 import ctypes
+import fcntl
 import hashlib
 import heapq
 import importlib
@@ -69,6 +71,7 @@ import numpy as np
 from mlx.utils import tree_flatten, tree_unflatten
 
 from .pool import _storage
+from .reader import F_RDAHEAD
 
 FORMAT = 3      # 3: arrays in compressed blocks (2: a CacheList's members
 #                 each their own way, windows cut)
@@ -91,13 +94,13 @@ _SAMPLE = 2**16  # bytes of a weight file's middle, and of its end, fingerprinte
 _FREE_FLOOR = 2**30   # what a segment write leaves free on the volume at least
 
 # The codecs: on the four models' stored segments (bf16 attention rows,
-# planes split) lzbitmap saves 18-22% and decodes at ~10 GB/s a thread,
-# faster than a drive reads; LZFSE saves 28-31% at ~1.3 GB/s a thread
-# (4-5 GB/s on four); lz4 14-17%; zlib about LZFSE's at a third of its
+# planes split) lzbitmap saves 18-21% (DeepSeek-V4.1's 35%) and decodes at
+# ~10 GB/s a thread, faster than a drive reads; LZFSE saves 28-29% (55%)
+# at ~1.3 GB/s a thread; lz4 14-16%; zlib about LZFSE's at a third of its
 # speed. Recurrent states in float32 save 10-14%.
 _ALGS = {"lzbitmap": 0x702, "lzfse": 0x801, "lz4": 0x100, "zlib": 0x205}
 _BLOCK = 4 * 2**20   # bytes of an array a block holds
-_UINT = {2: np.uint16, 4: np.uint32, 8: np.uint64}
+_ALLOC = 256 * 2**20  # bytes of restored arrays allocated at a time
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +130,31 @@ def _libcompression():
 _LIB = _libcompression()
 CODEC = _codec(os.environ.get("STREAMLX_KV_CODEC")) if _LIB else "none"
 
+
+class _VBuf(ctypes.Structure):     # vImage_Buffer
+    _fields_ = [("data", ctypes.c_void_p), ("height", ctypes.c_size_t),
+                ("width", ctypes.c_size_t), ("rowBytes", ctypes.c_size_t)]
+
+
+def _vimage():
+    """Accelerate's vImage (a system framework): its four-plane interleave
+    and deinterleave run at ~35-45 GB/s a thread where numpy's shifts
+    managed 5; None where it does not load (numpy then does it)."""
+    try:
+        lib = ctypes.CDLL("/System/Library/Frameworks/Accelerate.framework/"
+                          "Accelerate")
+    except OSError:
+        return None
+    for fn in (lib.vImageConvert_Planar8toARGB8888,
+               lib.vImageConvert_ARGB8888toPlanar8):
+        fn.restype = ctypes.c_ssize_t
+        fn.argtypes = [ctypes.POINTER(_VBuf)] * 5 + [ctypes.c_uint32]
+    return lib
+
+
+_VIMAGE = _vimage()
+_NO_TILE = 16   # kvImageDoNotTile: one thread a call (the callers are many)
+
 _POOLS: dict = {}
 
 
@@ -138,34 +166,47 @@ def _pool(name: str, workers: int) -> ThreadPoolExecutor:
     return _POOLS[name]
 
 
-def _split(raw: np.ndarray, w: int) -> np.ndarray:
-    """The bytes of w-byte values as planes, the values' most significant
-    byte first."""
-    if w == 1:
-        return raw
-    v, m = raw.view(_UINT[w]), raw.size // w
-    out = np.empty(raw.size, np.uint8)
-    for k in range(w):     # (each assignment keeps the low byte)
-        out[k * m:(k + 1) * m] = v >> (8 * (w - 1 - k)) if k < w - 1 else v
+def _planar(w: int, n: int) -> bool:
+    """Whether a block of n bytes of w-byte values is split into planes:
+    those of values wider than a byte that fill whole 4-byte groups."""
+    return w > 1 and n % 4 == 0
+
+
+def _bufs(a: np.ndarray, p: int) -> list:
+    """vImage buffers of a's four planes of p bytes, the first (the most
+    significant byte of each 4-byte group) last: vImage's A, R, G, B."""
+    return [ctypes.byref(_VBuf(a[k * p:].ctypes.data, 1, p, p))
+            for k in (3, 2, 1, 0)]
+
+
+def _split(raw: np.ndarray) -> np.ndarray:
+    """A block's 4-byte groups (a bf16 pair, a float32) as four planes, the
+    groups' most significant byte first: the high byte of a value, its sign
+    and exponent, repeats far more than the low one."""
+    p, out = raw.size // 4, np.empty(raw.size, np.uint8)
+    if _VIMAGE is None:
+        out.reshape(4, p)[:] = raw.reshape(p, 4)[:, ::-1].T
+    elif _VIMAGE.vImageConvert_ARGB8888toPlanar8(
+            ctypes.byref(_VBuf(raw.ctypes.data, 1, p, 4 * p)),
+            *_bufs(out, p), _NO_TILE):
+        raise RuntimeError("vImage could not split a block")
     return out
 
 
-def _join(planes: np.ndarray, out: np.ndarray, w: int) -> None:
+def _join(planes: np.ndarray, out: np.ndarray) -> None:
     """_split's inverse, into out."""
-    if w == 1:
-        out[:] = planes
-        return
-    t, m = _UINT[w], planes.size // w
-    o = out.view(t)
-    np.left_shift(planes[:m], 8 * (w - 1), out=o, dtype=t)
-    for k in range(1, w):
-        p = planes[k * m:(k + 1) * m]
-        o |= np.left_shift(p, 8 * (w - 1 - k), dtype=t) if k < w - 1 else p
+    p = planes.size // 4
+    if _VIMAGE is None:
+        out.reshape(p, 4)[:] = planes.reshape(4, p)[::-1].T
+    elif _VIMAGE.vImageConvert_Planar8toARGB8888(
+            *_bufs(planes, p), ctypes.byref(_VBuf(out.ctypes.data, 1, p,
+                                                  4 * p)), _NO_TILE):
+        raise RuntimeError("vImage could not join a block")
 
 
 def _encode(raw: np.ndarray, w: int, alg: int) -> np.ndarray | None:
     """A block's bytes compressed, or None when they would not shrink."""
-    src = _split(raw, w)
+    src = _split(raw) if _planar(w, raw.size) else raw
     dst = np.empty(src.size - 1, np.uint8)
     n = _LIB.compression_encode_buffer(dst.ctypes.data, dst.size,
                                        src.ctypes.data, src.size, None,
@@ -173,19 +214,34 @@ def _encode(raw: np.ndarray, w: int, alg: int) -> np.ndarray | None:
     return dst[:n] if n else None
 
 
-def _decode(stored: np.ndarray, out: np.ndarray, w: int, alg: int) -> None:
+def _scratch(bufs: dict | None, name: str, n: int) -> np.ndarray:
+    """n bytes of a thread's buffer `name` from `bufs` (a restore's, one a
+    thread), grown as needed: a block then reads and decodes into memory
+    already faulted in and warm in the caches, not a fresh allocation."""
+    if bufs is None:
+        return np.empty(n, np.uint8)
+    b = bufs.get(name)
+    if b is None or b.size < n:
+        b = bufs[name] = np.empty(n, np.uint8)
+    return b[:n]
+
+
+def _decode(stored: np.ndarray, out: np.ndarray, w: int, alg: int,
+            bufs: dict | None = None) -> None:
     """A block as stored -> its bytes, into out (a block that would not
     shrink is stored as it was: as many bytes as out)."""
     if stored.size == out.size:
         out[:] = stored
         return
-    planes = np.empty(out.size, np.uint8)
+    planar = _planar(w, out.size)
+    planes = _scratch(bufs, "planes", out.size) if planar else out
     n = _LIB.compression_decode_buffer(planes.ctypes.data, planes.size,
                                        stored.ctypes.data, stored.size, None,
                                        alg)
     if n != out.size:
         raise ValueError(f"a damaged block: {n} of {out.size} bytes")
-    _join(planes, out, w)
+    if planar:
+        _join(planes, out)
 
 
 def _lines(shape, w: int, axis) -> tuple[int, int] | None:
@@ -280,11 +336,16 @@ def _read(fd: int, buf: np.ndarray, off: int) -> None:
 
 
 def _fill(fd: int, file: tuple, name: str, axis, at: int, rows: int,
-          dst: np.ndarray) -> None:
+          dst: np.ndarray, scratch: dict) -> None:
     """One segment's part of a restored array, its blocks read (and
     decoded) straight into dst, a view of the array's buffer: the segment's
     first `rows` rows along `axis` at row `at` of each line, or (axis None)
-    the whole array. A block past those rows is not read."""
+    the whole array. A block stored as it was is read straight into place,
+    a compressed one into a buffer and decoded from there; a block past
+    those rows is not read. scratch: the restore's buffers, {thread id:
+    {name: buffer}}. (One read a block beat one an array: F185, cold 0.67
+    vs 0.80 s, warm 0.14 vs 0.15 s.)"""
+    bufs = scratch.setdefault(threading.get_ident(), {})
     h, meta, base = file
     a, b = h[name]["data_offsets"]
     tag, shape, blocks = _stored(h, meta, name, axis)
@@ -318,13 +379,13 @@ def _fill(fd: int, file: tuple, name: str, axis, at: int, rows: int,
             if stored == size:          # as it was: read straight in
                 _read(fd, out, off)
             else:
-                buf = np.empty(stored, np.uint8)
+                buf = _scratch(bufs, "stored", stored)
                 _read(fd, buf, off)
                 if need == size:
-                    _decode(buf, out, w, alg)
+                    _decode(buf, out, w, alg, bufs)
                 else:                   # the first rows of a block
-                    tmp = np.empty(size, np.uint8)
-                    _decode(buf, tmp, w, alg)
+                    tmp = _scratch(bufs, "rows", size)
+                    _decode(buf, tmp, w, alg, bufs)
                     out[:] = tmp[:need]
         off, r = off + stored, r + size
     if off != base + b or r != math.prod(shape) * w:
@@ -798,21 +859,48 @@ class PagedPromptCache:
 
         for i, spec in enumerate(metas[-1]["layers"]):
             plan(f"{i}.", spec)
-        mx.eval([a for a, _ in arrays.values()])
-        views = {k: np.frombuffer(_storage(a), _NP[tag]).reshape(a.shape)
-                 for k, (a, tag) in arrays.items() if a.size}
-        fds = []
+        # the arrays' buffers in groups of ~_ALLOC bytes: the GPU zeroes
+        # the next group while the threads fill this one
+        groups, size = [[]], 0
+        for k, (a, _) in arrays.items():
+            if size >= _ALLOC:
+                groups.append([])
+                size = 0
+            groups[-1].append(k)
+            size += a.nbytes
+        by_key: dict = {}
+        for job in jobs:
+            by_key.setdefault(job[1], []).append(job)
+        views, fds, futs = {}, [], []
         try:
             for s in segs:
                 fds.append(os.open(s.path, os.O_RDONLY))
-            dec = _pool("dec", min(8, os.cpu_count() or 4))
-            futs = [dec.submit(_fill, fds[i], files[i], key, axis, at, r,
-                               views[key])
-                    for i, key, axis, at, r in jobs if key in views]
+                # no read-ahead: it fetched the arrays a restore skips (the
+                # states of all but the last segment), and from a drive a
+                # restore took 18% longer (F185: 0.67 vs 0.57 s)
+                fcntl.fcntl(fds[-1], F_RDAHEAD, 0)
+            # six threads: on an M4 (4 + 6 cores) 4-8 restore alike, 6 best
+            dec = _pool("dec", min(6, os.cpu_count() or 4))
+            scratch: dict = {}   # the threads' buffers, gone with the restore
+            mx.async_eval([arrays[k][0] for k in groups[0]])
+            for g, keys in enumerate(groups):
+                if g + 1 < len(groups):
+                    mx.async_eval([arrays[k][0] for k in groups[g + 1]])
+                mx.eval([arrays[k][0] for k in keys])
+                for k in keys:
+                    a, tag = arrays[k]
+                    if not a.size:
+                        continue
+                    views[k] = np.frombuffer(_storage(a), _NP[tag]).reshape(
+                        a.shape)
+                    futs += [dec.submit(_fill, fds[i], files[i], k, axis, at,
+                                        r, views[k], scratch)
+                             for i, _, axis, at, r in by_key.get(k, ())]
             _all_done(futs)    # (a failed read: the others write on first)
             for f in futs:
                 f.result()
         finally:
+            _all_done(futs)    # no thread still reads a file or writes a view
             for fd in fds:
                 os.close(fd)
             # a live view keeps MLX from updating an array in place

@@ -245,12 +245,19 @@ class Codecs(_Case):
                 "0.0": ("BF16", rows, None),
                 "0.1": ("F32", rng.standard_normal((3, 70), np.float32), None),
                 "0.2": ("BOOL", np.ones(5, np.bool_), None),
+                "0.3": ("BF16", np.full((1, 3), 0x3F80, np.uint16), None),
                 "1.0": ("BF16", heads, -2)}     # along the sequence
         for codec in kvcache._ALGS:
             with self.subTest(codec=codec), \
                     mock.patch.object(kvcache, "_BLOCK", 600):
                 meta = {}
                 entries, pieces = kvcache._pack(host, codec, meta)
+                # numpy, where vImage does not load, stores the same bytes
+                with mock.patch.object(kvcache, "_VIMAGE", None):
+                    self.assertEqual(
+                        b"".join(p.tobytes() for p in
+                                 kvcache._pack(host, codec, {})[1]),
+                        b"".join(p.tobytes() for p in pieces))
                 data = np.concatenate(pieces)
                 header, off = {}, 0
                 for name, tag, shape, size in entries:
