@@ -1,12 +1,16 @@
 """The SSD prompt cache restores a history only for the weights that
 computed it, and a damaged or deleted segment costs one prefill: never a
 request, and never a second prefill of the same prompt."""
+import gc
 import importlib.util
 import os
 import shutil
 import struct
 import tempfile
+import time
+import tracemalloc
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import mlx.core as mx
@@ -317,6 +321,140 @@ class Codecs(_Case):
                                      (c.values, ref.values)):
                             self.assertTrue(bool(mx.array_equal(
                                 a[..., :n, :], b[..., :n, :])), (codec, n))
+
+
+class Chains(_Case):
+    """A restore reads every segment of a chain as that segment was stored:
+    rows of another dtype are not read into a buffer of the newest one's,
+    and a file rewritten meanwhile is read whole, old or new."""
+
+    def test_dtype_changed(self):
+        """A layer's rows that changed dtype from one segment to the next (a
+        ConcatenateKVCache's keys promoted from float16 to float32; no
+        model's do): a miss, never rows read as another dtype."""
+        from mlx_lm.models.cache import ConcatenateKVCache
+
+        ck = toy.Checkpoint()
+        self.addCleanup(ck.close)
+        tokens = toy.prompt(8)
+        for codec in ("none", "lzbitmap"):     # blocks as they were, packed
+            with self.subTest(codec=codec), \
+                    mock.patch.object(kvcache, "CODEC", codec):
+                root = tempfile.mkdtemp(dir=self.root)
+                pc = _server(root)
+                pc.fetch_nearest_cache(ck.dir, tokens)
+                live = ConcatenateKVCache()
+                for n, dt in ((4, mx.float16), (8, mx.float32)):
+                    k = mx.arange(16 * (n - 4), 16 * n,
+                                  dtype=dt).reshape(1, 1, 4, 16)
+                    live.update_and_fetch(k, k.astype(mx.float32))
+                    pc.save_progress(n, [live])
+                pc.flush()
+                pc = _server(root)
+                with self.assertLogs("streamlx.kvcache", "ERROR"):
+                    cache, rest = pc.fetch_nearest_cache(ck.dir,
+                                                         tokens + [NEXT])
+                self.assertIsNone(cache)
+                self.assertEqual(rest, tokens + [NEXT])
+
+    def test_rewritten_during_restore(self):
+        """A segment rewritten while a restore reads it (another server
+        storing the same prefix, here with another codec): the restore
+        reads the file it opened, and the segment stays."""
+        ck = toy.Checkpoint()
+        self.addCleanup(ck.close)
+        tokens = toy.prompt(200)
+        roots = []
+        for codec in ("lzfse", "none"):
+            with mock.patch.object(kvcache, "CODEC", codec):
+                roots.append(tempfile.mkdtemp(dir=self.root))
+                _store(_server(roots[-1]), ck, ck.ref, tokens)
+        pc = _server(roots[0])
+        pc._open(ck.dir)
+        (seg,) = pc._segs.values()
+        new = Path(roots[1]) / seg.path.relative_to(roots[0])
+        self.assertNotEqual(new.read_bytes(), seg.path.read_bytes())
+        read = PagedPromptCache._file
+
+        def meanwhile(*args):
+            got = read(*args)
+            if new.exists():        # once, right after the header is read
+                os.replace(new, seg.path)
+            return got
+
+        with mock.patch.object(PagedPromptCache, "_file",
+                               staticmethod(meanwhile)):
+            self.assertEqual(self.restored(pc, ck, ck.ref, tokens),
+                             len(tokens))
+        self.assertFalse(new.exists())
+        self.assertTrue(seg.path.exists())
+
+
+def _active(limit: float, timeout: float = 2.0) -> int:
+    """MLX's active memory once it is at most `limit`, else after `timeout`
+    seconds: the buffers an evaluated graph used are released a moment after
+    the eval returns, when the GPU's completed work lets them go (a buffer
+    something still holds is never released)."""
+    mx.synchronize()
+    end = time.monotonic() + timeout
+    while mx.get_active_memory() > limit and time.monotonic() < end:
+        time.sleep(0.01)
+    return mx.get_active_memory()
+
+
+class Memory(_Case):
+    """Rows a restore or a write is done with are let go at once, not when
+    the garbage collector next runs."""
+
+    def live(self, ck, pc, n):
+        """A request's single-layer cache of n tokens, 2 MiB a 256 tokens."""
+        from mlx_lm.models.cache import KVCache
+
+        pc.fetch_nearest_cache(ck.dir, toy.prompt(n))
+        c = KVCache()
+        kv = mx.ones((1, 8, n, 128), mx.bfloat16)
+        mx.eval(c.update_and_fetch(kv, kv))
+        return [c]
+
+    def test_restored_rows_held_once(self):
+        """A restored cache grown past its buffer (a new one) holds its rows
+        once, and dropped, holds none."""
+        ck = toy.Checkpoint()
+        self.addCleanup(ck.close)
+        n = 4096          # a buffer with no room left: KVCache.step is 256
+        pc = _server(self.root)
+        pc.save_progress(n, self.live(ck, pc, n))
+        pc.flush()
+        gc.collect()
+        gc.disable()
+        self.addCleanup(gc.enable)
+        base = mx.get_active_memory()
+        (c,), _ = _server(self.root).fetch_nearest_cache(
+            ck.dir, toy.prompt(n) + [NEXT])
+        one = mx.zeros((1, 8, 1, 128), mx.bfloat16)
+        mx.eval(c.update_and_fetch(one, one))
+        self.assertEqual(c.offset, n + 1)
+        rows = 1.1 * (c.keys.nbytes + c.values.nbytes)
+        self.assertLess(_active(base + rows) - base, rows)
+        del c
+        self.assertLess(_active(base + 2**20) - base, 2**20)
+
+    @unittest.skipUnless(kvcache._LIB, "needs libcompression")
+    def test_writer_keeps_nothing(self):
+        """Once a segment is written, the writer holds neither its host
+        copies nor its encoded blocks."""
+        ck = toy.Checkpoint()
+        self.addCleanup(ck.close)
+        n = 2048
+        pc = _server(self.root)
+        cache = self.live(ck, pc, n)
+        tracemalloc.start()
+        self.addCleanup(tracemalloc.stop)
+        with mock.patch.object(kvcache, "CODEC", "lzbitmap"):
+            pc.save_progress(n, cache)
+            pc.flush()
+        self.assertEqual(len(pc), 1)
+        self.assertLess(tracemalloc.get_traced_memory()[0], 2**20)
 
 
 if __name__ == "__main__":
