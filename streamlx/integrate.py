@@ -730,7 +730,17 @@ def install_streaming(model, model_dir: str, n_slots: int):
         raise RuntimeError("no MoE layers found to wrap")
     _link_next_layers(model, pools)
     _set_visits(model, pools)
+    _fuse_visits(model)
     return pools, reader
+
+
+def _fuse_visits(model) -> None:
+    """Inkling 2: its layer visit in about half the kernels, the same values
+    (inkling2_step: applied only where it reproduces mlx-lm's bit for bit)."""
+    if getattr(model, "model_type", None) in ("inkling2", "inkling2_loop"):
+        from .inkling2_step import fuse
+
+        fuse(model)
 
 
 def _link_next_layers(model, pools: dict) -> None:
@@ -967,6 +977,7 @@ def load_streaming_model(model_dir: str, budget_bytes: int,
     # lazy arrays stream-bound to a thread they don't run on.
     mx.eval([t for p in pools.values()
              for proj in p.pool.values() for t in proj.values()])
+    _fuse_visits(model)
     return model, tokenizer, pools, reader
 
 

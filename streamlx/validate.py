@@ -71,8 +71,12 @@ def main() -> int:
     ref, ref_logits = greedy(model, cache_factory, prompt_ids, args.tokens,
                              sync_each=True)
     pools, reader = install_streaming(model, args.model, args.slots)
+    fused = sum(type(layer).__name__.startswith("Fused")
+                for layer in model.layers)
     print(f"[validate] streaming installed: {len(pools)} layers x "
-          f"{args.slots} slots", file=sys.stderr)
+          f"{args.slots} slots"
+          + (f", {fused} layers on the fused visit" if fused else ""),
+          file=sys.stderr)
     stream, logits = greedy(model, cache_factory, prompt_ids, args.tokens)
 
     st = aggregate_stats(pools)
