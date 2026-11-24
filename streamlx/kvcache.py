@@ -28,6 +28,13 @@ that model then misses and stores it again), then the served model's least
 recently used segments. A segment is not written when it would leave the volume with
 less than 1 GiB free.
 
+A segment's arrays are stored compressed, losslessly: in blocks, each one's
+bytes split into planes, the most significant first (the high byte of a
+bf16 value, its sign and exponent, repeats far more than the low one), then
+compressed with Apple's libcompression, a system library. A restore reads
+every segment's part of an array straight into the array's final buffer,
+decoding on a pool of threads, so a row is copied once on its way in.
+
 Drop-in for mlx_lm's LRUPromptCache in the sequential server (one request at
 a time): the same fetch_nearest_cache / insert_cache interface, plus
 save_progress(n, cache) when the active request's prefill reaches token n.
@@ -37,12 +44,14 @@ from __future__ import annotations
 
 import bisect
 import copy
+import ctypes
 import hashlib
 import heapq
 import importlib
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -50,6 +59,8 @@ import shutil
 import struct
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as _all_done
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,7 +68,10 @@ import mlx.core as mx
 import numpy as np
 from mlx.utils import tree_flatten, tree_unflatten
 
-FORMAT = 2      # 2: a CacheList's members each their own way, windows cut
+from .pool import _storage
+
+FORMAT = 3      # 3: arrays in compressed blocks (2: a CacheList's members
+#                 each their own way, windows cut)
 _STEP = 256      # tokens per hash step
 _SLICED = ("KVCache", "QSAKVCache", "QuantizedKVCache", "ConcatenateKVCache")
 # state leaves of a sliced cache not along axis -2: their axis, or None for what
@@ -67,11 +81,254 @@ _TAGS = {mx.bfloat16: "BF16", mx.float16: "F16", mx.float32: "F32",
          mx.int32: "I32", mx.uint32: "U32", mx.int64: "I64",
          mx.uint8: "U8", mx.bool_: "BOOL"}
 
+_NP = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32,
+       "I32": np.int32, "U32": np.uint32, "I64": np.int64, "U8": np.uint8,
+       "BOOL": np.bool_}
+_MX = {tag: dt for dt, tag in _TAGS.items()}
+
 _MODEL_DIR = re.compile(r"[0-9a-f]{16}")   # root/<model fingerprint>
 _SAMPLE = 2**16  # bytes of a weight file's middle, and of its end, fingerprinted
 _FREE_FLOOR = 2**30   # what a segment write leaves free on the volume at least
 
+# The codecs: on the four models' stored segments (bf16 attention rows,
+# planes split) lzbitmap saves 18-22% and decodes at ~10 GB/s a thread,
+# faster than a drive reads; LZFSE saves 28-31% at ~1.3 GB/s a thread
+# (4-5 GB/s on four); lz4 14-17%; zlib about LZFSE's at a third of its
+# speed. Recurrent states in float32 save 10-14%.
+_ALGS = {"lzbitmap": 0x702, "lzfse": 0x801, "lz4": 0x100, "zlib": 0x205}
+_BLOCK = 4 * 2**20   # bytes of an array a block holds
+_UINT = {2: np.uint16, 4: np.uint32, 8: np.uint64}
+
 log = logging.getLogger(__name__)
+
+
+def _codec(v: str | None) -> str:
+    """STREAMLX_KV_CODEC: how segments are compressed, one of _ALGS (default
+    lzbitmap); none, off, false, no or 0: not at all. Any other word is the
+    default."""
+    v = (v or "").strip().lower()
+    if v in ("none", "off", "false", "no", "0"):
+        return "none"
+    return v if v in _ALGS else "lzbitmap"
+
+
+def _libcompression():
+    try:
+        lib = ctypes.CDLL("/usr/lib/libcompression.dylib")
+    except OSError:     # not macOS: segments are stored as they are
+        return None
+    for fn in (lib.compression_encode_buffer, lib.compression_decode_buffer):
+        fn.restype = ctypes.c_size_t
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                       ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int]
+    return lib
+
+
+_LIB = _libcompression()
+CODEC = _codec(os.environ.get("STREAMLX_KV_CODEC")) if _LIB else "none"
+
+_POOLS: dict = {}
+
+
+def _pool(name: str, workers: int) -> ThreadPoolExecutor:
+    """The writer's encoders ("enc") and the restore's readers ("dec")."""
+    if name not in _POOLS:
+        _POOLS[name] = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix=f"streamlx-kv-{name}")
+    return _POOLS[name]
+
+
+def _split(raw: np.ndarray, w: int) -> np.ndarray:
+    """The bytes of w-byte values as planes, the values' most significant
+    byte first."""
+    if w == 1:
+        return raw
+    v, m = raw.view(_UINT[w]), raw.size // w
+    out = np.empty(raw.size, np.uint8)
+    for k in range(w):     # (each assignment keeps the low byte)
+        out[k * m:(k + 1) * m] = v >> (8 * (w - 1 - k)) if k < w - 1 else v
+    return out
+
+
+def _join(planes: np.ndarray, out: np.ndarray, w: int) -> None:
+    """_split's inverse, into out."""
+    if w == 1:
+        out[:] = planes
+        return
+    t, m = _UINT[w], planes.size // w
+    o = out.view(t)
+    np.left_shift(planes[:m], 8 * (w - 1), out=o, dtype=t)
+    for k in range(1, w):
+        p = planes[k * m:(k + 1) * m]
+        o |= np.left_shift(p, 8 * (w - 1 - k), dtype=t) if k < w - 1 else p
+
+
+def _encode(raw: np.ndarray, w: int, alg: int) -> np.ndarray | None:
+    """A block's bytes compressed, or None when they would not shrink."""
+    src = _split(raw, w)
+    dst = np.empty(src.size - 1, np.uint8)
+    n = _LIB.compression_encode_buffer(dst.ctypes.data, dst.size,
+                                       src.ctypes.data, src.size, None,
+                                       alg) if dst.size else 0
+    return dst[:n] if n else None
+
+
+def _decode(stored: np.ndarray, out: np.ndarray, w: int, alg: int) -> None:
+    """A block as stored -> its bytes, into out (a block that would not
+    shrink is stored as it was: as many bytes as out)."""
+    if stored.size == out.size:
+        out[:] = stored
+        return
+    planes = np.empty(out.size, np.uint8)
+    n = _LIB.compression_decode_buffer(planes.ctypes.data, planes.size,
+                                       stored.ctypes.data, stored.size, None,
+                                       alg)
+    if n != out.size:
+        raise ValueError(f"a damaged block: {n} of {out.size} bytes")
+    _join(planes, out, w)
+
+
+def _lines(shape, w: int, axis) -> tuple[int, int] | None:
+    """(bytes of a row, of a line) of an array stored along the sequence
+    (axis -2): a line is a plane of its last two dims (a head's rows), which
+    a restore puts in one stretch of the restored buffer. None for others."""
+    if axis != -2 or len(shape) < 2:
+        return None
+    rb = shape[-1] * w
+    return rb, shape[-2] * rb
+
+
+def _blocks(raw: np.ndarray, shape, w: int, axis) -> list[np.ndarray]:
+    """An array's bytes in blocks: along the sequence, runs of whole rows
+    within one line (so that each block lands in one stretch of a restored
+    buffer: decoded or read straight into place); else runs of _BLOCK
+    bytes."""
+    ln = _lines(shape, w, axis)
+    if ln is None or not raw.size:
+        return [raw[i:i + _BLOCK] for i in range(0, raw.size, _BLOCK)]
+    rb, lb = ln
+    q = max(1, _BLOCK // rb) * rb
+    return [raw[s + i:s + min(i + q, lb)]
+            for s in range(0, raw.size, lb) for i in range(0, lb, q)]
+
+
+def _pack(host: dict, codec: str, meta: dict) -> tuple[list, list]:
+    """A segment's arrays as they go in its file: the header's entries
+    [(name, dtype, shape, bytes)] and the pieces to write, in order. host:
+    {name: (dtype, array, axis along the sequence or None)}. With a codec an
+    array (the tokens excepted) goes in blocks (_blocks), each compressed
+    or, when it would not shrink, as it is; meta["arrays"] then holds its
+    dtype, shape and [bytes stored, bytes] of each block."""
+    alg = _ALGS.get(codec)
+    enc = _pool("enc", 4) if alg is not None else None
+    todo = []
+    for name, (tag, arr, axis) in host.items():
+        raw = np.ascontiguousarray(arr).reshape(-1).view(np.uint8)
+        if alg is None or name == "tokens" or not raw.size:
+            todo.append((name, tag, arr.shape, [raw], None))
+            continue
+        blocks = _blocks(raw, arr.shape, arr.itemsize, axis)
+        todo.append((name, tag, arr.shape, blocks,
+                     [enc.submit(_encode, b, arr.itemsize, alg)
+                      for b in blocks]))
+    entries, pieces, packed = [], [], {}
+    for name, tag, shape, blocks, futs in todo:
+        got = [f.result() for f in futs] if futs else []
+        if any(g is not None for g in got):
+            stored = [b if g is None else g for b, g in zip(blocks, got)]
+            packed[name] = {"dtype": tag, "shape": list(shape), "blocks": [
+                [s.size, b.size] for s, b in zip(stored, blocks)]}
+            tag, shape, blocks = "U8", (sum(s.size for s in stored),), stored
+        entries.append((name, tag, list(shape), sum(b.size for b in blocks)))
+        pieces += blocks
+    if packed:
+        meta.update(codec=codec, arrays=packed)
+    return entries, pieces
+
+
+def _stored(h: dict, meta: dict, name: str, axis) -> tuple:
+    """(dtype, shape, [[bytes stored, bytes], ...]) of a segment's array; one
+    as it was comes in blocks of a line each along the sequence."""
+    packed = meta.get("arrays", {}).get(name)
+    if packed is not None:
+        return packed["dtype"], packed["shape"], packed["blocks"]
+    tag, shape = h[name]["dtype"], h[name]["shape"]
+    a, b = h[name]["data_offsets"]
+    ln = _lines(shape, np.dtype(_NP[tag]).itemsize, axis)
+    if ln is None or a == b:
+        return tag, shape, [[b - a, b - a]]
+    return tag, shape, [[ln[1], ln[1]]] * ((b - a) // ln[1])
+
+
+def _unpack(buf: np.ndarray, h: dict, meta: dict, name: str) -> np.ndarray:
+    """An array of a segment as it was, from its bytes in the file."""
+    tag, shape, blocks = _stored(h, meta, name, None)
+    w = np.dtype(_NP[tag]).itemsize
+    raw = np.empty(math.prod(shape) * w, np.uint8)
+    alg, at, out = _ALGS.get(meta.get("codec")), 0, 0
+    for stored, size in blocks:
+        _decode(buf[at:at + stored], raw[out:out + size], w, alg)
+        at, out = at + stored, out + size
+    if (at, out) != (buf.size, raw.size):
+        raise ValueError(f"array {name}: its blocks do not add up")
+    return raw.view(_NP[tag]).reshape(shape)
+
+
+def _read(fd: int, buf: np.ndarray, off: int) -> None:
+    if os.preadv(fd, [buf], off) != buf.nbytes:
+        raise OSError(f"short read at {off}")
+
+
+def _fill(fd: int, file: tuple, name: str, axis, at: int, rows: int,
+          dst: np.ndarray) -> None:
+    """One segment's part of a restored array, its blocks read (and
+    decoded) straight into dst, a view of the array's buffer: the segment's
+    first `rows` rows along `axis` at row `at` of each line, or (axis None)
+    the whole array. A block past those rows is not read."""
+    h, meta, base = file
+    a, b = h[name]["data_offsets"]
+    tag, shape, blocks = _stored(h, meta, name, axis)
+    w = np.dtype(_NP[tag]).itemsize
+    ln = _lines(shape, w, axis)
+    if axis is not None and ln is None:     # along the last axis (small)
+        buf = np.empty(b - a, np.uint8)
+        _read(fd, buf, base + a)
+        dst[..., at:at + rows] = _unpack(buf, h, meta, name)[..., :rows]
+        return
+    if ln is None:
+        flat = dst.reshape(-1).view(np.uint8)
+    else:
+        rb, lb = ln
+        lines = dst.reshape(-1, *dst.shape[-2:])
+    alg = _ALGS.get(meta.get("codec"))
+    off, r = base + a, 0
+    for stored, size in blocks:
+        if ln is None:
+            out, need = flat[r:r + size], size
+        else:       # the block's rows of its line, those restored
+            line, q = divmod(r, lb)
+            q //= rb
+            if (r % lb) % rb or size % rb or (q + size // rb) * rb > lb:
+                raise ValueError(f"array {name}: a block across lines")
+            n = min(q + size // rb, rows) - q
+            out = (lines[line, at + q:at + q + n].reshape(-1).view(np.uint8)
+                   if n > 0 else None)
+            need = max(n, 0) * rb
+        if out is not None:
+            if stored == size:          # as it was: read straight in
+                _read(fd, out, off)
+            else:
+                buf = np.empty(stored, np.uint8)
+                _read(fd, buf, off)
+                if need == size:
+                    _decode(buf, out, w, alg)
+                else:                   # the first rows of a block
+                    tmp = np.empty(size, np.uint8)
+                    _decode(buf, tmp, w, alg)
+                    out[:] = tmp[:need]
+        off, r = off + stored, r + size
+    if off != base + b or r != math.prod(shape) * w:
+        raise ValueError(f"array {name}: its blocks do not add up")
 
 
 def _files(d: Path) -> list[Path]:
@@ -190,8 +447,9 @@ def _host(a: mx.array) -> tuple[str, np.ndarray]:
 
 def _store(c, prefix: str, start: int, end: int, host: dict) -> dict:
     """A cache's part of the segment tokens[start:end]: its arrays into
-    `host` under `prefix`, and its spec. A CacheList's members are stored
-    each their own way, under prefix + their index."""
+    `host` under `prefix` (dtype, host copy, the axis it is cut along or
+    None), and its spec. A CacheList's members are stored each their own
+    way, under prefix + their index."""
     cls = f"{type(c).__module__}.{type(c).__qualname__}"
     if type(c).__name__ == "CacheList":
         members = [_store(m, f"{prefix}{j}.", start, end, host)
@@ -208,9 +466,9 @@ def _store(c, prefix: str, start: int, end: int, host: dict) -> dict:
         if axis is None:
             continue
         if isinstance(v, mx.array):
-            host[f"{prefix}{path}"] = _host(
+            host[f"{prefix}{path}"] = (*_host(
                 v if not sl else v[..., start:end, :] if axis == -2
-                else v[..., start:end])
+                else v[..., start:end]), axis if sl else None)
         else:
             scalars[path] = v
     meta = getattr(c, "meta_state", "")
@@ -391,11 +649,26 @@ class PagedPromptCache:
     # -- files --------------------------------------------------------------
 
     @staticmethod
-    def _header(path: Path) -> tuple[dict, dict]:
+    def _file(path: Path) -> tuple[dict, dict, int]:
+        """A segment file's header, its streamlx metadata and where its
+        arrays' bytes start."""
         with open(path, "rb") as f:
             (n,) = struct.unpack("<Q", f.read(8))
             h = json.loads(f.read(n))
-        return h, json.loads(h["__metadata__"]["streamlx"])
+        return h, json.loads(h["__metadata__"]["streamlx"]), 8 + n
+
+    @classmethod
+    def _header(cls, path: Path) -> tuple[dict, dict]:
+        return cls._file(path)[:2]
+
+    @staticmethod
+    def _arrays(h: dict, meta: dict) -> dict:
+        """{name: (dtype, shape)} of a segment's arrays as they were stored
+        (compressed ones by their metadata)."""
+        packed = meta.get("arrays", {})
+        return {k: ((packed[k]["dtype"], packed[k]["shape"]) if k in packed
+                    else (v["dtype"], v["shape"]))
+                for k, v in h.items() if k != "__metadata__"}
 
     def _tokens(self, s: _Seg) -> np.ndarray:
         h, _ = self._header(s.path)
@@ -415,19 +688,20 @@ class PagedPromptCache:
                     log.warning("kv cache: segment not stored, %.1f GB free",
                                 free / 1e9)
                     continue
+                entries, pieces = _pack(host, CODEC, meta)
                 header, off = {}, 0
-                for name, (tag, arr) in host.items():
-                    header[name] = {"dtype": tag, "shape": list(arr.shape),
-                                    "data_offsets": [off, off + arr.nbytes]}
-                    off += arr.nbytes
+                for name, tag, shape, size in entries:
+                    header[name] = {"dtype": tag, "shape": shape,
+                                    "data_offsets": [off, off + size]}
+                    off += size
                 header["__metadata__"] = {"streamlx": json.dumps(meta)}
                 hb = json.dumps(header).encode()
                 hb += b" " * (-len(hb) % 8)
                 with open(tmp, "wb") as f:
                     f.write(struct.pack("<Q", len(hb)))
                     f.write(hb)
-                    for _, arr in host.values():
-                        f.write(np.ascontiguousarray(arr).data)
+                    for p in pieces:
+                        f.write(p.data)
                 os.replace(tmp, seg.path)
                 seg.nbytes = seg.path.stat().st_size
                 with self._lock:
@@ -452,14 +726,14 @@ class PagedPromptCache:
                 return key
         mx.eval([v for c in cache for _, v in tree_flatten(c.state)
                  if isinstance(v, mx.array)])
-        host = {"tokens": ("I32", a[start:end].copy())}
+        host = {"tokens": ("I32", a[start:end].copy(), None)}
         layers = [_store(c, f"{i}.", start, end, host)
                   for i, c in enumerate(cache)]
         if self._sliced_only is None:
             self._sliced_only = all(x["sliced"] for x in layers)
         meta = {"format": FORMAT, "key": key, "prev": prev, "start": start,
                 "end": end, "layers": layers}
-        nbytes = sum(arr.nbytes for _, arr in host.values())
+        nbytes = sum(arr.nbytes for _, arr, _ in host.values())
         with self._cv:   # bound the host copies waiting for the disk
             while self._pending and self._pending + nbytes > self._pending_cap:
                 self._cv.wait()
@@ -471,12 +745,13 @@ class PagedPromptCache:
 
     def _restore(self, chain: list[_Seg], partial: tuple[_Seg, int] | None):
         """Rebuild the per-layer caches from the chain (+ the first tokens
-        of one more segment): sliced layers concatenate their slices, the
-        others take their state from the last whole segment."""
-        loaded = [mx.load(str(s.path), return_metadata=True) for s in chain]
-        if partial is not None:
-            loaded.append(mx.load(str(partial[0].path), return_metadata=True))
-        metas = [json.loads(m["streamlx"]) for _, m in loaded]
+        of one more segment): sliced layers take their rows from every
+        segment, the others their state from the last whole segment. Each
+        array is allocated once, whole, and every segment's part of it read
+        (and decoded) straight into place on the restore's threads."""
+        segs = chain + ([partial[0]] if partial is not None else [])
+        files = [self._file(s.path) for s in segs]
+        metas = [m for _, m, _ in files]
         kinds = {json.dumps(_layout(m["layers"])) for m in metas}
         if len(kinds) != 1:   # e.g. KV quantized from some point on
             raise ValueError("segments of different cache layouts")
@@ -484,6 +759,64 @@ class PagedPromptCache:
         if partial is not None:
             n = partial[0].start + partial[1]
         whole = len(chain)
+        stored = [self._arrays(h, m) for h, m, _ in files]
+        arrays: dict = {}    # name -> (the restored array, its dtype)
+        jobs = []            # (segment, name, axis, at row, rows)
+
+        def plan(prefix, spec):
+            """The arrays of the cache stored under `prefix` (`spec` its
+            spec in the newest segment) and the reads that fill them."""
+            if "members" in spec:     # a CacheList: its members' arrays
+                for j, m in enumerate(spec["members"]):
+                    plan(f"{prefix}{j}.", m)
+                return
+            cls = _cls(spec["cls"])
+            axes = _LEAF_AXIS.get(spec["cls"].rpartition(".")[2], {})
+            # a KVCache's rows go in a buffer with the room its updates
+            # allocate (`step` rows at a time), as a live one has: else the
+            # next token would copy every row into a new buffer
+            step = getattr(cls, "step", 0) if cls.__name__ == "KVCache" else 0
+            for key in [k for k in stored[-1] if k.startswith(prefix)]:
+                if not spec["sliced"]:
+                    tag, shape = stored[whole - 1][key]
+                    arrays[key] = mx.zeros(shape, _MX[tag]), tag
+                    jobs.append((whole - 1, key, None, 0, 0))
+                    continue
+                axis = axes.get(key[len(prefix):], -2)
+                tag, shape = stored[-1][key]
+                parts = [(i, stored[i][key][1][axis]) for i in range(whole)]
+                if partial is not None:
+                    parts.append((whole, partial[1]))
+                pad = -n % step if step and axis == -2 else 0
+                shape = list(shape)
+                shape[axis] = sum(r for _, r in parts) + pad
+                arrays[key] = mx.zeros(shape, _MX[tag]), tag
+                at = 0
+                for i, r in parts:
+                    jobs.append((i, key, axis, at, r))
+                    at += r
+
+        for i, spec in enumerate(metas[-1]["layers"]):
+            plan(f"{i}.", spec)
+        mx.eval([a for a, _ in arrays.values()])
+        views = {k: np.frombuffer(_storage(a), _NP[tag]).reshape(a.shape)
+                 for k, (a, tag) in arrays.items() if a.size}
+        fds = []
+        try:
+            for s in segs:
+                fds.append(os.open(s.path, os.O_RDONLY))
+            dec = _pool("dec", min(8, os.cpu_count() or 4))
+            futs = [dec.submit(_fill, fds[i], files[i], key, axis, at, r,
+                               views[key])
+                    for i, key, axis, at, r in jobs if key in views]
+            _all_done(futs)    # (a failed read: the others write on first)
+            for f in futs:
+                f.result()
+        finally:
+            for fd in fds:
+                os.close(fd)
+            # a live view keeps MLX from updating an array in place
+            del views
 
         def rebuild(prefix, spec, old):
             """The cache stored under `prefix`: `spec` its spec in the newest
@@ -493,37 +826,8 @@ class PagedPromptCache:
                 return cls(*(rebuild(f"{prefix}{j}.", m, o) for j, (m, o)
                              in enumerate(zip(spec["members"],
                                               old["members"]))))
-            names = [k[len(prefix):] for k in loaded[-1][0]
-                     if k.startswith(prefix)]
-            axes = _LEAF_AXIS.get(spec["cls"].rpartition(".")[2], {})
-            # a KVCache's rows go in a buffer with the room its updates
-            # allocate (`step` rows at a time), as a live one has: else the
-            # next token would copy every row into a new buffer
-            step = getattr(cls, "step", 0) if cls.__name__ == "KVCache" else 0
-            leaves = []
-            for name in names:
-                if spec["sliced"]:
-                    axis = axes.get(name, -2)
-                    parts = [arrs.pop(prefix + name) for arrs, _ in
-                             loaded[:whole]]
-                    if partial is not None:
-                        v = loaded[-1][0].pop(prefix + name)
-                        parts.append(v[..., :partial[1], :] if axis == -2
-                                     else v[..., :partial[1]])
-                    pad = -n % step if step and axis == -2 else 0
-                    if pad:
-                        v = parts[-1]
-                        parts.append(mx.zeros((*v.shape[:-2], pad,
-                                               v.shape[-1]), v.dtype))
-                    v = (parts[0] if len(parts) == 1
-                         else mx.concatenate(parts, axis=axis))
-                    # one array at a time: its parts go once it is copied,
-                    # so a restore holds the cache once, not twice
-                    mx.eval(v)
-                    del parts
-                else:
-                    v = loaded[whole - 1][0][prefix + name]
-                leaves.append((name, v))
+            leaves = [(k[len(prefix):], a) for k, (a, _) in arrays.items()
+                      if k.startswith(prefix)]
             src = spec if spec["sliced"] else old
             leaves += list(src["scalars"].items())
             state = tree_unflatten(leaves)
