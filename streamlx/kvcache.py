@@ -28,6 +28,14 @@ that model then misses and stores it again), then the served model's least
 recently used segments. A segment is not written when it would leave the volume with
 less than 1 GiB free.
 
+A segment's arrays are stored compressed, losslessly: in blocks, each one's
+bytes split into planes, the most significant first (the high byte of a
+bf16 value, its sign and exponent, repeats far more than the low one), then
+compressed with Apple's libcompression; Accelerate's vImage splits and joins
+the planes (both are system libraries). A restore reads every segment's
+part of an array straight into the array's final buffer, decoding on a pool
+of threads, so a row is copied once on its way in.
+
 Drop-in for mlx_lm's LRUPromptCache in the sequential server (one request at
 a time): the same fetch_nearest_cache / insert_cache interface, plus
 save_progress(n, cache) when the active request's prefill reaches token n.
@@ -37,12 +45,15 @@ from __future__ import annotations
 
 import bisect
 import copy
+import ctypes
+import fcntl
 import hashlib
 import heapq
 import importlib
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -50,6 +61,8 @@ import shutil
 import struct
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as _all_done
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,7 +70,12 @@ import mlx.core as mx
 import numpy as np
 from mlx.utils import tree_flatten, tree_unflatten
 
-FORMAT = 2      # 2: a CacheList's members each their own way, windows cut
+from .pool import _storage
+from .reader import F_RDAHEAD
+
+FORMAT = 4      # 4: arrays in compressed blocks, a block's 4-byte groups in
+#                 four planes (3: in planes each value's bytes; 2: a
+#                 CacheList's members each their own way, windows cut)
 _STEP = 256      # tokens per hash step
 _SLICED = ("KVCache", "QSAKVCache", "QuantizedKVCache", "ConcatenateKVCache")
 # state leaves of a sliced cache not along axis -2: their axis, or None for what
@@ -67,11 +85,312 @@ _TAGS = {mx.bfloat16: "BF16", mx.float16: "F16", mx.float32: "F32",
          mx.int32: "I32", mx.uint32: "U32", mx.int64: "I64",
          mx.uint8: "U8", mx.bool_: "BOOL"}
 
+_NP = {"BF16": np.uint16, "F16": np.float16, "F32": np.float32,
+       "I32": np.int32, "U32": np.uint32, "I64": np.int64, "U8": np.uint8,
+       "BOOL": np.bool_}
+_MX = {tag: dt for dt, tag in _TAGS.items()}
+
 _MODEL_DIR = re.compile(r"[0-9a-f]{16}")   # root/<model fingerprint>
 _SAMPLE = 2**16  # bytes of a weight file's middle, and of its end, fingerprinted
 _FREE_FLOOR = 2**30   # what a segment write leaves free on the volume at least
 
+# The codecs: on the four models' stored segments (bf16 attention rows,
+# planes split) lzbitmap saves 18-21% (DeepSeek-V4.1's 35%) and decodes at
+# ~10 GB/s a thread, faster than a drive reads; LZFSE saves 28-29% (55%)
+# at ~1.3 GB/s a thread; lz4 14-16%; zlib about LZFSE's at a third of its
+# speed. Recurrent states in float32 save 10-14%.
+_ALGS = {"lzbitmap": 0x702, "lzfse": 0x801, "lz4": 0x100, "zlib": 0x205}
+_BLOCK = 4 * 2**20   # bytes of an array a block holds
+_ALLOC = 256 * 2**20  # bytes of restored arrays allocated at a time
+
 log = logging.getLogger(__name__)
+
+
+def _codec(v: str | None) -> str:
+    """STREAMLX_KV_CODEC: how segments are compressed, one of _ALGS (default
+    lzbitmap); none, off, false, no or 0: not at all. Any other word is the
+    default."""
+    v = (v or "").strip().lower()
+    if v in ("none", "off", "false", "no", "0"):
+        return "none"
+    return v if v in _ALGS else "lzbitmap"
+
+
+def _libcompression():
+    try:
+        lib = ctypes.CDLL("/usr/lib/libcompression.dylib")
+    except OSError:     # not macOS: segments are stored as they are
+        return None
+    for fn in (lib.compression_encode_buffer, lib.compression_decode_buffer):
+        fn.restype = ctypes.c_size_t
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+                       ctypes.c_size_t, ctypes.c_void_p, ctypes.c_int]
+    return lib
+
+
+_LIB = _libcompression()
+CODEC = _codec(os.environ.get("STREAMLX_KV_CODEC")) if _LIB else "none"
+
+
+class _VBuf(ctypes.Structure):     # vImage_Buffer
+    _fields_ = [("data", ctypes.c_void_p), ("height", ctypes.c_size_t),
+                ("width", ctypes.c_size_t), ("rowBytes", ctypes.c_size_t)]
+
+
+def _vimage():
+    """Accelerate's vImage (a system framework): its four-plane interleave
+    and deinterleave run at ~35-45 GB/s a thread where numpy's shifts
+    managed 5; None where it does not load (numpy then does it)."""
+    try:
+        lib = ctypes.CDLL("/System/Library/Frameworks/Accelerate.framework/"
+                          "Accelerate")
+    except OSError:
+        return None
+    for fn in (lib.vImageConvert_Planar8toARGB8888,
+               lib.vImageConvert_ARGB8888toPlanar8):
+        fn.restype = ctypes.c_ssize_t
+        fn.argtypes = [ctypes.POINTER(_VBuf)] * 5 + [ctypes.c_uint32]
+    return lib
+
+
+_VIMAGE = _vimage()
+_NO_TILE = 16   # kvImageDoNotTile: one thread a call (the callers are many)
+
+_POOLS: dict = {}
+
+
+def _pool(name: str, workers: int) -> ThreadPoolExecutor:
+    """The writer's encoders ("enc") and the restore's readers ("dec")."""
+    if name not in _POOLS:
+        _POOLS[name] = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix=f"streamlx-kv-{name}")
+    return _POOLS[name]
+
+
+def _planar(w: int, n: int) -> bool:
+    """Whether a block of n bytes of w-byte values is split into planes:
+    those of values wider than a byte that fill whole 4-byte groups."""
+    return w > 1 and n % 4 == 0
+
+
+def _bufs(a: np.ndarray, p: int) -> list:
+    """vImage buffers of a's four planes of p bytes, the first (the most
+    significant byte of each 4-byte group) last: vImage's A, R, G, B."""
+    return [ctypes.byref(_VBuf(a[k * p:].ctypes.data, 1, p, p))
+            for k in (3, 2, 1, 0)]
+
+
+def _split(raw: np.ndarray) -> np.ndarray:
+    """A block's 4-byte groups (a bf16 pair, a float32) as four planes, the
+    groups' most significant byte first: the high byte of a value, its sign
+    and exponent, repeats far more than the low one."""
+    p, out = raw.size // 4, np.empty(raw.size, np.uint8)
+    if _VIMAGE is None:
+        out.reshape(4, p)[:] = raw.reshape(p, 4)[:, ::-1].T
+    elif _VIMAGE.vImageConvert_ARGB8888toPlanar8(
+            ctypes.byref(_VBuf(raw.ctypes.data, 1, p, 4 * p)),
+            *_bufs(out, p), _NO_TILE):
+        raise RuntimeError("vImage could not split a block")
+    return out
+
+
+def _join(planes: np.ndarray, out: np.ndarray) -> None:
+    """_split's inverse, into out."""
+    p = planes.size // 4
+    if _VIMAGE is None:
+        out.reshape(p, 4)[:] = planes.reshape(4, p)[::-1].T
+    elif _VIMAGE.vImageConvert_Planar8toARGB8888(
+            *_bufs(planes, p), ctypes.byref(_VBuf(out.ctypes.data, 1, p,
+                                                  4 * p)), _NO_TILE):
+        raise RuntimeError("vImage could not join a block")
+
+
+def _encode(raw: np.ndarray, w: int, alg: int) -> np.ndarray | None:
+    """A block's bytes compressed, or None when they would not shrink."""
+    src = _split(raw) if _planar(w, raw.size) else raw
+    dst = np.empty(src.size - 1, np.uint8)
+    n = _LIB.compression_encode_buffer(dst.ctypes.data, dst.size,
+                                       src.ctypes.data, src.size, None,
+                                       alg) if dst.size else 0
+    return dst[:n] if n else None
+
+
+def _scratch(bufs: dict | None, name: str, n: int) -> np.ndarray:
+    """n bytes of a thread's buffer `name` from `bufs` (a restore's, one a
+    thread), grown as needed: a block then reads and decodes into memory
+    already faulted in and warm in the caches, not a fresh allocation."""
+    if bufs is None:
+        return np.empty(n, np.uint8)
+    b = bufs.get(name)
+    if b is None or b.size < n:
+        b = bufs[name] = np.empty(n, np.uint8)
+    return b[:n]
+
+
+def _decode(stored: np.ndarray, out: np.ndarray, w: int, alg: int,
+            bufs: dict | None = None) -> None:
+    """A block as stored -> its bytes, into out (a block that would not
+    shrink is stored as it was: as many bytes as out)."""
+    if stored.size == out.size:
+        out[:] = stored
+        return
+    planar = _planar(w, out.size)
+    planes = _scratch(bufs, "planes", out.size) if planar else out
+    n = _LIB.compression_decode_buffer(planes.ctypes.data, planes.size,
+                                       stored.ctypes.data, stored.size, None,
+                                       alg)
+    if n != out.size:
+        raise ValueError(f"a damaged block: {n} of {out.size} bytes")
+    if planar:
+        _join(planes, out)
+
+
+def _lines(shape, w: int, axis) -> tuple[int, int] | None:
+    """(bytes of a row, of a line) of an array stored along the sequence
+    (axis -2): a line is a plane of its last two dims (a head's rows), which
+    a restore puts in one stretch of the restored buffer. None for others."""
+    if axis != -2 or len(shape) < 2:
+        return None
+    rb = shape[-1] * w
+    return rb, shape[-2] * rb
+
+
+def _blocks(raw: np.ndarray, shape, w: int, axis) -> list[np.ndarray]:
+    """An array's bytes in blocks: along the sequence, runs of whole rows
+    within one line (so that each block lands in one stretch of a restored
+    buffer: decoded or read straight into place); else runs of _BLOCK
+    bytes."""
+    ln = _lines(shape, w, axis)
+    if ln is None or not raw.size:
+        return [raw[i:i + _BLOCK] for i in range(0, raw.size, _BLOCK)]
+    rb, lb = ln
+    q = max(1, _BLOCK // rb) * rb
+    return [raw[s + i:s + min(i + q, lb)]
+            for s in range(0, raw.size, lb) for i in range(0, lb, q)]
+
+
+def _pack(host: dict, codec: str, meta: dict) -> tuple[list, list]:
+    """A segment's arrays as they go in its file: the header's entries
+    [(name, dtype, shape, bytes)] and the pieces to write, in order. host:
+    {name: (dtype, array, axis along the sequence or None)}. With a codec an
+    array (the tokens excepted) goes in blocks (_blocks), each compressed
+    or, when it would not shrink, as it is; meta["arrays"] then holds its
+    dtype, shape and [bytes stored, bytes] of each block."""
+    alg = _ALGS.get(codec)
+    enc = _pool("enc", 4) if alg is not None else None
+    todo = []
+    for name, (tag, arr, axis) in host.items():
+        raw = np.ascontiguousarray(arr).reshape(-1).view(np.uint8)
+        if alg is None or name == "tokens" or not raw.size:
+            todo.append((name, tag, arr.shape, [raw], None))
+            continue
+        blocks = _blocks(raw, arr.shape, arr.itemsize, axis)
+        todo.append((name, tag, arr.shape, blocks,
+                     [enc.submit(_encode, b, arr.itemsize, alg)
+                      for b in blocks]))
+    entries, pieces, packed = [], [], {}
+    for name, tag, shape, blocks, futs in todo:
+        got = [f.result() for f in futs] if futs else []
+        if any(g is not None for g in got):
+            stored = [b if g is None else g for b, g in zip(blocks, got)]
+            packed[name] = {"dtype": tag, "shape": list(shape), "blocks": [
+                [s.size, b.size] for s, b in zip(stored, blocks)]}
+            tag, shape, blocks = "U8", (sum(s.size for s in stored),), stored
+        entries.append((name, tag, list(shape), sum(b.size for b in blocks)))
+        pieces += blocks
+    if packed:
+        meta.update(codec=codec, arrays=packed)
+    return entries, pieces
+
+
+def _stored(h: dict, meta: dict, name: str, axis) -> tuple:
+    """(dtype, shape, [[bytes stored, bytes], ...]) of a segment's array; one
+    as it was comes in blocks of a line each along the sequence."""
+    packed = meta.get("arrays", {}).get(name)
+    if packed is not None:
+        return packed["dtype"], packed["shape"], packed["blocks"]
+    tag, shape = h[name]["dtype"], h[name]["shape"]
+    a, b = h[name]["data_offsets"]
+    ln = _lines(shape, np.dtype(_NP[tag]).itemsize, axis)
+    if ln is None or a == b:
+        return tag, shape, [[b - a, b - a]]
+    return tag, shape, [[ln[1], ln[1]]] * ((b - a) // ln[1])
+
+
+def _unpack(buf: np.ndarray, h: dict, meta: dict, name: str) -> np.ndarray:
+    """An array of a segment as it was, from its bytes in the file."""
+    tag, shape, blocks = _stored(h, meta, name, None)
+    w = np.dtype(_NP[tag]).itemsize
+    raw = np.empty(math.prod(shape) * w, np.uint8)
+    alg, at, out = _ALGS.get(meta.get("codec")), 0, 0
+    for stored, size in blocks:
+        _decode(buf[at:at + stored], raw[out:out + size], w, alg)
+        at, out = at + stored, out + size
+    if (at, out) != (buf.size, raw.size):
+        raise ValueError(f"array {name}: its blocks do not add up")
+    return raw.view(_NP[tag]).reshape(shape)
+
+
+def _read(fd: int, buf: np.ndarray, off: int) -> None:
+    if os.preadv(fd, [buf], off) != buf.nbytes:
+        raise OSError(f"short read at {off}")
+
+
+def _fill(fd: int, file: tuple, name: str, axis, at: int, rows: int,
+          dst: np.ndarray, scratch: dict) -> None:
+    """One segment's part of a restored array, its blocks read (and
+    decoded) straight into dst, a view of the array's buffer: the segment's
+    first `rows` rows along `axis` at row `at` of each line, or (axis None)
+    the whole array. A block stored as it was is read straight into place,
+    a compressed one into a buffer and decoded from there; a block past
+    those rows is not read. scratch: the restore's buffers, {thread id:
+    {name: buffer}}. (One read a block beat one an array: F185, cold 0.67
+    vs 0.80 s, warm 0.14 vs 0.15 s.)"""
+    bufs = scratch.setdefault(threading.get_ident(), {})
+    h, meta, base = file
+    a, b = h[name]["data_offsets"]
+    tag, shape, blocks = _stored(h, meta, name, axis)
+    w = np.dtype(_NP[tag]).itemsize
+    ln = _lines(shape, w, axis)
+    if axis is not None and ln is None:     # along the last axis (small)
+        buf = np.empty(b - a, np.uint8)
+        _read(fd, buf, base + a)
+        dst[..., at:at + rows] = _unpack(buf, h, meta, name)[..., :rows]
+        return
+    if ln is None:
+        flat = dst.reshape(-1).view(np.uint8)
+    else:
+        rb, lb = ln
+        lines = dst.reshape(-1, *dst.shape[-2:])
+    alg = _ALGS.get(meta.get("codec"))
+    off, r = base + a, 0
+    for stored, size in blocks:
+        if ln is None:
+            out, need = flat[r:r + size], size
+        else:       # the block's rows of its line, those restored
+            line, q = divmod(r, lb)
+            q //= rb
+            if (r % lb) % rb or size % rb or (q + size // rb) * rb > lb:
+                raise ValueError(f"array {name}: a block across lines")
+            n = min(q + size // rb, rows) - q
+            out = (lines[line, at + q:at + q + n].reshape(-1).view(np.uint8)
+                   if n > 0 else None)
+            need = max(n, 0) * rb
+        if out is not None:
+            if stored == size:          # as it was: read straight in
+                _read(fd, out, off)
+            else:
+                buf = _scratch(bufs, "stored", stored)
+                _read(fd, buf, off)
+                if need == size:
+                    _decode(buf, out, w, alg, bufs)
+                else:                   # the first rows of a block
+                    tmp = _scratch(bufs, "rows", size)
+                    _decode(buf, tmp, w, alg, bufs)
+                    out[:] = tmp[:need]
+        off, r = off + stored, r + size
+    if off != base + b or r != math.prod(shape) * w:
+        raise ValueError(f"array {name}: its blocks do not add up")
 
 
 def _files(d: Path) -> list[Path]:
@@ -164,6 +483,44 @@ def _layout(specs) -> list:
             for s in specs]
 
 
+def _caches(specs, prefix: str = ""):
+    """(prefix, spec) of each cache of a segment's layers, a CacheList's
+    members each, in the order _store stored them."""
+    for i, s in enumerate(specs):
+        if "members" in s:
+            yield from _caches(s["members"], f"{prefix}{i}.")
+        else:
+            yield f"{prefix}{i}.", s
+
+
+def _rebuild(prefix: str, spec: dict, old: dict, arrays: dict, n: int):
+    """The cache stored under `prefix` from a restore's arrays ({name:
+    array}): `spec` its spec in the newest segment, `old` in the last whole
+    one (the same layout), n the tokens restored. (Not a closure of the
+    restore's: one that calls itself is a reference cycle, which held the
+    arrays, a restored cache's rows, until the garbage collector ran.)"""
+    cls = _cls(spec["cls"])
+    if "members" in spec:     # a CacheList: its members, rebuilt
+        return cls(*(_rebuild(f"{prefix}{j}.", m, o, arrays, n)
+                     for j, (m, o) in enumerate(zip(spec["members"],
+                                                    old["members"]))))
+    leaves = [(k[len(prefix):], a) for k, a in arrays.items()
+              if k.startswith(prefix)]
+    src = spec if spec["sliced"] else old
+    leaves += list(src["scalars"].items())
+    state = tree_unflatten(leaves)
+    # mlx-vlm's caches (and mlx-lm's older ones) rebuild from both
+    if len(inspect.signature(cls.from_state).parameters) > 1:
+        meta = src.get("meta", "")
+        c = cls.from_state(state, tuple(meta) if isinstance(meta, list)
+                           else meta)
+    else:
+        c = cls.from_state(state)
+    if spec["sliced"]:
+        c.offset = n
+    return c
+
+
 def _offset(c) -> int | None:
     """Tokens a layer cache has seen (None for recurrent state)."""
     if type(c).__name__ == "CacheList":
@@ -190,8 +547,9 @@ def _host(a: mx.array) -> tuple[str, np.ndarray]:
 
 def _store(c, prefix: str, start: int, end: int, host: dict) -> dict:
     """A cache's part of the segment tokens[start:end]: its arrays into
-    `host` under `prefix`, and its spec. A CacheList's members are stored
-    each their own way, under prefix + their index."""
+    `host` under `prefix` (dtype, host copy, the axis it is cut along or
+    None), and its spec. A CacheList's members are stored each their own
+    way, under prefix + their index."""
     cls = f"{type(c).__module__}.{type(c).__qualname__}"
     if type(c).__name__ == "CacheList":
         members = [_store(m, f"{prefix}{j}.", start, end, host)
@@ -208,9 +566,9 @@ def _store(c, prefix: str, start: int, end: int, host: dict) -> dict:
         if axis is None:
             continue
         if isinstance(v, mx.array):
-            host[f"{prefix}{path}"] = _host(
+            host[f"{prefix}{path}"] = (*_host(
                 v if not sl else v[..., start:end, :] if axis == -2
-                else v[..., start:end])
+                else v[..., start:end]), axis if sl else None)
         else:
             scalars[path] = v
     meta = getattr(c, "meta_state", "")
@@ -391,55 +749,89 @@ class PagedPromptCache:
     # -- files --------------------------------------------------------------
 
     @staticmethod
-    def _header(path: Path) -> tuple[dict, dict]:
-        with open(path, "rb") as f:
-            (n,) = struct.unpack("<Q", f.read(8))
-            h = json.loads(f.read(n))
-        return h, json.loads(h["__metadata__"]["streamlx"])
+    def _file(fd: int) -> tuple[dict, dict, int]:
+        """A segment file's header, its streamlx metadata and where its
+        arrays' bytes start, read through fd: a reader takes the arrays
+        through the same one, so a file rewritten meanwhile (another server
+        storing the same prefix) is read as it was when opened, not the
+        header of one with the arrays of the other."""
+        (n,) = struct.unpack("<Q", os.pread(fd, 8, 0))
+        h = json.loads(os.pread(fd, n, 8))
+        return h, json.loads(h["__metadata__"]["streamlx"]), 8 + n
+
+    @classmethod
+    def _header(cls, path: Path) -> tuple[dict, dict]:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            return cls._file(fd)[:2]
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _arrays(h: dict, meta: dict) -> dict:
+        """{name: (dtype, shape)} of a segment's arrays as they were stored
+        (compressed ones by their metadata)."""
+        packed = meta.get("arrays", {})
+        return {k: ((packed[k]["dtype"], packed[k]["shape"]) if k in packed
+                    else (v["dtype"], v["shape"]))
+                for k, v in h.items() if k != "__metadata__"}
 
     def _tokens(self, s: _Seg) -> np.ndarray:
-        h, _ = self._header(s.path)
-        t = h["tokens"]
-        a, b = t["data_offsets"]
-        with open(s.path, "rb") as f:
-            f.seek(8 + struct.unpack("<Q", f.read(8))[0] + a)
-            return np.frombuffer(f.read(b - a), dtype=np.int32)
+        fd = os.open(s.path, os.O_RDONLY)
+        try:
+            h, _, base = self._file(fd)
+            a, b = h["tokens"]["data_offsets"]
+            return np.frombuffer(os.pread(fd, b - a, base + a),
+                                 dtype=np.int32)
+        finally:
+            os.close(fd)
 
     def _writer(self) -> None:
         while True:
             seg, host, meta, nbytes = self._q.get()
-            tmp = seg.path.with_suffix(".tmp")
             try:
-                free = shutil.disk_usage(seg.path.parent).free
-                if free - nbytes < _FREE_FLOOR:
-                    log.warning("kv cache: segment not stored, %.1f GB free",
-                                free / 1e9)
-                    continue
-                header, off = {}, 0
-                for name, (tag, arr) in host.items():
-                    header[name] = {"dtype": tag, "shape": list(arr.shape),
-                                    "data_offsets": [off, off + arr.nbytes]}
-                    off += arr.nbytes
-                header["__metadata__"] = {"streamlx": json.dumps(meta)}
-                hb = json.dumps(header).encode()
-                hb += b" " * (-len(hb) % 8)
-                with open(tmp, "wb") as f:
-                    f.write(struct.pack("<Q", len(hb)))
-                    f.write(hb)
-                    for _, arr in host.values():
-                        f.write(np.ascontiguousarray(arr).data)
-                os.replace(tmp, seg.path)
-                seg.nbytes = seg.path.stat().st_size
-                with self._lock:
-                    self._add(seg)
-                    self._evict()
-            except Exception:  # a failed write is a cache miss
-                log.exception("kv cache: segment write failed")
-                tmp.unlink(missing_ok=True)
+                self._write(seg, host, meta, nbytes)
             finally:
+                # nothing of a written segment is held while the next one is
+                # waited for: its encoded blocks went with _write, its host
+                # copies go here
+                del seg, host, meta
                 with self._cv:
                     self._pending -= nbytes
                     self._cv.notify_all()
+
+    def _write(self, seg: _Seg, host: dict, meta: dict, nbytes: int) -> None:
+        """A queued segment's file, written beside its place, then moved
+        there."""
+        tmp = seg.path.with_suffix(".tmp")
+        try:
+            free = shutil.disk_usage(seg.path.parent).free
+            if free - nbytes < _FREE_FLOOR:
+                log.warning("kv cache: segment not stored, %.1f GB free",
+                            free / 1e9)
+                return
+            entries, pieces = _pack(host, CODEC, meta)
+            header, off = {}, 0
+            for name, tag, shape, size in entries:
+                header[name] = {"dtype": tag, "shape": shape,
+                                "data_offsets": [off, off + size]}
+                off += size
+            header["__metadata__"] = {"streamlx": json.dumps(meta)}
+            hb = json.dumps(header).encode()
+            hb += b" " * (-len(hb) % 8)
+            with open(tmp, "wb") as f:
+                f.write(struct.pack("<Q", len(hb)))
+                f.write(hb)
+                for p in pieces:
+                    f.write(p.data)
+            os.replace(tmp, seg.path)
+            seg.nbytes = seg.path.stat().st_size
+            with self._lock:
+                self._add(seg)
+                self._evict()
+        except Exception:  # a failed write is a cache miss
+            log.exception("kv cache: segment write failed")
+            tmp.unlink(missing_ok=True)
 
     def _save(self, chain, a, start: int, end: int, prev: str,
               cache) -> str:
@@ -452,14 +844,14 @@ class PagedPromptCache:
                 return key
         mx.eval([v for c in cache for _, v in tree_flatten(c.state)
                  if isinstance(v, mx.array)])
-        host = {"tokens": ("I32", a[start:end].copy())}
+        host = {"tokens": ("I32", a[start:end].copy(), None)}
         layers = [_store(c, f"{i}.", start, end, host)
                   for i, c in enumerate(cache)]
         if self._sliced_only is None:
             self._sliced_only = all(x["sliced"] for x in layers)
         meta = {"format": FORMAT, "key": key, "prev": prev, "start": start,
                 "end": end, "layers": layers}
-        nbytes = sum(arr.nbytes for _, arr in host.values())
+        nbytes = sum(arr.nbytes for _, arr, _ in host.values())
         with self._cv:   # bound the host copies waiting for the disk
             while self._pending and self._pending + nbytes > self._pending_cap:
                 self._cv.wait()
@@ -471,76 +863,115 @@ class PagedPromptCache:
 
     def _restore(self, chain: list[_Seg], partial: tuple[_Seg, int] | None):
         """Rebuild the per-layer caches from the chain (+ the first tokens
-        of one more segment): sliced layers concatenate their slices, the
-        others take their state from the last whole segment."""
-        loaded = [mx.load(str(s.path), return_metadata=True) for s in chain]
-        if partial is not None:
-            loaded.append(mx.load(str(partial[0].path), return_metadata=True))
-        metas = [json.loads(m["streamlx"]) for _, m in loaded]
-        kinds = {json.dumps(_layout(m["layers"])) for m in metas}
-        if len(kinds) != 1:   # e.g. KV quantized from some point on
-            raise ValueError("segments of different cache layouts")
+        of one more segment): sliced layers take their rows from every
+        segment, the others their state from the last whole segment. Each
+        array is allocated once, whole, and every segment's part of it read
+        (and decoded) straight into place on the restore's threads."""
+        segs = chain + ([partial[0]] if partial is not None else [])
         n = chain[-1].end if chain else 0
         if partial is not None:
             n = partial[0].start + partial[1]
         whole = len(chain)
-
-        def rebuild(prefix, spec, old):
-            """The cache stored under `prefix`: `spec` its spec in the newest
-            segment, `old` in the last whole one (the same layout)."""
-            cls = _cls(spec["cls"])
-            if "members" in spec:     # a CacheList: its members, rebuilt
-                return cls(*(rebuild(f"{prefix}{j}.", m, o) for j, (m, o)
-                             in enumerate(zip(spec["members"],
-                                              old["members"]))))
-            names = [k[len(prefix):] for k in loaded[-1][0]
-                     if k.startswith(prefix)]
-            axes = _LEAF_AXIS.get(spec["cls"].rpartition(".")[2], {})
-            # a KVCache's rows go in a buffer with the room its updates
-            # allocate (`step` rows at a time), as a live one has: else the
-            # next token would copy every row into a new buffer
-            step = getattr(cls, "step", 0) if cls.__name__ == "KVCache" else 0
-            leaves = []
-            for name in names:
-                if spec["sliced"]:
-                    axis = axes.get(name, -2)
-                    parts = [arrs.pop(prefix + name) for arrs, _ in
-                             loaded[:whole]]
+        arrays: dict = {}    # name -> the restored array
+        scratch: dict = {}   # the threads' buffers, gone with the restore
+        views, fds, futs = {}, [], []
+        try:
+            for s in segs:
+                # a file's header and arrays through one descriptor (_file)
+                fds.append(os.open(s.path, os.O_RDONLY))
+                # no read-ahead: it fetched the arrays a restore skips (the
+                # states of all but the last segment), and from a drive a
+                # restore took 18% longer (F185: 0.67 vs 0.57 s)
+                fcntl.fcntl(fds[-1], F_RDAHEAD, 0)
+            files = [self._file(fd) for fd in fds]
+            metas = [m for _, m, _ in files]
+            kinds = {json.dumps(_layout(m["layers"])) for m in metas}
+            if len(kinds) != 1:   # e.g. KV quantized from some point on
+                raise ValueError("segments of different cache layouts")
+            stored = [self._arrays(h, m) for h, m, _ in files]
+            jobs = []            # (segment, name, axis, at row, rows)
+            for prefix, spec in _caches(metas[-1]["layers"]):
+                cls = _cls(spec["cls"])
+                axes = _LEAF_AXIS.get(spec["cls"].rpartition(".")[2], {})
+                # a KVCache's rows go in a buffer with the room its updates
+                # allocate (`step` rows at a time), as a live one has: else
+                # the next token would copy every row into a new buffer
+                step = (getattr(cls, "step", 0) if cls.__name__ == "KVCache"
+                        else 0)
+                for key in [k for k in stored[-1] if k.startswith(prefix)]:
+                    if not spec["sliced"]:
+                        tag, shape = stored[whole - 1][key]
+                        arrays[key] = mx.zeros(shape, _MX[tag])
+                        jobs.append((whole - 1, key, None, 0, 0))
+                        continue
+                    axis = axes.get(key[len(prefix):], -2)
+                    tag, shape = stored[-1][key]
+                    shape = list(shape)
+                    parts = [(i, stored[i][key][1][axis])
+                             for i in range(whole)]
                     if partial is not None:
-                        v = loaded[-1][0].pop(prefix + name)
-                        parts.append(v[..., :partial[1], :] if axis == -2
-                                     else v[..., :partial[1]])
+                        parts.append((whole, partial[1]))
+                    for i, _ in parts:
+                        # each segment's rows go straight into a buffer of
+                        # the newest one's dtype and width: rows of others
+                        # (a cache whose dtype changed; no model's does)
+                        # would be read as these, so the chain is a miss
+                        t, s = stored[i][key]
+                        s = list(s)
+                        s[axis] = shape[axis]
+                        if (t, s) != (tag, shape):
+                            raise ValueError(f"array {key}: segments of "
+                                             "other dtypes or widths")
                     pad = -n % step if step and axis == -2 else 0
-                    if pad:
-                        v = parts[-1]
-                        parts.append(mx.zeros((*v.shape[:-2], pad,
-                                               v.shape[-1]), v.dtype))
-                    v = (parts[0] if len(parts) == 1
-                         else mx.concatenate(parts, axis=axis))
-                    # one array at a time: its parts go once it is copied,
-                    # so a restore holds the cache once, not twice
-                    mx.eval(v)
-                    del parts
-                else:
-                    v = loaded[whole - 1][0][prefix + name]
-                leaves.append((name, v))
-            src = spec if spec["sliced"] else old
-            leaves += list(src["scalars"].items())
-            state = tree_unflatten(leaves)
-            # mlx-vlm's caches (and mlx-lm's older ones) rebuild from both
-            if len(inspect.signature(cls.from_state).parameters) > 1:
-                meta = src.get("meta", "")
-                c = cls.from_state(state, tuple(meta) if isinstance(meta, list)
-                                   else meta)
-            else:
-                c = cls.from_state(state)
-            if spec["sliced"]:
-                c.offset = n
-            return c
-
-        return [rebuild(f"{i}.", s, o) for i, (s, o) in
-                enumerate(zip(metas[-1]["layers"],
-                              metas[whole - 1]["layers"]))], n
+                    shape[axis] = sum(r for _, r in parts) + pad
+                    arrays[key] = mx.zeros(shape, _MX[tag])
+                    at = 0
+                    for i, r in parts:
+                        jobs.append((i, key, axis, at, r))
+                        at += r
+            # the arrays' buffers in groups of ~_ALLOC bytes: the GPU zeroes
+            # the next group while the threads fill this one
+            groups, size = [[]], 0
+            for k, a in arrays.items():
+                if size >= _ALLOC:
+                    groups.append([])
+                    size = 0
+                groups[-1].append(k)
+                size += a.nbytes
+            by_key: dict = {}
+            for job in jobs:
+                by_key.setdefault(job[1], []).append(job)
+            # six threads: on an M4 (4 + 6 cores) 4-8 restore alike, 6 best
+            dec = _pool("dec", min(6, os.cpu_count() or 4))
+            mx.async_eval([arrays[k] for k in groups[0]])
+            for g, keys in enumerate(groups):
+                if g + 1 < len(groups):
+                    mx.async_eval([arrays[k] for k in groups[g + 1]])
+                mx.eval([arrays[k] for k in keys])
+                for k in keys:
+                    a = arrays[k]
+                    if not a.size:
+                        continue
+                    views[k] = np.frombuffer(
+                        _storage(a), _NP[_TAGS[a.dtype]]).reshape(a.shape)
+                    futs += [dec.submit(_fill, fds[i], files[i], k, axis, at,
+                                        r, views[k], scratch)
+                             for i, _, axis, at, r in by_key.get(k, ())]
+            _all_done(futs)    # (a failed read: the others write on first)
+            for f in futs:
+                f.result()
+            return [_rebuild(f"{i}.", s, o, arrays, n) for i, (s, o) in
+                    enumerate(zip(metas[-1]["layers"],
+                                  metas[whole - 1]["layers"]))], n
+        finally:
+            _all_done(futs)    # no thread still reads a file or writes a view
+            for fd in fds:
+                os.close(fd)
+            # a live view keeps MLX from updating an array in place; and the
+            # traceback of a failed read keeps this frame, not its buffers
+            views.clear()
+            arrays.clear()
+            scratch.clear()
 
     # -- the server's interface ----------------------------------------------
 

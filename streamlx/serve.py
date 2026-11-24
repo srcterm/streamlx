@@ -64,7 +64,11 @@ Prompt caches live on SSD (streamlx.kvcache; --kv-cache-dir, default
 the same prefix, so RAM holds only the active request's cache.
 --kv-cache-gib bounds the disk use (default half of what is free there, at
 most 32; oldest segments go first). A drive other than the model's avoids
-sharing its bandwidth with expert reads.
+sharing its bandwidth with expert reads. Segments are compressed losslessly
+(the same rows back, bit for bit): STREAMLX_KV_CODEC=lzbitmap (the default)
+stores 13-21% fewer bytes and restores from a drive about a third sooner,
+from RAM about as fast; lzfse 19-29% fewer, from RAM slower; none as they
+are.
 
 A draft head decodes greedy requests through streamlx.pipeline: K tokens in
 flight, so each token's expert reads overlap the others' compute, with plain
