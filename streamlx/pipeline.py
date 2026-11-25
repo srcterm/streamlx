@@ -71,6 +71,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -229,6 +230,7 @@ class Stream:
     ctx: object = None
     l: int = 0                  # the next layer to begin
     st: object = None           # the layer begun, until finished
+    lg: object = None           # its router's logits there, if its pool ranks
     idx: object = None          # its routing there (numpy)
     need: tuple = ()            # the routed experts its pool lacks
     reads: tuple = ()           # the reads that hold them
@@ -361,7 +363,10 @@ class PipelinedDecoder:
         # last step's used at that layer: a gather still in flight never has
         # a slot rewritten under it, streams in flight never evict each
         # other's experts, and what the next token is likeliest to route to
-        # stays, whatever the budget. With no such slot the expert is read
+        # stays, whatever the budget. Of those experts the least recently
+        # used gives it up, or, where the pool ranks (pool.ranking: each
+        # stream's routing ranks its layer as a plain token's does), the one
+        # of the lowest worth. With no such slot the expert is read
         # as arrays instead (handed to the streaming switch as
         # pool.call_hint). Once every stream has computed a layer and an
         # eval has run it, its pool takes the order, and the experts read as
@@ -372,6 +377,8 @@ class PipelinedDecoder:
         self._used: dict = {}              # layer -> [stream's experts, ...]
         self._last: dict = {}              # layer -> the last step's experts
         self._fin: dict = {}               # layer -> streams finished
+        self._ranked: set = set()          # layers whose pools ranked
+        self._io = deque()                 # (start, end, layer, bytes) a read
         self._k_cur = 0
         # an adapter whose begin() routes with the block's own code lets the
         # switch reuse that routing instead of syncing on it a second time
@@ -380,10 +387,17 @@ class PipelinedDecoder:
     # -- layer halves over the pools ---------------------------------------
     def _begin(self, s: Stream) -> None:
         """The stream's next layer up to its routing, handed to the GPU: the
-        host goes on meanwhile, _route reads the routing back."""
+        host goes on meanwhile, _route reads the routing back. Where the
+        layer's pool ranks, the router's logits go with it, of the input
+        the router was given in begin() (pool.router_logits: whatever the
+        adapter calls it)."""
         l = s.l
+        pool = self.pools.get(l)
+        if pool is not None:
+            pool.router_x = None          # (left by an earlier call)
         s.st = self.ad.begin(l, s.h, s.ids, s.ctx, self.cache, s.pos)
-        mx.async_eval(s.st.inds)
+        s.lg = None if pool is None else pool.router_logits()
+        mx.async_eval(s.st.inds, *([] if s.lg is None else [s.lg]))
         s.l, s.need, s.reads = l + 1, (), ()
 
     def _route(self, s: Stream) -> None:
@@ -391,13 +405,19 @@ class PipelinedDecoder:
         experts no pool slot nor read of this step holds start reading."""
         l, st = s.l - 1, s.st
         t0 = time.perf_counter()
-        mx.eval(st.inds)                                   # routing sync
+        mx.eval(st.inds, *([] if s.lg is None else [s.lg]))   # routing sync
         self.t_sync += time.perf_counter() - t0
         pool = self.pools.get(l)
         if pool is None:
             return
         s.idx = np.array(st.inds)
         uniq = list(dict.fromkeys(s.idx.reshape(-1).tolist()))
+        pool.since_rank += 1
+        if s.lg is not None:
+            pool.rank(np.array(s.lg).reshape(-1), uniq)
+            s.lg = None
+            self._ranked.add(l)
+        by_worth = l in self._ranked and pool.worth is not None
         self._used.setdefault(l, []).append(uniq)
         busy = self._last.get(l, set()).union(*self._used[l])
         held = self._reads.setdefault(l, {})
@@ -409,29 +429,63 @@ class PipelinedDecoder:
         for e in uniq:
             if e in pool.id2slot:
                 pool.id2slot.move_to_end(e)
-        # a slot for each new expert while one is free or the least recent
-        # expert is none this step or the last used here
+        # a slot for each new expert while one is free or an expert none of
+        # this step or the last used here can give up its own: the least
+        # recent expert if it is one, where the pool ranks the lowest-worth
         direct = []
-        for e in new:
-            if pool.free or next(iter(pool.id2slot)) not in busy:
+        if by_worth:
+            pool._evict_lowest(len(new) - len(pool.free), busy)
+            direct = new[:len(pool.free)]
+            for e in direct:
                 pool._take_slot_for(e)
-                direct.append(e)
+        else:
+            for e in new:
+                if pool.free or next(iter(pool.id2slot)) not in busy:
+                    pool._take_slot_for(e)
+                    direct.append(e)
         if direct:
             try:
                 reqs = pool.slot_requests(direct)
             except BaseException:
                 pool.forget(direct)        # slots given, nothing read
                 raise
-            rd = _Read(self.ex.submit(self.reader.read_into, reqs), direct,
-                       slots=True)
+            rd = _Read(self.ex.submit(
+                self._read, l, len(direct) * pool.expert_bytes,
+                self.reader.read_into, reqs), direct, slots=True)
             held.update(dict.fromkeys(direct, rd))
         if len(direct) < len(new):
             rest = [e for e in new if e not in pool.id2slot]
-            rd = _Read(self.ex.submit(self.reader.read_experts_arrays,
-                                      pool.triples_loc, rest), rest)
+            rd = _Read(self.ex.submit(
+                self._read, l, len(rest) * pool.expert_bytes,
+                self.reader.read_experts_arrays, pool.triples_loc, rest),
+                rest)
             held.update(dict.fromkeys(rest, rd))
         s.need = need = [e for e in uniq if e in held]
         s.reads = tuple(dict.fromkeys(held[e] for e in need))
+
+    def _read(self, l: int, nbytes: int, fn, *args):
+        """fn(*args) on a read thread, its interval logged for the layers'
+        read cost (_note_reads)."""
+        t0 = time.perf_counter()
+        try:
+            return fn(*args)
+        finally:
+            self._io.append((t0, time.perf_counter(), l, nbytes))
+
+    def _note_reads(self, K: int) -> None:
+        """Each pool's reads of the step, as K tokens', to its fetch_avg
+        (what auto decides by): the time some read was in flight, shared by
+        bytes. Reads overlap here; a plain step's is its blocking read."""
+        io, self._io = sorted(self._io), deque()
+        busy, end, by_layer = 0.0, -math.inf, {}
+        for t0, t1, l, nbytes in io:
+            busy += max(0.0, t1 - max(t0, end))
+            end = max(end, t1)
+            by_layer[l] = by_layer.get(l, 0) + nbytes
+        total = sum(by_layer.values())
+        for l, pool in self.pools.items():
+            share = by_layer.get(l, 0) / total if total else 0.0
+            pool.note_reads(busy * share, K)
 
     def _finish(self, s: Stream) -> None:
         """The rest of the layer the stream began (its reads have arrived)."""
@@ -468,7 +522,8 @@ class PipelinedDecoder:
         the step's logits): leave in each pool what the step's tokens would
         have left there one after another (the experts used last, as many
         as it has slots, in their order of use; a slot for each of them
-        that was read as arrays) and drop the step's reads."""
+        that was read as arrays: the least recently used expert's, or the
+        lowest worth's where the pool ranked) and drop the step's reads."""
         if not s.done:
             return
         t0 = time.perf_counter()
@@ -485,9 +540,11 @@ class PipelinedDecoder:
             for e in keep:
                 if e in pool.id2slot:
                     pool.id2slot.move_to_end(e)
-            for e in keep:
-                if e not in pool.id2slot:          # read as arrays
-                    pool.adopt(e, held[e].fut.result())
+            arrays = [e for e in keep if e not in pool.id2slot]
+            if arrays and l in self._ranked and pool.worth is not None:
+                pool._evict_lowest(len(arrays) - len(pool.free), keep)
+            for e in arrays:
+                pool.adopt(e, held[e].fut.result())
             for e in reversed(keep):               # their order of use
                 pool.id2slot.move_to_end(e)
             self._last[l] = {e for uniq in seq for e in uniq}
@@ -586,7 +643,8 @@ class PipelinedDecoder:
         writing a slot when the pools are next used), and the experts of a
         read into slots that failed are not resident (pool.forget)."""
         reads, self._reads = self._reads, {}
-        self._used, self._fin = {}, {}
+        self._used, self._fin, self._ranked = {}, {}, set()
+        self._io = deque()
         for l, held in reads.items():
             for rd in dict.fromkeys(held.values()):
                 try:
@@ -598,6 +656,7 @@ class PipelinedDecoder:
     def _step(self, toks: list[int], offset: int):
         K, n = len(toks), self.n_layers
         self._reads, self._used, self._fin = {}, {}, {}
+        self._ranked, self._io = set(), deque()
         self._k_cur = K
         streams = [Stream(i, t, *self.ad.prep(t, offset + i))
                    for i, t in enumerate(toks)]
@@ -642,7 +701,8 @@ class PipelinedDecoder:
         mx.eval(*(s.out for s in streams))
         for s in streams:                    # the layers the logits ran last
             self._settle(s)
-        outs = [int(greedy(s.out[0, -1]).item()) for s in streams]
+        self._note_reads(K)
+        outs =[int(greedy(s.out[0, -1]).item()) for s in streams]
         dh = getattr(self.ad, "draft_hidden", None)
         return outs, [dh(s.h, s.pos) if dh else s.h for s in streams], snaps
 

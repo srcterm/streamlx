@@ -13,6 +13,7 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 
 import toy
 from streamlx import pipeline
+from streamlx import pool as pool_mod
 from streamlx.integrate import prefill_cache, resize_pools
 from streamlx.pipeline import PipelinedDecoder
 from streamlx.pipeline_adapters import adapter_for
@@ -80,7 +81,9 @@ class Scheduler(unittest.TestCase):
                     bad_pools.append(l)
 
         same = 0
-        with mock.patch.object(PipelinedDecoder, "_settle", checked):
+        # (the order checked is LRU's: pools that rank keep another)
+        with mock.patch.object(PipelinedDecoder, "_settle", checked), \
+                mock.patch.object(pool_mod, "RANK_EVICT", "lru"):
             for i in range(0, N, K):
                 outs, hid, _ = dec.step(self.seq[i:i + K], len(PROMPT) + i)
                 for j, (o, h) in enumerate(zip(outs, hid)):

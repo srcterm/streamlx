@@ -24,8 +24,6 @@ from mlx import nn
 
 from .pool import (
     KEEPALIVE,
-    RANK_EVICT,
-    RANK_MIN_FETCH_S,
     StreamingSwitchMLP,
     gpu_hold,
     keepalive_wait,
@@ -118,9 +116,6 @@ class StreamingSwitchGLU(nn.Module):
         # (_resident_slots), and the table it was made from.
         self._slots_mx = None
         self._slots_key = None
-        # x -> the block's router logits (set at wrap time, None when the
-        # router was not found): what the pool ranks its experts by
-        self._logits = None
         # Hosts probe these to pick fused resident-tensor fast paths; None
         # sends them down the standard switch_mlp(x, indices) call.
         self.gate_proj = None
@@ -590,6 +585,8 @@ class StreamingSwitchGLU(nn.Module):
             idx = (np.array(indices) if hint.idx is None
                    else hint.idx.reshape(indices.shape))
             return self._stream_forward(x, idx, hint.rows, w)
+        # (a pipelined stream's token was counted where it routed)
+        self.pool.since_rank += indices.shape[0] * indices.shape[1]
         # Every expert of the layer resident (a model that fits: fill() read
         # it whole) and a call on the per-row kernel (decode, a verify, a
         # short chunk): the expert ids map to slots on the GPU, with no host
@@ -610,13 +607,11 @@ class StreamingSwitchGLU(nn.Module):
                                       self.pool.qparams, self.pool.act,
                                       escales=self._esc(indices), weights=w)
         t0 = time.perf_counter()
-        lg = None
-        if decode and self._logits is not None and self.pool.ranked \
-                and (RANK_EVICT == "rank" or RANK_EVICT == "auto"
-                     and self.pool.fetch_avg >= RANK_MIN_FETCH_S):
-            # the router's logits ride the routing sync: the pool ranks its
-            # experts by them (pool.rank)
-            lg = self._logits(x).astype(mx.float32)
+        # where the pool ranks, the router's logits (of the input the router
+        # was given, which x is not where the experts take a projection of
+        # it) ride the routing sync: the pool ranks its experts by them
+        lg = self.pool.router_logits() if decode else None
+        if lg is not None:
             mx.eval(indices, lg)
         idx = np.array(indices)  # materializes the gate's selection (sync)
         if decode:
@@ -645,8 +640,7 @@ class StreamingSwitchGLU(nn.Module):
                                self.pool.qparams, self.pool.act,
                                escales=self._esc(idx.astype(np.uint32)),
                                weights=w)
-        self.pool.fetch_avg += 0.125 * (self.pool.fetch_s - f0
-                                        - self.pool.fetch_avg)
+        self.pool.note_reads(self.pool.fetch_s - f0)
         if ka is not None:
             # Dispatch the layer's experts now, so the GPU starts on them
             # while the host builds the rest of the layer.
@@ -695,14 +689,24 @@ def _n_args(fn) -> int:
         return 0
 
 
-def _router_logits(mlp, sw, n_experts: int):
-    """x -> the logits of a MoE block's router, or None. Every block keeps,
-    beside its stacked experts, a router that is one matrix [experts,
-    hidden]: a Linear `gate` (qwen3, mistral_large4), or a gate module
-    holding `weight` (deepseek's MoEGate, inkling2's TopKRouter). It is
-    found by that shape, not by name; what the model does after the matrix
-    (softmax, sigmoid, a bias, groups) is not needed, the pool only ranks.
-    None unless exactly one module of the block qualifies."""
+_TAPPED: dict = {}    # a router's class -> its subclass that reports inputs
+
+
+def _tap_router(mlp, sw, pool) -> None:
+    """Find a MoE block's router, give the pool its logits (pool.router,
+    x -> logits) and have it report each input to the pool (pool.saw): the
+    pool ranks by the logits of what the router itself was given, whoever
+    calls it (the block's code, the fused visit, a pipeline adapter) and
+    whatever the experts are given (kimi_k3's latent experts take a
+    projection of it). Every block keeps, beside its stacked experts, a
+    router that is one matrix [experts, hidden]: a Linear `gate` (qwen3,
+    mistral_large4), or a gate module holding `weight` (deepseek's MoEGate,
+    inkling2's TopKRouter). It is found by that shape, not by name; what the
+    model does after the matrix (softmax, sigmoid, a bias, groups) is not
+    needed, the pool only ranks. None is found unless exactly one module of
+    the block qualifies. The router's class becomes a subclass of its own
+    that adds only the report: its parameters, their names and isinstance
+    stay."""
     skip = {id(m) for _, m in sw.named_modules()}
     found = []
     for _, m in mlp.named_modules():
@@ -713,16 +717,32 @@ def _router_logits(mlp, sw, n_experts: int):
         except (AttributeError, KeyError):
             continue
         if isinstance(w, mx.array) and w.ndim == 2 \
-                and w.shape[0] == n_experts:
+                and w.shape[0] == pool.n_experts:
             found.append(m)
     if len(found) != 1:
-        return None
+        return
     gate = found[0]
-    if "Linear" in type(gate).__name__:
-        return lambda x: gate(x)
-    if gate.weight.dtype not in (mx.float32, mx.float16, mx.bfloat16):
-        return None
-    return lambda x: x.astype(mx.float32) @ gate.weight.astype(mx.float32).T
+    cls = getattr(type(gate), "_streamlx_base", type(gate))
+    if "Linear" in cls.__name__:
+        pool.router = lambda x: cls.__call__(gate, x)    # (not reported)
+    elif gate.weight.dtype in (mx.float32, mx.float16, mx.bfloat16):
+        pool.router = lambda x: (x.astype(mx.float32)
+                                 @ gate.weight.astype(mx.float32).T)
+    else:
+        return
+    gate._streamlx_pool = pool
+    if type(gate) is cls:
+        sub = _TAPPED.get(cls)
+        if sub is None:
+            def __call__(self, x, *args, **kwargs):
+                self._streamlx_pool.saw(x)
+                return cls.__call__(self, x, *args, **kwargs)
+
+            sub = _TAPPED[cls] = type(cls.__name__, (cls,), {
+                "__call__": __call__, "_streamlx_base": cls,
+                "__module__": cls.__module__,
+                "__qualname__": cls.__qualname__})
+        gate.__class__ = sub
 
 
 def _wrap(layer, mlp, pool) -> None:
@@ -730,7 +750,7 @@ def _wrap(layer, mlp, pool) -> None:
     over what the stock module computed besides the gathers."""
     name = _switch_name(mlp)
     sw = getattr(mlp, name)
-    logits = _router_logits(mlp, sw, pool.n_experts)
+    _tap_router(mlp, sw, pool)
     # A non-default activation (deepseek_v4's LimitedSwiGLU, inkling2's
     # act_fn) must survive the swap; plain SwiGLU stays on the fused default.
     act = getattr(sw, "activation", None)
@@ -760,7 +780,6 @@ def _wrap(layer, mlp, pool) -> None:
             pool.escales = (gsv, osv)
     _uncompile_ffn(layer)
     setattr(mlp, name, StreamingSwitchGLU(pool))
-    getattr(mlp, name)._logits = logits
 
 
 def install_streaming(model, model_dir: str, n_slots: int):
