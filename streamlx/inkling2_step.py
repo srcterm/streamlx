@@ -25,13 +25,20 @@ kernels) falls by 30%, which is the bound where memory is faster.
   - a convolution state is a view of the window that made it (no gather).
 
 Nothing here changes a float: every rewrite keeps the operations and their
-order element by element. fuse() checks both ways it could stop being so, and
-leaves the model as it was if either fails: every compiled group against its
-operations run one by one, at full precision (a device whose compiler
-contracts a multiply and an add rounds differently: the CPU's does, in the
-message gate's; Metal's does not), and a visit of each kind of layer against
-mlx-lm's own, every output and cache entry compared (an mlx-lm whose layer no
-longer is the one mirrored here).
+order element by element, in the dtypes fuse() checks it in. It checks both
+ways it could stop being so: every compiled group against its operations run
+one by one, at full precision (a device whose compiler contracts a multiply
+and an add rounds differently: the CPU's does, in the message gate's; Metal's
+does not), and a visit of each kind of layer against mlx-lm's own, every
+output and cache entry compared (an mlx-lm whose layer no longer is the one
+mirrored here, or a layer whose parameters' dtypes give its projections
+another dtype than the stream's: mlx-lm casts a convolution's output to its
+input's dtype, the fused visit to the stream's). A kind of layer that differs
+keeps mlx-lm's visit (every layer does when a group differs), and so does a
+visit whose stream comes in another dtype than the check's (input embeddings
+of another dtype). What the visit makes from parameters (casts, the static
+convolution weights, the message queries) is made again when a parameter is
+replaced; loading weights of other dtypes needs fuse() again.
 
 Visits of up to _MAX_ROWS tokens without padding take this path (a decode
 step, a step's drafts checked together); a prompt chunk and a padded batch
@@ -45,6 +52,7 @@ import sys
 from types import SimpleNamespace
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 F32 = mx.float32
 _MAX_ROWS = 16
@@ -202,22 +210,38 @@ _MASKS = _Memo()
 _TAUS = _Memo()
 
 
+class _Made:
+    """Values made from a parameter once, made again when the parameter is
+    replaced (model.load_weights, Module.update): get() reads it, make(it,
+    key) makes the value for a key (a dtype, an index, or None)."""
+
+    def __init__(self, get, make):
+        self.get, self.make, self.src, self.made = get, make, None, {}
+
+    def __call__(self, key=None):
+        src = self.get()
+        if src is not self.src:
+            self.src, self.made = src, {}
+        v = self.made.get(key)
+        if v is None:
+            v = self.made[key] = self.make(src, key)
+            mx.eval(v)
+        return v
+
+
 class _Norm:
     """An nn.RMSNorm's call with its weight already in the result's dtype
     (mx.fast.rms_norm casts the weight on every call when it is not)."""
 
     def __init__(self, norm):
-        self.norm, self.cast = norm, {}
+        self.norm = norm
+        self.cast = _Made(lambda: norm.weight, lambda w, dtype: w.astype(
+            mx.result_type(dtype, w.dtype)))
 
     def __call__(self, x):
         w = self.norm.weight
         if w.dtype != x.dtype:
-            c = self.cast.get(x.dtype)
-            if c is None:
-                c = w.astype(mx.result_type(x.dtype, w.dtype))
-                mx.eval(c)
-                self.cast[x.dtype] = c
-            w = c
+            w = self.cast(x.dtype)
         return mx.fast.rms_norm(x, w, self.norm.eps)
 
 
@@ -248,8 +272,15 @@ class _Fused:
     """The fused visit, mixed into mlx-lm's two layer classes (fuse())."""
 
     def _fused_ok(self, hidden_states, cache, conv_mask) -> bool:
+        """A visit of the kind fuse() checked: up to _MAX_ROWS tokens, no
+        padding, and a stream in the dtype its probe drew it in (the
+        embedding's when it was fused: the fused visit casts to the stream's
+        dtype where mlx-lm casts to a projection's, the same dtype only
+        there); any other is mlx-lm's. (Block states, messages, and keys and
+        values cached in another dtype go through the same calls in both.)"""
         return (ENABLED and cache is not None and conv_mask is None
                 and hidden_states.shape[1] <= _MAX_ROWS
+                and hidden_states.dtype == self._k.dtype
                 and cache[1].lengths is None
                 and self.mlp.sharding_group is None)
 
@@ -439,10 +470,10 @@ class _FusedFull(_Fused):
         kh = k.k_norm(kh).astype(dtype)
         vh = k.v_norm(vh).astype(dtype)
 
-        out, x32, states[0] = self._dconv(attn.k_sconv, k.k_static,
+        out, x32, states[0] = self._dconv(attn.k_sconv, k.k_static(),
                                           attn.k_proj(kh), kh, states[0], fn)
         key_states = fn.tail(out, x32, k.c_dyn)
-        out, x32, states[1] = self._dconv(attn.v_sconv, k.v_static,
+        out, x32, states[1] = self._dconv(attn.v_sconv, k.v_static(),
                                           attn.v_proj(vh), vh, states[1], fn)
         value32 = fn.tail32(out, x32, k.c_dyn)
 
@@ -462,13 +493,13 @@ class _FusedFull(_Fused):
 
 class _FusedMessages:
     """MessageInput with each looped layer's four queries taken out of the
-    table when fused (indexing it is a gather a visit)."""
+    table once (indexing it is a gather a visit)."""
 
     def __call__(self, bank, loop_layer_idx):
         if not ENABLED:
             return super().__call__(bank, loop_layer_idx)
         stock, queries = self._k
-        return stock._depth_attention(*bank, queries[loop_layer_idx])
+        return stock._depth_attention(*bank, queries(loop_layer_idx))
 
 
 _CLASSES: dict = {}
@@ -490,8 +521,9 @@ def _fuse_messages(lm, stock):
     mi = getattr(lm, "message_input", None)
     if mi is None or isinstance(mi, _FusedMessages):
         return None
-    queries = [mx.contiguous(mi.query[i]) for i in range(mi.query.shape[0])]
-    mx.eval(queries)
+    queries = _Made(lambda: mi.query, lambda q, i: mx.contiguous(q[i]))
+    for i in range(mi.query.shape[0]):
+        queries(i)
     cls = type(mi)
     mi.__class__ = type("Fused" + cls.__name__, (_FusedMessages, cls),
                         {"__module__": cls.__module__})
@@ -499,40 +531,37 @@ def _fuse_messages(lm, stock):
     return mi, cls
 
 
-def _consts(layer, stock, text):
-    """What a fused visit reads besides the layer's parameters."""
+def _static(conv):
+    """A DynamicShortConvolution's static weights as its call shapes them."""
+    return _Made(lambda: conv.static_weight, lambda w, _key: mx.contiguous(
+        w.astype(F32).T.reshape(conv.num_heads, -1, conv.kernel_size)))
+
+
+def _consts(layer, stock, text, dtype):
+    """What a fused visit reads besides the layer's parameters (made again
+    from a parameter that is replaced), and the stream's dtype its probe
+    checks it in."""
     attn = layer.self_attn
     K = text.sconv_kernel_size
-    casts: dict = {}
-
-    def rel_proj(dtype):
-        p = casts.get(dtype)
-        if p is None:
-            p = casts[dtype] = attn.rel_logits_proj.proj.astype(dtype)
-            mx.eval(p)
-        return p
-
     k = SimpleNamespace(
-        stock=stock, rms=stock.unweighted_rms_norm, keep=K - 1,
+        stock=stock, rms=stock.unweighted_rms_norm, keep=K - 1, dtype=dtype,
         conv_state=stock._conv_state,
         c_short=_scalar(math.sqrt(K + 1)), c_dyn=_scalar(math.sqrt(2 * K + 1)),
         qk_thr=_scalar(attn.q_l2_clip.threshold),
         rel_thr=_scalar(attn.rel_l2_clip.threshold),
-        rel_proj=rel_proj, k_static=None, v_static=None)
+        rel_proj=_Made(lambda: attn.rel_logits_proj.proj,
+                       lambda p, dt: p.astype(dt)))
     k.post_norm = _Norm(layer.post_attention_layernorm)
     if isinstance(layer, stock.FullDecoderLayer):
         for name in ("q", "k", "v"):
             setattr(k, name + "_norm",
                     _Norm(getattr(layer, name + "_input_layernorm")))
+        k.k_static, k.v_static = _static(attn.k_sconv), _static(attn.v_sconv)
+        for made in (k.k_static, k.v_static):
+            made()
     else:
         k.in_norm = _Norm(layer.input_layernorm)
-    if isinstance(layer, stock.FullDecoderLayer):
-        for name in ("k", "v"):
-            conv = getattr(attn, name + "_sconv")
-            st = conv.static_weight.astype(F32).T.reshape(
-                conv.num_heads, -1, conv.kernel_size)
-            setattr(k, name + "_static", mx.contiguous(st))
-    mx.eval(k.k_static, k.v_static, k.c_short, k.c_dyn, k.qk_thr, k.rel_thr)
+    mx.eval(k.c_short, k.c_dyn, k.qk_thr, k.rel_thr)
     return k
 
 
@@ -571,24 +600,36 @@ class _stand_in:
         object.__delattr__(self.mlp, "experts")
 
 
-def _probe(model, layers, stock, rows: int = 1) -> bool:
-    """A visit of each kind of layer (first of the stack, with and without
-    the loop's messages) through mlx-lm's code and through the fused one,
-    from the same inputs and caches: every output and cache entry equal bit
-    for bit."""
+def _kind(layer) -> tuple:
+    """What a layer's visit computes besides its inputs: its class, its place
+    in its block, whether it takes the loop's messages, and the dtypes of its
+    parameters (a projection's output takes its own: mlx-lm casts a
+    convolution's output to its input's dtype, the fused visit to the
+    stream's), its experts aside (the same call in both visits, stood in for
+    by the probe). The probe tries a layer of each kind."""
+    return (type(layer), layer.attention_input is None,
+            layer.is_block_boundary, hasattr(layer, "q_message_gate"),
+            tuple((name, a.dtype) for name, a in tree_flatten(
+                layer.parameters()) if not name.startswith("mlp.experts.")))
+
+
+def _probe(model, layers, stock, dtype, rows: int = 1):
+    """A visit of each kind of layer (its first in the stack, with and
+    without the loop's messages) through mlx-lm's code and through the fused
+    one, from the same inputs (the stream's in `dtype`) and caches. Returns
+    the kinds where some output or cache entry is not equal bit for bit, and
+    whether the message input's are."""
     global ENABLED
     text = model.args.text
     lm = model.model.language_model
-    dims, dtype = text.hidden_size, lm.embed(mx.array([[0]])).dtype
+    dims = text.hidden_size
     visits = list(getattr(lm, "layer_visits", None) or lm.layers)
     cache = model.make_cache()
     key = mx.random.key(0)
     per = max(text.n_layers_per_attn_res_block, 1)
-    seen = set()
+    seen, bad = set(), set()
     for layer in layers:
-        kind = (type(layer), layer.attention_input is None,
-                layer.is_block_boundary,
-                hasattr(layer, "q_message_gate"))
+        kind = _kind(layer)
         if kind in seen:
             continue
         seen.add(kind)
@@ -622,7 +663,8 @@ def _probe(model, layers, stock, rows: int = 1) -> bool:
                 mx.eval(state)
                 results.append(state)
             if not _same(results[0], results[1]):
-                return False
+                bad.add(kind)
+    messages_same = True
     mi = getattr(lm, "message_input", None)
     if mi is not None:
         ks = mx.random.split(key, 2)
@@ -633,44 +675,53 @@ def _probe(model, layers, stock, rows: int = 1) -> bool:
             ENABLED = fused
             results.append([mi(bank, i) for i in range(mi.query.shape[0])])
         mx.eval(results)
-        if not _same(results[0], results[1]):
-            return False
-    return True
+        messages_same = _same(results[0], results[1])
+    return bad, messages_same
+
+
+def _unfuse(lm) -> None:
+    """The layers and the message input back in mlx-lm's classes."""
+    for m in [*lm.layers, getattr(lm, "message_input", None)]:
+        if isinstance(m, (_Fused, _FusedMessages)):
+            m.__class__ = type(m).__bases__[1]
 
 
 def fuse(model) -> int:
     """Give mlx-lm's inkling2 layers the fused visit. Returns how many
     layers took it: 0 when switched off (STREAMLX_FUSED=0), for a model that
     is not mlx-lm's inkling2, or when the check against mlx-lm's own visit
-    finds a difference (the model is then as it was)."""
+    finds a difference in every kind of layer (the model is then as it was);
+    the layers of a kind that differs keep mlx-lm's visit. A model fused
+    before is checked anew (after loading weights of other dtypes)."""
     global ENABLED
     if not ENABLED:
         return 0
-    before, why = [], None
+    before, why, bad, same, lm = [], None, set(), True, None
     try:
         stock = _stock()
         if not all(hasattr(stock, name) for name in _NEEDS):
             return 0                   # an mlx-lm before the layer mirrored
-        layers = list(model.model.language_model.layers)
+        lm = model.model.language_model
+        layers = list(lm.layers)
         text = model.args.text
         if not all(isinstance(layer, stock.DecoderLayer) for layer in layers):
             return 0
-        if any(isinstance(layer, _Fused) for layer in layers):
-            return len(layers)
+        _unfuse(lm)
+        dtype = lm.embed(mx.array([[0]])).dtype
         for layer in layers:
-            k = _consts(layer, stock, text)
+            k = _consts(layer, stock, text, dtype)
             before.append((layer, type(layer)))
             layer.__class__ = _fused_class(type(layer), stock)
             object.__setattr__(layer, "_k", k)
-        swapped = _fuse_messages(model.model.language_model, stock)
-        if swapped is not None:
-            before.append(swapped)
-        dtype = model.model.language_model.embed(mx.array([[0]])).dtype
+        swapped = _fuse_messages(lm, stock)
         if not _groups_exact(dtype):
             why = "a compiled group rounds differently on this device"
-        elif not (_probe(model, layers, stock)
-                  and _probe(model, layers, stock, 3)):
-            why = "its values differ"
+        else:
+            for rows in (1, 3):
+                b, s = _probe(model, layers, stock, dtype, rows)
+                bad, same = bad | b, same and s
+            if len(bad) == len({_kind(layer) for layer in layers}):
+                why = "its values differ"
     except Exception as e:  # noqa: BLE001 — a layer this does not know
         why = f"{type(e).__name__}: {e}"
     finally:
@@ -678,8 +729,23 @@ def fuse(model) -> int:
     if why is not None:
         for layer, cls in before:
             layer.__class__ = cls
+        if lm is not None:
+            _unfuse(lm)
         print("[streamlx] inkling2: mlx-lm's own layer visit is used (the "
               f"fused one does not reproduce it here: {why})",
               file=sys.stderr)
         return 0
-    return len(layers)
+    kept = [i for i, (layer, cls) in enumerate(before) if _kind(layer) in bad]
+    for i in kept:
+        layer, cls = before[i]
+        layer.__class__ = cls
+    if swapped is not None and not same:
+        mi, cls = swapped
+        mi.__class__ = cls
+    parts = ([f"layers {kept}"] if kept else []) + (
+        [] if same else ["the message input"])
+    if parts:
+        print(f"[streamlx] inkling2: mlx-lm's own visit is kept for "
+              f"{' and '.join(parts)} (the fused one does not reproduce it "
+              "there)", file=sys.stderr)
+    return len(layers) - len(kept)

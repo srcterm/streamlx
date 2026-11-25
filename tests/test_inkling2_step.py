@@ -12,10 +12,15 @@ import unittest
 from unittest import mock
 
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 import toy  # noqa: F401  (the device switch)
-import toy_inkling2 as ink
 from streamlx import inkling2_step as step
+
+try:
+    import toy_inkling2 as ink
+except ImportError:         # an mlx-lm without the inkling2 model
+    ink = None
 
 _VIEWS = {"Broadcast", "Reshape", "Squeeze", "ExpandDims", "Slice",
           "AsStrided", "StopGradient", "Depends", "Split", "Unflatten",
@@ -23,6 +28,8 @@ _VIEWS = {"Broadcast", "Reshape", "Squeeze", "ExpandDims", "Slice",
 
 
 def _mirrored() -> bool:
+    if ink is None:
+        return False
     try:
         stock = step._stock()
     except ImportError:
@@ -51,6 +58,20 @@ def _same(a, b) -> bool:
 
 def _states(cache):
     return [[c[0].state, list(c[1].cache)] for c in cache]
+
+
+def _alike(test, ref, m, prompt, steps=6, emb=None):
+    """The streamed model gives stock's logits and caches bit for bit over a
+    prompt (or its input embeddings) and greedy steps after it."""
+    ca, cb = ref.make_cache(), m.make_cache()
+    ids = mx.array([prompt])
+    for i in range(steps + 1):
+        la = ref(ids, cache=ca, input_embeddings=emb if i == 0 else None)
+        lb = m(ids, cache=cb, input_embeddings=emb if i == 0 else None)
+        mx.eval(la, lb, _states(ca), _states(cb))
+        test.assertTrue(_same(la, lb), f"logits, step {i}")
+        test.assertTrue(_same(_states(ca), _states(cb)), f"caches, step {i}")
+        ids = mx.argmax(la[0, -1]).reshape(1, 1)
 
 
 @unittest.skipUnless(mx.default_device() == mx.gpu and _mirrored(),
@@ -105,9 +126,60 @@ class FusedVisit(unittest.TestCase):
         self._check(loop=ink.HAS_LOOP, qk_l2_clip_threshold=0.25,
                     rel_l2_clip_threshold=0.125)
 
-    @unittest.skipUnless(ink.HAS_LOOP, "needs mlx-lm's inkling2_loop")
+    @unittest.skipUnless(ink is not None and ink.HAS_LOOP,
+                         "needs mlx-lm's inkling2_loop")
     def test_matches_mlx_lm_looped(self):
         self._check(loop=True)
+
+    def test_other_dtypes_keep_mlx_lm(self):
+        """A layer whose value projection keeps its scales in float32 (its
+        output in float32, which mlx-lm's convolution after it keeps) is not
+        the kind fuse() checked for its class: it keeps mlx-lm's visit, the
+        other layers take the fused one. A prompt given as input embeddings
+        in float16 runs mlx-lm's code, the steps after it the fused visit
+        over the keys and values it cached in float32. Bit for bit."""
+        ck = ink.Checkpoint(loop=ink.HAS_LOOP)
+        try:
+            path = f"{ck.dir}/model-00001-of-00001.safetensors"
+            w = mx.load(path)
+            for part in ("scales", "biases"):
+                k = f"{ink.ROOT}layers.4.self_attn.v_proj.{part}"
+                w[k] = w[k].astype(mx.float32)
+            mx.save_safetensors(path, w)
+            ref = ck.stock()
+            m, _pools = ck.streaming(16)
+            layers = m.model.language_model.layers
+            self.assertEqual([isinstance(x, step._Fused) for x in layers],
+                             [i != 4 for i in range(len(layers))])
+            _alike(self, ref, m, [25, 26, 27])
+            emb = ref.model.language_model.embed(mx.array([[25, 26, 27]]))
+            _alike(self, ref, m, [25, 26, 27], emb=emb.astype(mx.float16))
+        finally:
+            ck.close()
+
+    def test_new_weights(self):
+        """Weights loaded after fuse(): what the fused visit made of the old
+        ones (a norm weight's cast, the relative logits table's, the static
+        convolution weights, the loop's message queries) is made again."""
+        ck = ink.Checkpoint(loop=ink.HAS_LOOP)
+        try:
+            ref = ck.stock()
+            m, _pools = ck.streaming(16)
+            self.assertTrue(all(isinstance(x, step._Fused)
+                                for x in m.model.language_model.layers))
+            _alike(self, ref, m, [5, 6, 7], steps=1)
+            mx.random.seed(3)
+            made = ("sconv.static_weight", "rel_logits_proj.proj",
+                    "post_attention_layernorm.weight", "message_input.query")
+            new = [(name, (p + 0.5 * mx.random.normal(p.shape)).astype(
+                p.dtype)) for name, p in tree_flatten(ref.parameters())
+                if name.endswith(made)]
+            self.assertGreaterEqual(len(new), 4 + ink.HAS_LOOP)
+            for model in (ref, m):
+                model.load_weights(new, strict=False)
+            _alike(self, ref, m, [5, 6, 7])
+        finally:
+            ck.close()
 
     def test_compiled_groups_exact(self):
         """Each compiled group against its operations one by one, at full
