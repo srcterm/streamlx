@@ -38,7 +38,8 @@ keeps mlx-lm's visit (every layer does when a group differs), and so does a
 visit whose stream comes in another dtype than the check's (input embeddings
 of another dtype). What the visit makes from parameters (casts, the static
 convolution weights, the message queries) is made again when a parameter is
-replaced; loading weights of other dtypes needs fuse() again.
+replaced; loading weights of other dtypes, or updating a parameter in place
+(an indexed assignment keeps its identity), needs fuse() again.
 
 Visits of up to _MAX_ROWS tokens without padding take this path (a decode
 step, a step's drafts checked together); a prompt chunk and a padded batch
@@ -211,15 +212,18 @@ _TAUS = _Memo()
 
 
 class _Made:
-    """Values made from a parameter once, made again when the parameter is
-    replaced (model.load_weights, Module.update): get() reads it, make(it,
-    key) makes the value for a key (a dtype, an index, or None)."""
+    """Values made from a parameter, made again when the caller passes one
+    that was replaced (model.load_weights, Module.update): make(it, key)
+    makes the value for a key (a dtype, an index, or None). An update in
+    place (an indexed assignment) keeps the parameter's identity: fuse()
+    again after one. The caller passes the parameter, so nothing here holds
+    the module it belongs to (no reference cycle keeps a model's modules
+    once the model is dropped)."""
 
-    def __init__(self, get, make):
-        self.get, self.make, self.src, self.made = get, make, None, {}
+    def __init__(self, make):
+        self.make, self.src, self.made = make, None, {}
 
-    def __call__(self, key=None):
-        src = self.get()
+    def __call__(self, src, key=None):
         if src is not self.src:
             self.src, self.made = src, {}
         v = self.made.get(key)
@@ -235,13 +239,13 @@ class _Norm:
 
     def __init__(self, norm):
         self.norm = norm
-        self.cast = _Made(lambda: norm.weight, lambda w, dtype: w.astype(
+        self.cast = _Made(lambda w, dtype: w.astype(
             mx.result_type(dtype, w.dtype)))
 
     def __call__(self, x):
         w = self.norm.weight
         if w.dtype != x.dtype:
-            w = self.cast(x.dtype)
+            w = self.cast(w, x.dtype)
         return mx.fast.rms_norm(x, w, self.norm.eps)
 
 
@@ -375,7 +379,7 @@ class _Fused:
         key = _clip(fn, key, None, k.qk_thr)
         value = k.rms(value, attn.eps).astype(dtype)
         r = _clip(fn, r, attn.rel_l2_clip.scale, k.rel_thr, tau)
-        position_bias = r @ k.rel_proj(r.dtype)
+        position_bias = r @ k.rel_proj(attn.rel_logits_proj.proj, r.dtype)
 
         q = q.transpose(0, 2, 1, 3)
         key = key.transpose(0, 2, 1, 3)
@@ -470,10 +474,12 @@ class _FusedFull(_Fused):
         kh = k.k_norm(kh).astype(dtype)
         vh = k.v_norm(vh).astype(dtype)
 
-        out, x32, states[0] = self._dconv(attn.k_sconv, k.k_static(),
+        static = k.k_static(attn.k_sconv.static_weight)
+        out, x32, states[0] = self._dconv(attn.k_sconv, static,
                                           attn.k_proj(kh), kh, states[0], fn)
         key_states = fn.tail(out, x32, k.c_dyn)
-        out, x32, states[1] = self._dconv(attn.v_sconv, k.v_static(),
+        static = k.v_static(attn.v_sconv.static_weight)
+        out, x32, states[1] = self._dconv(attn.v_sconv, static,
                                           attn.v_proj(vh), vh, states[1], fn)
         value32 = fn.tail32(out, x32, k.c_dyn)
 
@@ -499,7 +505,8 @@ class _FusedMessages:
         if not ENABLED:
             return super().__call__(bank, loop_layer_idx)
         stock, queries = self._k
-        return stock._depth_attention(*bank, queries(loop_layer_idx))
+        return stock._depth_attention(*bank,
+                                      queries(self.query, loop_layer_idx))
 
 
 _CLASSES: dict = {}
@@ -521,9 +528,9 @@ def _fuse_messages(lm, stock):
     mi = getattr(lm, "message_input", None)
     if mi is None or isinstance(mi, _FusedMessages):
         return None
-    queries = _Made(lambda: mi.query, lambda q, i: mx.contiguous(q[i]))
+    queries = _Made(lambda q, i: mx.contiguous(q[i]))
     for i in range(mi.query.shape[0]):
-        queries(i)
+        queries(mi.query, i)
     cls = type(mi)
     mi.__class__ = type("Fused" + cls.__name__, (_FusedMessages, cls),
                         {"__module__": cls.__module__})
@@ -532,9 +539,13 @@ def _fuse_messages(lm, stock):
 
 
 def _static(conv):
-    """A DynamicShortConvolution's static weights as its call shapes them."""
-    return _Made(lambda: conv.static_weight, lambda w, _key: mx.contiguous(
-        w.astype(F32).T.reshape(conv.num_heads, -1, conv.kernel_size)))
+    """A DynamicShortConvolution's static weights as its call shapes them,
+    made now."""
+    heads, kernel = conv.num_heads, conv.kernel_size
+    made = _Made(lambda w, _key: mx.contiguous(
+        w.astype(F32).T.reshape(heads, -1, kernel)))
+    made(conv.static_weight)
+    return made
 
 
 def _consts(layer, stock, text, dtype):
@@ -549,16 +560,13 @@ def _consts(layer, stock, text, dtype):
         c_short=_scalar(math.sqrt(K + 1)), c_dyn=_scalar(math.sqrt(2 * K + 1)),
         qk_thr=_scalar(attn.q_l2_clip.threshold),
         rel_thr=_scalar(attn.rel_l2_clip.threshold),
-        rel_proj=_Made(lambda: attn.rel_logits_proj.proj,
-                       lambda p, dt: p.astype(dt)))
+        rel_proj=_Made(lambda p, dt: p.astype(dt)))
     k.post_norm = _Norm(layer.post_attention_layernorm)
     if isinstance(layer, stock.FullDecoderLayer):
         for name in ("q", "k", "v"):
             setattr(k, name + "_norm",
                     _Norm(getattr(layer, name + "_input_layernorm")))
         k.k_static, k.v_static = _static(attn.k_sconv), _static(attn.v_sconv)
-        for made in (k.k_static, k.v_static):
-            made()
     else:
         k.in_norm = _Norm(layer.input_layernorm)
     mx.eval(k.c_short, k.c_dyn, k.qk_thr, k.rel_thr)
@@ -692,7 +700,9 @@ def fuse(model) -> int:
     is not mlx-lm's inkling2, or when the check against mlx-lm's own visit
     finds a difference in every kind of layer (the model is then as it was);
     the layers of a kind that differs keep mlx-lm's visit. A model fused
-    before is checked anew (after loading weights of other dtypes)."""
+    before is checked anew and what the visit made from its parameters made
+    again (after loading weights of other dtypes, or updating a parameter in
+    place)."""
     global ENABLED
     if not ENABLED:
         return 0

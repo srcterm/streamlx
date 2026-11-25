@@ -400,16 +400,25 @@ def headless_adapter(model, pools):
 def capture_layer_outputs(model, layer_ids):
     """Record model.layers[i]'s output for every i in layer_ids during the
     forwards inside the block: yields {i: [output per call]} (a prefill's
-    draft-head context)."""
+    draft-head context). A layer whose class and that class's parent are
+    both wrapped (a fused layer falling back to mlx-lm's visit beside one
+    that kept it) is recorded once a call, at its own class."""
     layers = model.layers
     want = {id(layers[i]): i for i in layer_ids}
     out = {i: [] for i in layer_ids}
     patched = {type(layers[i]) for i in layer_ids}
     orig = {cls: cls.__call__ for cls in patched}
+    inside = set()                   # the layers whose call is under way
 
     def wrap(cls):
         def call(self, *a, **kw):
-            res = orig[cls](self, *a, **kw)
+            if id(self) in inside:   # its own class's call reached this one
+                return orig[cls](self, *a, **kw)
+            inside.add(id(self))
+            try:
+                res = orig[cls](self, *a, **kw)
+            finally:
+                inside.discard(id(self))
             i = want.get(id(self))
             if i is not None:
                 out[i].append(res[0] if isinstance(res, tuple) else res)

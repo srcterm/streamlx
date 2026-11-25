@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import mlx.core as mx
@@ -16,6 +17,7 @@ from mlx.utils import tree_flatten
 
 import toy  # noqa: F401  (the device switch)
 from streamlx import inkling2_step as step
+from streamlx.pipeline_adapters import adapter_for
 
 try:
     import toy_inkling2 as ink
@@ -58,6 +60,17 @@ def _same(a, b) -> bool:
 
 def _states(cache):
     return [[c[0].state, list(c[1].cache)] for c in cache]
+
+
+def _float32_v(ck, layer):
+    """The checkpoint with one layer's value projection scales and biases in
+    float32 (its output then float32, the stream bfloat16)."""
+    path = f"{ck.dir}/model-00001-of-00001.safetensors"
+    w = mx.load(path)
+    for part in ("scales", "biases"):
+        k = f"{ink.ROOT}layers.{layer}.self_attn.v_proj.{part}"
+        w[k] = w[k].astype(mx.float32)
+    mx.save_safetensors(path, w)
 
 
 def _alike(test, ref, m, prompt, steps=6, emb=None):
@@ -140,12 +153,7 @@ class FusedVisit(unittest.TestCase):
         over the keys and values it cached in float32. Bit for bit."""
         ck = ink.Checkpoint(loop=ink.HAS_LOOP)
         try:
-            path = f"{ck.dir}/model-00001-of-00001.safetensors"
-            w = mx.load(path)
-            for part in ("scales", "biases"):
-                k = f"{ink.ROOT}layers.4.self_attn.v_proj.{part}"
-                w[k] = w[k].astype(mx.float32)
-            mx.save_safetensors(path, w)
+            _float32_v(ck, 4)
             ref = ck.stock()
             m, _pools = ck.streaming(16)
             layers = m.model.language_model.layers
@@ -156,6 +164,35 @@ class FusedVisit(unittest.TestCase):
             _alike(self, ref, m, [25, 26, 27], emb=emb.astype(mx.float16))
         finally:
             ck.close()
+
+    def test_head_rows_with_some_layers_fused(self):
+        """A prompt chunk of more rows than the fused visit takes, through a
+        model where one layer keeps mlx-lm's visit (its value projection in
+        float32): the draft head's rows record each layer visit once (a
+        fused layer falls back to its class's parent, which the recorder
+        also wraps), equal to stock's, looped and not."""
+        for loop, taps in ((False, (2, 5, 6)), (True, (2, 5, 10))):
+            if loop and not ink.HAS_LOOP:
+                continue
+            with self.subTest(loop=loop):
+                ck = ink.Checkpoint(loop=loop)
+                try:
+                    _float32_v(ck, 4)
+                    ref = ck.stock()
+                    m, _pools = ck.streaming(16)
+                    self.assertEqual(
+                        [isinstance(x, step._Fused)
+                         for x in m.model.language_model.layers],
+                        [i != 4 for i in range(ink.TEXT["num_hidden_layers"])])
+                    head = SimpleNamespace(tap_layers=taps)
+                    prompt = mx.array([list(range(3, 3 + step._MAX_ROWS + 1))])
+                    got = [adapter_for(x, head).forward_taps(prompt,
+                                                             x.make_cache())
+                           for x in (ref, m)]
+                    mx.eval(got)
+                    self.assertTrue(_same(got[0], got[1]))
+                finally:
+                    ck.close()
 
     def test_new_weights(self):
         """Weights loaded after fuse(): what the fused visit made of the old
@@ -177,6 +214,15 @@ class FusedVisit(unittest.TestCase):
             self.assertGreaterEqual(len(new), 4 + ink.HAS_LOOP)
             for model in (ref, m):
                 model.load_weights(new, strict=False)
+            _alike(self, ref, m, [5, 6, 7])
+            # an update in place keeps the parameter's identity: fuse() again
+            values = 0.5 * mx.random.normal(
+                ref.model.language_model.layers[2].self_attn.k_sconv
+                .static_weight.shape)
+            for model in (ref, m):
+                conv = model.model.language_model.layers[2].self_attn.k_sconv
+                conv.static_weight[:] = values
+            self.assertEqual(step.fuse(m), len(m.model.language_model.layers))
             _alike(self, ref, m, [5, 6, 7])
         finally:
             ck.close()

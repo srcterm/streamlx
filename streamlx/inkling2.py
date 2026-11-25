@@ -391,7 +391,6 @@ class Inkling2LoopAdapter(Inkling2Adapter):
     def __init__(self, model, drafter=None):
         super().__init__(model, drafter)
         self.n_visits = len(self.lm.layer_visits)
-        self._classes = {type(layer) for layer in self.layers}
         # the module whose _conv_state the layers call
         self._module = sys.modules[type(self.layers[0]).__module__]
         self._want = {t - 1 for t in self.tap_layers if t < self.n_visits}
@@ -400,13 +399,22 @@ class Inkling2LoopAdapter(Inkling2Adapter):
     def _recording(self, windows=None):
         """During the forward inside: {visit: its output} for the visits the
         taps read and, appended to `windows`, every convolution window in
-        the order the layers build them (four a visit)."""
-        orig = {c: c.__call__ for c in self._classes}
-        outs, count, want = {}, [0], self._want
+        the order the layers build them (four a visit). The layers' classes
+        as they are now (fuse() may change them); a layer whose class and
+        that class's parent are both wrapped (a fused layer falling back to
+        mlx-lm's visit beside one that kept it) counts once a visit."""
+        orig = {c: c.__call__ for c in {type(x) for x in self.layers}}
+        outs, count, want, inside = {}, [0], self._want, set()
 
         def wrap(f):
             def call(layer, *a, **kw):
-                res = f(layer, *a, **kw)
+                if id(layer) in inside:  # its own class's call reached this
+                    return f(layer, *a, **kw)
+                inside.add(id(layer))
+                try:
+                    res = f(layer, *a, **kw)
+                finally:
+                    inside.discard(id(layer))
                 if count[0] in want:
                     outs[count[0]] = res[0]
                 count[0] += 1
