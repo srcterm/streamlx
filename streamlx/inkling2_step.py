@@ -71,7 +71,7 @@ def _stock():
 
 # what the fused visit calls of mlx-lm's layer module
 _NEEDS = ("DecoderLayer", "SlidingDecoderLayer", "FullDecoderLayer",
-          "unweighted_rms_norm", "_conv_state", "_positions",
+          "unweighted_rms_norm", "_conv_input", "_conv_state", "_positions",
           "_key_positions", "_depth_attention")
 
 _FNS: dict = {}
@@ -88,9 +88,6 @@ def _groups(dtype) -> dict:
     def both(x):
         y = x.astype(dtype)
         return y, y.astype(F32)
-
-    def round32(x):
-        return through(x)
 
     def tail(out, resid, c):           # a convolution's output and residual
         return ((out.astype(F32) + resid) / c).astype(dtype)
@@ -136,7 +133,7 @@ def _groups(dtype) -> dict:
     def dyn_weighted(windows, static, dyn):
         return windows * (static + dyn.astype(F32))
 
-    return {"both": (both, "f"), "round32": (round32, "f"),
+    return {"both": (both, "f"),
             "tail": (tail, "sfc"), "tail32": (tail32, "sfc"),
             "tail_add": (tail_add, "sfcf"), "final": (final, "sfcf"),
             "out_gate": (out_gate, "ss"), "gate_out": (gate_out, "ffff"),
@@ -258,17 +255,12 @@ def _clip(fn, x, scale, thr, tau=None):
     return fn.clip_out_scaled(s, sq, thr, tau)
 
 
-def _window(conv, x32, state):
-    """A short convolution's window (its state then the input, float32)."""
-    if state is None:
-        state = mx.zeros((x32.shape[0], conv.kernel_size - 1, x32.shape[-1]),
-                         F32)
-    return mx.concatenate([state, x32], axis=1)
-
-
-def _sconv(conv, x32, state):
-    """ShortConvolution up to its conv1d: (the conv's output, the window)."""
-    window = _window(conv, x32, state)
+def _sconv(stock, conv, x, state):
+    """ShortConvolution up to its conv1d: (the conv's output, the window).
+    The window is mlx-lm's own (_conv_input of the conv's input in its own
+    dtype: its state then the input, in float32 or in the input's dtype as
+    that mlx-lm keeps it)."""
+    window = stock._conv_input(x, state, None, conv.kernel_size)
     return conv.conv1d(window.astype(conv.conv1d.weight.dtype)), window
 
 
@@ -309,7 +301,7 @@ class _Fused:
         a = self._fused_attention(hidden_states, attention_inputs, cache,
                                   states, messages, fn)
         a32 = a.astype(F32)
-        out, states[2] = _sconv(self.post_attention_convolution, a32,
+        out, states[2] = _sconv(k.stock, self.post_attention_convolution, a,
                                 states[2])
         if self.is_block_boundary:
             residual = fn.tail32(out, a32, k.c_short)
@@ -326,8 +318,9 @@ class _Fused:
         xn, xn32 = fn.both(k.post_norm(x))
         inds, weights = self.mlp.gate(xn32)
         y = fn.moe_weighted(self.mlp.experts(xn, inds), weights[..., None])
-        y32 = fn.round32(y.sum(axis=-2))
-        out, states[3] = _sconv(self.post_mlp_convolution, y32, states[3])
+        y, y32 = fn.both(y.sum(axis=-2))
+        out, states[3] = _sconv(k.stock, self.post_mlp_convolution, y,
+                                states[3])
         h = fn.final(out, y32, k.c_short, residual)
 
         n, rows = k.keep, hidden_states.shape[1]
@@ -436,11 +429,12 @@ class _FusedSliding(_Fused):
         else:
             q, kh, vh = (k.in_norm(s).astype(dtype)
                          for s in self._fused_mix((x, x, x), messages, fn))
-        kx32 = attn.k_proj(kh).astype(F32)
-        out, states[0] = _sconv(attn.k_sconv, kx32, states[0])
-        key_states = fn.tail(out, kx32, k.c_short)
-        vx32 = attn.v_proj(vh).astype(F32)
-        out, states[1] = _sconv(attn.v_sconv, vx32, states[1])
+        kx = attn.k_proj(kh)
+        out, states[0] = _sconv(k.stock, attn.k_sconv, kx, states[0])
+        key_states = fn.tail(out, kx.astype(F32), k.c_short)
+        vx = attn.v_proj(vh)
+        vx32 = vx.astype(F32)
+        out, states[1] = _sconv(k.stock, attn.v_sconv, vx, states[1])
         value32 = fn.tail32(out, vx32, k.c_short)
         return self._fused_attend(q, key_states, value32, cache, fn)
 
@@ -453,7 +447,7 @@ class _FusedFull(_Fused):
         K, H = conv.kernel_size, conv.num_heads
         dyn = conv.weight_proj(dynamic_input).reshape(B, L, H, 1, K)
         x32 = x.astype(F32)
-        window = _window(conv, x32, state)
+        window = self._k.stock._conv_input(x, state, None, K)
         windows = mx.stack([window[:, K - 1 - lag:K - 1 - lag + L]
                             for lag in range(K)], axis=-1)
         windows = windows.reshape(B, L, H, -1, K)
