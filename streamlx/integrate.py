@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import itertools
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
@@ -706,7 +707,9 @@ def _tap_router(mlp, sw, pool) -> None:
     needed, the pool only ranks. None is found unless exactly one module of
     the block qualifies. The router's class becomes a subclass of its own
     that adds only the report: its parameters, their names and isinstance
-    stay."""
+    stay. It holds its pool weakly: the pool's logits hold the router, and
+    a cycle would keep a dropped model's pools (their slots) until the
+    garbage collector found it."""
     skip = {id(m) for _, m in sw.named_modules()}
     found = []
     for _, m in mlp.named_modules():
@@ -730,12 +733,14 @@ def _tap_router(mlp, sw, pool) -> None:
                                  @ gate.weight.astype(mx.float32).T)
     else:
         return
-    gate._streamlx_pool = pool
+    gate._streamlx_pool = weakref.ref(pool)
     if type(gate) is cls:
         sub = _TAPPED.get(cls)
         if sub is None:
             def __call__(self, x, *args, **kwargs):
-                self._streamlx_pool.saw(x)
+                to = self._streamlx_pool()
+                if to is not None:
+                    to.saw(x)
                 return cls.__call__(self, x, *args, **kwargs)
 
             sub = _TAPPED[cls] = type(cls.__name__, (cls,), {

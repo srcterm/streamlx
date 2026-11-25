@@ -378,7 +378,7 @@ class PipelinedDecoder:
         self._last: dict = {}              # layer -> the last step's experts
         self._fin: dict = {}               # layer -> streams finished
         self._ranked: set = set()          # layers whose pools ranked
-        self._io = deque()                 # (start, end, layer, bytes) a read
+        self._io = deque()                 # (start, end, layer) a read
         self._k_cur = 0
         # an adapter whose begin() routes with the block's own code lets the
         # switch reuse that routing instead of syncing on it a second time
@@ -449,43 +449,48 @@ class PipelinedDecoder:
             except BaseException:
                 pool.forget(direct)        # slots given, nothing read
                 raise
-            rd = _Read(self.ex.submit(
-                self._read, l, len(direct) * pool.expert_bytes,
-                self.reader.read_into, reqs), direct, slots=True)
+            rd = _Read(self.ex.submit(self._read, l, self.reader.read_into,
+                                      reqs), direct, slots=True)
             held.update(dict.fromkeys(direct, rd))
         if len(direct) < len(new):
             rest = [e for e in new if e not in pool.id2slot]
-            rd = _Read(self.ex.submit(
-                self._read, l, len(rest) * pool.expert_bytes,
-                self.reader.read_experts_arrays, pool.triples_loc, rest),
-                rest)
+            rd = _Read(self.ex.submit(self._read, l,
+                                      self.reader.read_experts_arrays,
+                                      pool.triples_loc, rest), rest)
             held.update(dict.fromkeys(rest, rd))
         s.need = need = [e for e in uniq if e in held]
         s.reads = tuple(dict.fromkeys(held[e] for e in need))
 
-    def _read(self, l: int, nbytes: int, fn, *args):
+    def _read(self, l: int, fn, *args):
         """fn(*args) on a read thread, its interval logged for the layers'
         read cost (_note_reads)."""
         t0 = time.perf_counter()
         try:
             return fn(*args)
         finally:
-            self._io.append((t0, time.perf_counter(), l, nbytes))
+            self._io.append((t0, time.perf_counter(), l))
 
     def _note_reads(self, K: int) -> None:
         """Each pool's reads of the step, as K tokens', to its fetch_avg
-        (what auto decides by): the time some read was in flight, shared by
-        bytes. Reads overlap here; a plain step's is its blocking read."""
-        io, self._io = sorted(self._io), deque()
-        busy, end, by_layer = 0.0, -math.inf, {}
-        for t0, t1, l, nbytes in io:
-            busy += max(0.0, t1 - max(t0, end))
-            end = max(end, t1)
-            by_layer[l] = by_layer.get(l, 0) + nbytes
-        total = sum(by_layer.values())
+        (what auto decides by): every stretch of time some read was in
+        flight goes to the layers reading then, in equal shares, so a read
+        alone is charged all of its time (a layer's slow reads stay its
+        own) and reads that overlap are counted once. A plain step's is its
+        blocking read."""
+        io, self._io = list(self._io), deque()
+        events = sorted([(t0, 1, i) for i, (t0, _t1, _l) in enumerate(io)]
+                        + [(t1, -1, i) for i, (_t0, t1, _l) in enumerate(io)])
+        cost = dict.fromkeys(self.pools, 0.0)
+        live, then = set(), 0.0
+        for t, edge, i in events:            # (at a tie, an end goes first)
+            if live:
+                share = (t - then) / len(live)
+                for j in live:
+                    cost[io[j][2]] += share
+            then = t
+            (live.add if edge > 0 else live.discard)(i)
         for l, pool in self.pools.items():
-            share = by_layer.get(l, 0) / total if total else 0.0
-            pool.note_reads(busy * share, K)
+            pool.note_reads(cost[l], K)
 
     def _finish(self, s: Stream) -> None:
         """The rest of the layer the stream began (its reads have arrived)."""

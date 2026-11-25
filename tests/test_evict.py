@@ -6,9 +6,11 @@ model family the tests build; the current token's experts (a pipelined
 step's: every stream's, and the last step's) never leave; a matrix whose
 top-k is not the routed set is dropped after the probe (the pool stays LRU);
 and "auto" ranks only where a layer's reads take long enough."""
+import gc
 import importlib.util
 import time
 import unittest
+import weakref
 from contextlib import ExitStack, contextmanager
 from unittest import mock
 
@@ -123,6 +125,21 @@ class Exact(unittest.TestCase):
             m, pools = self.ck.streaming(6)
             toy.greedy(m, PROMPT, N)
         self.assertTrue(all(p.worth is None for p in pools.values()))
+
+    def test_pools_freed_with_the_model(self):
+        """A dropped model's pools, and their slots, are freed at once, not
+        when the garbage collector next looks for cycles: a router holds its
+        pool weakly (the pool's logits hold the router)."""
+        with _evict("rank"):
+            m, pools = self.ck.streaming(6)
+            toy.greedy(m, PROMPT, 4)
+        alive = [weakref.ref(p) for p in pools.values()]
+        gc.disable()
+        try:
+            del m, pools
+            self.assertEqual([r() for r in alive], [None] * len(alive))
+        finally:
+            gc.enable()
 
 
 class Pool(unittest.TestCase):
@@ -275,8 +292,8 @@ class Pipelined(unittest.TestCase):
         cls.ck.close()
 
     def decode(self, slots, mode, wrong=0.0, floor=None, rename=False,
-               slow=0.0, start=None):
-        """N tokens in steps of up to 3, each draft wrong with probability
+               slow=0.0, start=None, k=3, slow_layer=None):
+        """N tokens in steps of up to k, each draft wrong with probability
         `wrong`: the pools, and whether every token kept had stock's logits
         and token. Checked as it runs: a stream's routing evicts no expert
         that a stream of the step or of the last uses at that layer, and a
@@ -284,10 +301,21 @@ class Pipelined(unittest.TestCase):
         pool has slots) resident; where the pool ranks, what either evicts
         is of the lowest worth among the experts it could have.
         rename: the adapter's state names the block's input otherwise (as
-        Qwen3.8's does); slow: seconds each read takes longer; start: every
-        pool's fetch_avg before the first step."""
+        Qwen3.8's does); slow: seconds each read takes longer; slow_layer:
+        (layer, seconds) for one layer's reads alone; start: every pool's
+        fetch_avg before the first step."""
         rng = np.random.default_rng(0)
         route, settle = PipelinedDecoder._route, PipelinedDecoder._settle
+        read = PipelinedDecoder._read
+
+        def late_layer(self_, l, fn, *args):
+            if slow_layer is None or l != slow_layer[0]:
+                return read(self_, l, fn, *args)
+
+            def late(*a):
+                time.sleep(slow_layer[1])
+                return fn(*a)
+            return read(self_, l, late, *args)
 
         def routed(self_, s):
             l, pool = s.l - 1, self_.pools.get(s.l - 1)
@@ -314,7 +342,8 @@ class Pipelined(unittest.TestCase):
 
         with _evict(mode, floor), \
                 mock.patch.object(PipelinedDecoder, "_route", routed), \
-                mock.patch.object(PipelinedDecoder, "_settle", settled):
+                mock.patch.object(PipelinedDecoder, "_settle", settled), \
+                mock.patch.object(PipelinedDecoder, "_read", late_layer):
             m, pools = self.ck.streaming(slots)
             ad = adapter_for(m, None)
             if rename:
@@ -346,7 +375,7 @@ class Pipelined(unittest.TestCase):
             i, same = 0, True
             while i < N:
                 toks, a = [self.seq[i]], None
-                for j in range(1, min(3, N - i)):
+                for j in range(1, min(k, N - i)):
                     if rng.random() < wrong:
                         toks.append((self.seq[i + j] + 1) % toy.VOCAB)
                         a = j if a is None else a
@@ -415,18 +444,32 @@ class Pipelined(unittest.TestCase):
         self.assertTrue(all(p.fetch_avg < 0.01 for p in pools.values()))
 
     def test_read_cost(self):
-        """A step's reads in fetch_avg: the time some read was in flight,
-        shared by bytes, per token. Two reads of 10 ms at once, layer 0's
-        three times the bytes of layer 1's: 7.5 and 2.5 ms over 2 tokens."""
+        """A step's reads in fetch_avg, per token: a read alone is charged all
+        of its time, reads in flight together share theirs equally. Layer 0
+        reads 20 ms, layer 1 the last 10 of them, then layer 2 10 ms alone:
+        15, 5 and 10 ms over 2 tokens."""
         m, pools = self.ck.streaming(8)
         ad = adapter_for(m, None)
         dec = PipelinedDecoder(ad, pools, [], k_max=3, adaptive=False,
                                self_gate=False)
-        dec._io.extend([(1.0, 1.01, 0, 3000), (1.0, 1.01, 1, 1000)])
+        dec._io.extend([(1.0, 1.02, 0), (1.01, 1.02, 1), (1.03, 1.04, 2)])
         dec._note_reads(2)
         a = 1 - (1 - pool_mod._FETCH_WEIGHT) ** 2
-        for l, ms in ((0, 7.5), (1, 2.5), (2, 0.0), (3, 0.0)):
+        for l, ms in ((0, 15.0), (1, 5.0), (2, 10.0), (3, 0.0)):
             self.assertAlmostEqual(pools[l].fetch_avg, a * ms / 2e3)
+
+    def test_auto_follows_a_slow_layer(self):
+        """One stream a step, one layer's reads 30 ms slower (it reads in
+        about half the steps, at top-k slots): auto ranks that layer (its
+        reads take more than the 3 ms floor a token, overlapping no other's)
+        and only it; shared by bytes, the step's read time gave it ~1/4."""
+        pools, same = self.decode(toy.ARGS["num_experts_per_tok"], "auto",
+                                  floor=3e-3, k=1, slow_layer=(2, 0.03))
+        self.assertTrue(same)
+        for l, p in pools.items():
+            with self.subTest(layer=l):
+                self.assertEqual(p.fetch_avg >= 3e-3, l == 2)
+                self.assertEqual(p.worth is not None, l == 2)
 
     def test_router_input_by_any_name(self):
         """The router's input reaches the pool from the router itself: an
