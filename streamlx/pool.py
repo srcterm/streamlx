@@ -5,9 +5,11 @@ is bitwise-identical to the full stacked call. The forward here is a
 line-for-line mirror of mlx_lm SwitchGLU's decode path (no-sort branch),
 parameterized by which triples (full tensors or pool slots) it runs over.
 
-Eviction: the least recently used expert leaves, applied per miss, only
-between steps by construction (ensure() runs before the step's compute graph
-is built). Requires n_slots >= k.
+Eviction, only between steps by construction (ensure() runs before the
+step's compute graph is built), requires n_slots >= k. Which expert leaves:
+in decode, plain or pipelined, the one its layer's router has ranked lowest
+lately (rank(), below); wherever a pool has no ranks (prefill, a block whose
+router was not found) the least recently used one.
 """
 
 from __future__ import annotations
@@ -35,6 +37,28 @@ KEEPALIVE = os.environ.get("STREAMLX_KEEPALIVE", "1") != "0"
 GPU_HOLD = KEEPALIVE
 _KEEPALIVE_PERIOD_S = 50e-6
 _KEEPALIVE_LOCAL = threading.local()
+
+# STREAMLX_EVICT: which expert a decode miss evicts, in a plain step or a
+# pipelined one. "lru": the least recently used, as prefill does. "rank":
+# the one the layer's router has ranked lowest lately. "auto" (default): by
+# rank in the layers whose reads take RANK_MIN_FETCH_S a token or more, by
+# recency in the others (ranking costs ~0.07 ms a layer and token and saves
+# ~5% of the layer's reads).
+RANK_EVICT = os.environ.get("STREAMLX_EVICT", "auto")
+RANK_MIN_FETCH_S = 3e-3
+# An expert's worth = exp(-place / k), place = where its router logit stands
+# among the layer's experts (0 = the highest), k = the experts a token routes,
+# averaged over tokens with a half-life of _RANK_TOKENS x the tokens whose
+# experts the pool holds (n_slots / k), within _RANK_HALF_LIFE: a larger pool
+# remembers longer. (Replays of four models: a wider place scale or a longer
+# memory than this reads MORE than LRU on large pools.)
+_RANK_TOKENS = 1.5
+_RANK_HALF_LIFE = (4.0, 32.0)
+# A matrix whose top-k is the routed set less often than this, on average,
+# is not what routes the layer: its ranks are dropped (the pool is LRU).
+_RANK_MIN_AGREE = 0.5
+_RANK_PROBE = 16      # decode calls before that verdict
+_FETCH_WEIGHT = 0.125  # a decode token's weight in fetch_avg (~the last 8)
 
 
 class _GpuKeepalive:
@@ -304,6 +328,31 @@ class StreamingSwitchMLP:
         self.SENTINEL = np.uint32(0xFFFFFFFF)
         self.slot_table = np.full(self.n_experts, self.SENTINEL,
                                   dtype=np.uint32)
+        # x -> the block's router logits (set at wrap time, None when the
+        # router was not found): what rank() is given for a decode token
+        self.router = None
+        # the router's input at its last one-token call while the pool
+        # ranks, reported by the router itself (saw), taken by router_logits
+        self.router_x = None
+        # rank(): each expert's worth from its router's logits (None until a
+        # decode call ranks); over the first calls, how often the logits'
+        # top-k was the routed set: too seldom and they are not this layer's
+        # router (ranked = False, the pool stays LRU)
+        self.worth = None
+        self.ranked = True
+        self._place = None    # this token's share of worth, by place
+        self._decay = 0.0     # what a token leaves of the worth before it
+        self._rank_for = None  # the (n_slots, k) those two were made for
+        self._agree = 0.0
+        self._probed = 0
+        # tokens routed through the layer since rank() last ran (prefill,
+        # decode while auto is below its floor): each ages the worth as a
+        # ranked token does
+        self.since_rank = 0
+        # seconds this pool's reads take a decode token, averaged over the
+        # last ~8 (note_reads: a plain step's blocking read, a pipelined
+        # step's share of the drive's time): what "auto" eviction decides by
+        self.fetch_avg = 0.0
         self.hits = 0
         self.misses = 0
         self.evictions = 0
@@ -329,20 +378,105 @@ class StreamingSwitchMLP:
         self.slot_table[e] = slot
         return slot
 
-    def ensure(self, ids: list[int], wait=None) -> list[int]:
+    def rank(self, logits: np.ndarray, routed) -> None:
+        """One decode token's router logits for this layer ([n_experts], any
+        monotone-per-token scale: only their order is used) and the experts
+        it routed. Updates every expert's worth, which ensure(routed=...)
+        evicts by: an expert the router keeps placing just under its top-k
+        is likelier to be routed soon than one it used a few tokens ago and
+        now places low. Only which experts stay resident depends on it."""
+        if not self.ranked:
+            return
+        order = np.argsort(logits)[::-1]
+        k = len(routed)
+        if self._probed < _RANK_PROBE:
+            top = set(order[:k].tolist())
+            self._agree += sum(e in top for e in routed) / k
+            self._probed += 1
+            if self._probed == _RANK_PROBE and \
+                    self._agree < _RANK_MIN_AGREE * _RANK_PROBE:
+                self.ranked, self.worth = False, None
+                return
+        if self._rank_for != (self.n_slots, k):
+            self._rank_for = (self.n_slots, k)
+            lo, hi = _RANK_HALF_LIFE
+            half = min(max(_RANK_TOKENS * self.n_slots / k, lo), hi)
+            self._decay = 0.5 ** (1.0 / half)
+            self._place = (1.0 - self._decay) * np.exp(
+                -np.arange(len(order), dtype=np.float32) / k)
+            if self.worth is None:
+                self.worth = np.zeros(len(order), dtype=np.float32)
+        # this token, and those routed since the last rank, age the worth
+        gap, self.since_rank = max(self.since_rank, 1), 0
+        self.worth *= self._decay ** gap
+        self.worth[order] += self._place
+
+    def ranking(self) -> bool:
+        """Whether a decode token's router logits are to rank this pool now:
+        STREAMLX_EVICT=rank, or auto with the layer's reads slow enough to
+        pay for ranking (fetch_avg)."""
+        return (self.router is not None and self.ranked
+                and (RANK_EVICT == "rank" or RANK_EVICT == "auto"
+                     and self.fetch_avg >= RANK_MIN_FETCH_S))
+
+    def saw(self, x) -> None:
+        """The router was called on x (reported by the router itself, see
+        integrate._tap_router): a one-token input is kept while the pool
+        ranks, for router_logits(), whoever called the router (the block,
+        the fused visit, a pipeline adapter) and whatever the experts are
+        given."""
+        self.router_x = (x if x.size == x.shape[-1] and self.ranking()
+                         else None)
+
+    def router_logits(self):
+        """The router's logits (lazy, float32) for its last one-token input,
+        or None; an input is taken once."""
+        x, self.router_x = self.router_x, None
+        return None if x is None else self.router(x).astype(mx.float32)
+
+    def note_reads(self, seconds: float, tokens: int = 1) -> None:
+        """`tokens` decode tokens' reads of this layer took `seconds`
+        (fetch_avg)."""
+        a = 1.0 - (1.0 - _FETCH_WEIGHT) ** tokens
+        self.fetch_avg += a * (seconds / tokens - self.fetch_avg)
+
+    def _evict_lowest(self, n: int, keep) -> int:
+        """Free up to n slots: those of the resident experts of the lowest
+        worth, none of `keep` (experts a kernel in flight may read, or that
+        are to stay). Returns how many it freed: fewer when keep holds the
+        rest of the pool."""
+        worth = np.where(self.slot_table == self.SENTINEL, np.inf, self.worth)
+        worth[list(keep)] = np.inf
+        n = min(n, int(np.isfinite(worth).sum()))
+        if n <= 0:
+            return 0
+        for e in np.argpartition(worth, n - 1)[:n].tolist():
+            self.free.append(self.id2slot.pop(e))
+            self.slot_table[e] = self.SENTINEL
+            self.evictions += 1
+        return n
+
+    def ensure(self, ids: list[int], wait=None, routed=None) -> list[int]:
         """Return slot ids for `ids` (touch order = given order).
 
-        Misses are slot-assigned in order (LRU) but FETCHED as one threaded
+        Misses are slot-assigned in order but FETCHED as one threaded
         batch, each range straight into its slot's memory (no array is built
-        and no slot copy follows): eviction decisions never depend on fetch
-        timing. A batch whose read fails leaves none of its experts resident
+        and no slot copy follows): what leaves is decided before any read
+        starts. A batch whose read fails leaves none of its experts resident
         (forget) and raises. The slots it takes must be none a kernel in
-        flight reads: the
-        decode path touches its hits before calling, and a layer's earlier
-        calls are evaluated by the time its routing is known.
+        flight reads: the decode path touches its hits before calling, and a
+        layer's earlier calls are evaluated by the time its routing is known.
         `wait`, when given, blocks on the batch's read futures in place of a
         plain wait (the decode path's GPU keepalive).
+        `routed`: the current decode token's experts (those of `ids` and its
+        hits). With it, and once rank() has run, the experts of the lowest
+        worth leave instead of the least recently used.
         """
+        if routed is not None and self.worth is not None:
+            need = len({e for e in ids if e not in self.id2slot}) \
+                - len(self.free)
+            if need > 0:
+                self._evict_lowest(need, routed)
         slots = []
         missing: list[int] = []
         for e in ids:
